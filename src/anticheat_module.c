@@ -101,6 +101,8 @@ static struct workqueue_struct *ac_wq;
  * registry itself is bounded to. */
 static mempool_t *ac_prot_add_pool;
 static mempool_t *ac_prot_release_pool;
+static mempool_t *ac_kill_pool;
+static atomic_t ac_kill_dropped = ATOMIC_INIT(0);
 
 /* ------------------------------------------------------------------ */
 /* safe kernel reads                                                   */
@@ -128,10 +130,13 @@ MODULE_PARM_DESC(ac_verbose, "print extra diagnostics");
 /* ------------------------------------------------------------------ */
 /* symbol resolution via kprobes                                       */
 /* ------------------------------------------------------------------ */
+/* sleeps — do not call with spinlock held */
 static unsigned long ac_lookup(const char *name)
 {
     struct kprobe kp = { .symbol_name = name };
     unsigned long addr = 0;
+
+    might_sleep();
 
     if (register_kprobe(&kp) == 0) {
         addr = (unsigned long)kp.addr;
@@ -152,6 +157,8 @@ static unsigned long ac_normalize_func(unsigned long addr)
 
     if (!addr)
         return 0;
+    if (addr < 4)
+        return addr;
     if (ac_kread(&insn, (void *)(addr - 4), sizeof(insn)) == 0 &&
         insn == 0xfa1e0ff3)   /* endbr64, little-endian */
         return addr - 4;
@@ -306,13 +313,16 @@ static unsigned long ac_find_syscall_table(void)
     if (!rh || !wh)
         return 0;
 
+    if (!ac_stext && !ac_etext)
+        pr_warn("text bounds unresolved (_stext/_etext not kprobe-able); "
+                "using anchor-relative scan window around handler\n");
+
     /* Primary window: from the end of .text forward.  On x86-64 the table
      * lives in .rodata right after .text. */
     lo = ac_etext ? ac_etext : (ac_stext ? ac_stext : rh);
     hi = lo + 0x2000000UL;      /* 32 MB window */
     if (ac_verbose)
         pr_info("table scan window [0x%lx, 0x%lx)\n", lo, hi);
-
     for (addr = lo; addr < hi; addr += sizeof(unsigned long)) {
         if (ac_kread(&v1, (void *)addr, sizeof(v1)))
             continue;
@@ -1348,7 +1358,7 @@ static void ac_kill_worker(struct work_struct *w)
         put_task_struct(t);
     }
     put_pid(r->pid);
-    kfree(r);
+    mempool_free(r, ac_kill_pool);
 }
 
 static void ac_schedule_kill(struct task_struct *victim)
@@ -1357,18 +1367,21 @@ static void ac_schedule_kill(struct task_struct *victim)
 
     if (!victim)
         return;
-    r = kmalloc(sizeof(*r), GFP_ATOMIC);
-    if (!r)
+    r = mempool_alloc(ac_kill_pool, GFP_ATOMIC);
+    if (!r) {
+        atomic_inc(&ac_kill_dropped);
+        pr_warn("anticheat: kill work dropped (pool exhausted)\n");
         return;
+    }
     INIT_WORK(&r->work, ac_kill_worker);
     r->pid = get_task_pid(victim, PIDTYPE_PID);
     queue_work(ac_wq, &r->work);
 }
-
 /* ------------------------------------------------------------------ */
 /* kprobes                                                             */
 /* ------------------------------------------------------------------ */
 static struct kprobe ac_kp_ptrace32;
+
 
 static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
 {
@@ -2124,6 +2137,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         st.events_dropped = READ_ONCE(ac_dropped);
         st.locked = atomic_read(&ac_lock_count) > 0 ? 1 : 0;
         st.syscall_hook_count = READ_ONCE(ac_last_hook_count);
+        st.kill_dropped = (unsigned int)atomic_read(&ac_kill_dropped);
         if (copy_to_user(uarg, &st, sizeof(st)))
             return -EFAULT;
         return 0;
@@ -2522,6 +2536,13 @@ static int __init ac_init(void)
         destroy_workqueue(ac_wq);
         return -ENOMEM;
     }
+    ac_kill_pool = mempool_create_kmalloc_pool(16, sizeof(struct ac_kill_req));
+    if (!ac_kill_pool) {
+        mempool_destroy(ac_prot_release_pool);
+        mempool_destroy(ac_prot_add_pool);
+        destroy_workqueue(ac_wq);
+        return -ENOMEM;
+    }
 
     ac_resolve_text_bounds();
     if (ac_verbose)
@@ -2546,6 +2567,7 @@ static int __init ac_init(void)
          * work; drain it before tearing the workqueue down (see the same
          * reasoning in ac_exit() below). */
         flush_workqueue(ac_wq);
+        mempool_destroy(ac_kill_pool);
         mempool_destroy(ac_prot_release_pool);
         mempool_destroy(ac_prot_add_pool);
         destroy_workqueue(ac_wq);
@@ -2582,6 +2604,7 @@ static void __exit ac_exit(void)
      * returned, and the two flush_workqueue() calls above guarantee every
      * ac_prot_add_worker()/ac_prot_release_worker() that could still be
      * holding one has already run to completion and freed it back. */
+    mempool_destroy(ac_kill_pool);
     mempool_destroy(ac_prot_add_pool);
     mempool_destroy(ac_prot_release_pool);
     pr_info("unloaded\n");

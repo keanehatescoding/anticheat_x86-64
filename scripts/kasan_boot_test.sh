@@ -67,8 +67,10 @@ echo "== fetching linux-$KVER =="
 curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
     -o "$WORKDIR/linux-$KVER.tar.xz" \
     "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz"
+curl -fsSL -o "$WORKDIR/sha256sums.asc" \
+    "https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc"
+grep "linux-$KVER.tar.xz" "$WORKDIR/sha256sums.asc" | (cd "$WORKDIR" && sha256sum -c -)
 tar -xJf "$WORKDIR/linux-$KVER.tar.xz" -C "$WORKDIR"
-rm -f "$WORKDIR/linux-$KVER.tar.xz"
 
 echo "== configuring: defconfig + KASAN/lockdep debug fragment =="
 make -C "$KDIR" ARCH=x86_64 defconfig

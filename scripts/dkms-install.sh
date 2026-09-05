@@ -24,13 +24,18 @@ DEST="/usr/src/${NAME}-${VERSION}"
 MOK_DIR="/var/lib/anticheat/mok"
 MOK_CERT="${MOK_DIR}/mok.der"
 
+if [[ -z "$VERSION" || ! "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    echo "dkms-install: invalid PACKAGE_VERSION '$VERSION'" >&2; exit 1
+fi
+case "$DEST" in /usr/src/anticheat-*) ;; *) echo "refusing DEST=$DEST" >&2; exit 1;; esac
+
 # DKMS's built-in Secure Boot signing needs to be told where to keep a
 # persistent key (see the note in dkms.conf for why this can't just be a
 # variable in this package's own dkms.conf). This fragment applies to every
 # DKMS package on the machine, matching DKMS's normal one-key-for-everything
 # model, so it's safe even if other DKMS modules are already installed.
 install -d -m 0700 "$MOK_DIR"
-install -D -m 0644 /dev/stdin /etc/dkms/framework.conf.d/anticheat.conf <<EOF
+install -D -b -m 0644 /dev/stdin /etc/dkms/framework.conf.d/anticheat.conf <<EOF
 mok_signing_key="${MOK_DIR}/mok.priv"
 mok_certificate="${MOK_CERT}"
 EOF
@@ -38,7 +43,7 @@ EOF
 if [[ -e "$DEST" && "$(readlink -f "$DEST")" != "$(readlink -f "$SRC_DIR")" ]]; then
     echo "removing previous DKMS source tree at ${DEST}"
     dkms remove -m "$NAME" -v "$VERSION" --all 2>/dev/null || true
-    rm -rf "$DEST"
+    rm -rf -- "$DEST"
 fi
 
 if [[ ! -e "$DEST" ]]; then

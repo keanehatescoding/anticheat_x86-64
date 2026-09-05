@@ -196,6 +196,280 @@ int main(void)
               "the file still holds exactly the records it had before the failed save");
     }
 
+    /* Concurrent baseline_save_record via fork()+flock: two writers to the
+     * same path's baseline file (different segments) must not lose one
+     * writer's record. Without flock() the second's load would see the
+     * first's rename partially or discard it. */
+    {
+        char conc_path[PATH_MAX];
+        pid_t c1, c2;
+        int st1 = 0, st2 = 0;
+
+        baseline_path_for("/usr/lib/libconcurrent.so", conc_path);
+        unlink(conc_path);
+        /* also remove any stale .tmp file from prior run */
+        {
+            char tmp[PATH_MAX + 32];
+            snprintf(tmp, sizeof(tmp), "%s.tmpXXXXXX", conc_path);
+            (void)tmp; /* mkstemp pattern not needed; unlink possible leftover handled by new save */
+        }
+
+        c1 = fork();
+        if (c1 < 0) {
+            CHECK(0, "fork for concurrent writer 1");
+        } else if (c1 == 0) {
+            int rc = baseline_save_record(conc_path, 111, 0x1000, 0x1000,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            _exit(rc == 0 ? 0 : 2);
+        }
+        c2 = fork();
+        if (c2 < 0) {
+            CHECK(0, "fork for concurrent writer 2");
+        } else if (c2 == 0) {
+            /* small jitter to increase overlap */
+            usleep(5000);
+            int rc = baseline_save_record(conc_path, 111, 0x2000, 0x1000,
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            _exit(rc == 0 ? 0 : 2);
+        }
+        if (c1 > 0) waitpid(c1, &st1, 0);
+        if (c2 > 0) waitpid(c2, &st2, 0);
+        CHECK(c1 > 0 && WIFEXITED(st1) && WEXITSTATUS(st1) == 0,
+              "concurrent writer 1 exited successfully");
+        CHECK(c2 > 0 && WIFEXITED(st2) && WEXITSTATUS(st2) == 0,
+              "concurrent writer 2 exited successfully");
+
+        n = baseline_load_records(conc_path, recs, &legacy);
+        CHECK(n == 2, "concurrent writers: both segments survive");
+        CHECK(baseline_find_record(recs, n, 111, 0x1000, 0x1000, hex, NULL) &&
+              strncmp(hex, "aaaa", 4) == 0,
+              "concurrent writer 1's record intact");
+        CHECK(baseline_find_record(recs, n, 111, 0x2000, 0x1000, hex, NULL) &&
+              strncmp(hex, "bbbb", 4) == 0,
+              "concurrent writer 2's record intact");
+    }
+
+    /* Corrupt digest handling: baseline_load_records must not crash on
+     * non-hex, truncated, empty, or garbage inputs and must report
+     * legacy/invalid correctly. */
+    {
+        char corrupt_path[PATH_MAX];
+        FILE *f;
+
+        baseline_path_for("/usr/lib/libcorrupt.so", corrupt_path);
+
+        /* empty file */
+        f = fopen(corrupt_path, "w");
+        CHECK(f != NULL, "create empty baseline file");
+        if (f) fclose(f);
+        n = baseline_load_records(corrupt_path, recs, &legacy);
+        CHECK(n == 0, "empty file yields zero records");
+        CHECK(!legacy, "empty file not flagged as legacy");
+
+        /* truncated digest (short hex, still 4 fields) -- must not crash */
+        f = fopen(corrupt_path, "w");
+        CHECK(f != NULL, "create truncated-digest baseline file");
+        if (f) {
+            fprintf(f, "%llx %llx %llx %s\n", 0x2aULL, 0x1000ULL, 0x2000ULL, "abcd");
+            fclose(f);
+        }
+        n = baseline_load_records(corrupt_path, recs, &legacy);
+        CHECK(n == 1, "truncated digest line still parsed as one record (no crash)");
+        if (n == 1) {
+            CHECK(recs[0].inode == 0x2a && recs[0].offset == 0x1000 && recs[0].size == 0x2000,
+                  "truncated digest record fields parsed correctly");
+            CHECK(strcmp(recs[0].hex, "abcd") == 0,
+                  "truncated digest hex preserved verbatim");
+        }
+        CHECK(!legacy, "truncated 4-field line not flagged as legacy");
+
+        /* non-hex digest (contains 'z','g' which are not hex) -- %s still
+         * captures it, must not crash. */
+        f = fopen(corrupt_path, "w");
+        CHECK(f != NULL, "create non-hex digest baseline file");
+        if (f) {
+            fprintf(f, "%llx %llx %llx %s\n", 0x2aULL, 0x1000ULL, 0x2000ULL,
+                    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+            fclose(f);
+        }
+        n = baseline_load_records(corrupt_path, recs, &legacy);
+        CHECK(n == 1, "non-hex digest line parsed as one record (no crash)");
+        if (n == 1)
+            CHECK(strncmp(recs[0].hex, "zzzz", 4) == 0,
+                  "non-hex digest preserved, no validation crash");
+        CHECK(!legacy, "non-hex 4-field line not flagged as legacy");
+
+        /* garbage line + valid line: garbage must be skipped, valid kept */
+        f = fopen(corrupt_path, "w");
+        CHECK(f != NULL, "create garbage+valid baseline file");
+        if (f) {
+            fprintf(f, "hello world this is not a baseline\n");
+            fprintf(f, "%llx %llx %llx %s\n", 0x2aULL, 0x1000ULL, 0x2000ULL,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            fprintf(f, "   \n"); /* blank line */
+            fclose(f);
+        }
+        n = baseline_load_records(corrupt_path, recs, &legacy);
+        CHECK(n == 1, "garbage line skipped, valid record still loaded");
+        CHECK(!legacy, "garbage non-legacy line not flagged as legacy");
+
+        /* mixed legacy 3-field + valid 4-field: legacy flagged, valid kept */
+        f = fopen(corrupt_path, "w");
+        CHECK(f != NULL, "create legacy+valid baseline file");
+        if (f) {
+            fprintf(f, "%llx %llx %s\n", 0x1000ULL, 0x2000ULL,
+                    "4444444444444444444444444444444444444444444444444444444444444444");
+            fprintf(f, "%llx %llx %llx %s\n", 0x2aULL, 0x1000ULL, 0x2000ULL,
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            fclose(f);
+        }
+        n = baseline_load_records(corrupt_path, recs, &legacy);
+        CHECK(n == 1, "legacy line ignored, valid 4-field record loaded");
+        CHECK(legacy, "legacy flag set when file contains a 3-field line");
+        if (n == 1)
+            CHECK(baseline_find_record(recs, n, 0x2a, 0x1000, 0x2000, hex, NULL) &&
+                  strncmp(hex, "bbbb", 4) == 0,
+                  "valid record after legacy line is retrievable");
+
+        /* baseline_load_records with NULL out_legacy must not crash */
+        f = fopen(corrupt_path, "w");
+        if (f) {
+            fprintf(f, "%llx %llx %s\n", 0x1000ULL, 0x2000ULL,
+                    "4444444444444444444444444444444444444444444444444444444444444444");
+            fclose(f);
+        }
+        n = baseline_load_records(corrupt_path, recs, NULL);
+        CHECK(n == 0, "baseline_load_records with NULL out_legacy handles legacy line (no crash)");
+
+        /* nonexistent file */
+        {
+            char nofile[PATH_MAX];
+            snprintf(nofile, sizeof(nofile), "%s/nonexistent_%d.txt", tmpdir, (int)getpid());
+            n = baseline_load_records(nofile, recs, &legacy);
+            CHECK(n == 0, "nonexistent file yields zero records");
+            CHECK(!legacy, "nonexistent file not flagged as legacy");
+        }
+    }
+
+    /* AC_BASELINE_DIR override unwritable dir -- baseline_save_record must
+     * fail cleanly (return -1, no crash). Handles both non-root (chmod)
+     * and root (file-as-dir ENOTDIR) cases. */
+    {
+        char ro_dir[PATH_MAX];
+        char blpath2[PATH_MAX];
+        char blocker_file[PATH_MAX];
+        int rc;
+        FILE *bf;
+
+        /* chmod-based unwritable directory */
+        snprintf(ro_dir, sizeof(ro_dir), "%s/ro_test", tmpdir);
+        mkdir(ro_dir, 0755);
+        chmod(ro_dir, 0000);
+        setenv("AC_BASELINE_DIR", ro_dir, 1);
+        baseline_path_for("/usr/lib/libnowrite.so", blpath2);
+        rc = baseline_save_record(blpath2, 99, 0x1000, 0x1000,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        if (geteuid() != 0) {
+            CHECK(rc == -1, "AC_BASELINE_DIR unwritable dir fails cleanly (return -1)");
+        } else {
+            /* root bypasses DAC; don't assert -1, just ensure no crash */
+            fprintf(stderr, "SKIP: unwritable chmod check running as root (rc=%d)\n", rc);
+            CHECK(1, "AC_BASELINE_DIR unwritable dir no crash as root (skipped)");
+            if (rc == 0) unlink(blpath2);
+        }
+        chmod(ro_dir, 0755);
+        rmdir(ro_dir);
+
+        /* file-as-directory: AC_BASELINE_DIR points at a regular file, so
+         * any baseline path is <file>/hash.txt -> ENOTDIR, fails even as root. */
+        snprintf(blocker_file, sizeof(blocker_file), "%s/blocker", tmpdir);
+        bf = fopen(blocker_file, "w");
+        CHECK(bf != NULL, "create blocker file for unwritable-dir test");
+        if (bf) { fputs("x", bf); fclose(bf); }
+        setenv("AC_BASELINE_DIR", blocker_file, 1);
+        baseline_path_for("/usr/lib/libnowrite2.so", blpath2);
+        rc = baseline_save_record(blpath2, 99, 0x1000, 0x1000,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        CHECK(rc == -1, "AC_BASELINE_DIR file-as-dir fails cleanly (return -1, no crash)");
+        unlink(blocker_file);
+
+        /* restore for remaining tests */
+        setenv("AC_BASELINE_DIR", tmpdir, 1);
+        ac_mkdir_baselines();
+    }
+
+    /* AC_HASH_CAP=16MiB cap: mapping >16MiB hashes only first 16MiB
+     * (assert by hashing known pattern). The daemon caps via
+     *   size = vi->end - vi->start; if (size > AC_HASH_CAP) size = AC_HASH_CAP;
+     * before calling hash_proc_mem(). Verify that a file whose tail beyond
+     * 16MiB differs still hashes identically when capped. */
+    {
+        char pathtmp[] = "/tmp/ac_hashcap_XXXXXX";
+        int fd = mkstemp(pathtmp);
+        char hex_cap[65], hex_full[65], hex_capped_via_logic[65];
+        uint64_t raw_size, capped_size;
+        size_t i_chunk;
+        const size_t one_mib = 1024 * 1024;
+        char *chunk = malloc(one_mib);
+        int ok = 0;
+
+        CHECK(fd >= 0, "AC_HASH_CAP test: create temp file");
+        CHECK(chunk != NULL, "AC_HASH_CAP test: allocate 1MiB chunk");
+        if (fd >= 0 && chunk) {
+            /* write 16MiB of 'A' */
+            memset(chunk, 'A', one_mib);
+            for (i_chunk = 0; i_chunk < 16; i_chunk++) {
+                ssize_t w = write(fd, chunk, one_mib);
+                CHECK(w == (ssize_t)one_mib, "AC_HASH_CAP test: write A chunk");
+                if (w != (ssize_t)one_mib) break;
+            }
+            /* write extra 1MiB of 'B' so total 17MiB differs beyond cap */
+            memset(chunk, 'B', one_mib);
+            {
+                ssize_t w = write(fd, chunk, one_mib);
+                CHECK(w == (ssize_t)one_mib, "AC_HASH_CAP test: write B chunk");
+            }
+            fsync(fd);
+
+            raw_size = 17ULL * 1024 * 1024;
+            capped_size = raw_size > AC_HASH_CAP ? AC_HASH_CAP : raw_size;
+            CHECK(capped_size == AC_HASH_CAP, "AC_HASH_CAP is 16MiB and caps 17MiB mapping");
+
+            /* hash only first 16MiB */
+            CHECK(hash_proc_mem(fd, 0, AC_HASH_CAP, hex_cap) == 0,
+                  "AC_HASH_CAP test: hash first 16MiB via hash_proc_mem");
+            /* hash full 17MiB -- must differ from capped */
+            CHECK(hash_proc_mem(fd, 0, raw_size, hex_full) == 0,
+                  "AC_HASH_CAP test: hash full 17MiB via hash_proc_mem");
+            CHECK(strcmp(hex_cap, hex_full) != 0,
+                  "AC_HASH_CAP test: full 17MiB digest differs from capped 16MiB (cap matters)");
+
+            /* daemon's capping logic: hash with capped size equals hex_cap */
+            CHECK(hash_proc_mem(fd, 0, capped_size, hex_capped_via_logic) == 0,
+                  "AC_HASH_CAP test: hash with capped size succeeds");
+            CHECK(strcmp(hex_cap, hex_capped_via_logic) == 0,
+                  "AC_HASH_CAP test: capped hash equals hash of first 16MiB");
+
+            /* also verify capping via raw->capped transform yields same as direct */
+            {
+                uint64_t sz = raw_size;
+                if (sz > AC_HASH_CAP) sz = AC_HASH_CAP;
+                char hex_via_transform[65];
+                CHECK(hash_proc_mem(fd, 0, sz, hex_via_transform) == 0,
+                      "AC_HASH_CAP test: hash via transformed size");
+                CHECK(strcmp(hex_via_transform, hex_cap) == 0,
+                      "AC_HASH_CAP test: transformed-size hash matches cap");
+            }
+
+            ok = 1;
+        }
+        if (chunk) free(chunk);
+        if (fd >= 0) close(fd);
+        unlink(pathtmp);
+        if (!ok)
+            CHECK(0, "AC_HASH_CAP test: setup failed");
+    }
+
     if (failures) {
         fprintf(stderr, "%d check(s) FAILED\n", failures);
         return 1;

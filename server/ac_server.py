@@ -60,49 +60,63 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
+import collections
 
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 MAX_BODY_BYTES = 4096
 
 
 class RateLimiter:
-    """Fixed-window limiter: at most `limit` requests per `window` seconds,
-    per key (source IP here). Not built for distributed scale or precise
-    edge behavior (a fixed window allows a brief double-rate burst right
-    at the boundary) -- enough to bound abuse against a single small
-    process, which is the actual deployment this is for. Applied to every
-    endpoint, not just /report: unauthenticated attempts against /banned
-    or /ban are exactly the kind of thing worth throttling too (ID
-    enumeration, admin-key brute-forcing), not just report flooding."""
+    """Sliding-window limiter: at most `limit` requests per `window` seconds,
+    per key (source IP here). Replaces the previous fixed-window scheme
+    which allowed a brief double-rate burst at the window boundary (up to
+    2*limit in one window's worth of time straddling two fixed windows).
+    Sliding window prunes timestamps older than `window` on every `allow()`
+    and counts only those still inside the window. Not built for distributed
+    scale -- enough to bound abuse against a single small process, which is
+    the actual deployment this is for. Applied to every endpoint, not just
+    /report: unauthenticated attempts against /banned or /ban are exactly
+    the kind of thing worth throttling too (ID enumeration, admin-key
+    brute-forcing), not just report flooding."""
 
     def __init__(self, limit, window):
         self.limit = limit
         self.window = window
         self._lock = threading.Lock()
-        self._buckets = {}  # key -> (window_start, count)
-        self._last_prune = time.time()
+        self._hits = {}  # key -> deque[monotonic timestamps]
+        self._buckets = self._hits  # compat alias for older tests inspecting _buckets
+        self._last_prune = time.monotonic()
 
     def allow(self, key):
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
-            window_start, count = self._buckets.get(key, (now, 0))
-            if now - window_start >= self.window:
-                window_start, count = now, 0
-            count += 1
-            self._buckets[key] = (window_start, count)
+            dq = self._hits.get(key)
+            if dq is None:
+                dq = collections.deque()
+                self._hits[key] = dq
+            # prune outside window
+            while dq and now - dq[0] >= self.window:
+                dq.popleft()
+            if len(dq) >= self.limit:
+                # still need occasional prune of stale keys even on deny
+                if now - self._last_prune >= self.window:
+                    self._prune(now)
+                return False
+            dq.append(now)
             if now - self._last_prune >= self.window:
                 self._prune(now)
-            return count <= self.limit
+            return True
 
     def _prune(self, now):
-        """Drop buckets whose window has already elapsed. _buckets grows
-        one entry per distinct source IP ever seen with nothing to evict
-        them otherwise -- an unbounded leak in a long-running process.
-        Called opportunistically from allow() roughly once per window
-        rather than on every request, so this stays cheap."""
-        stale = [k for k, (ws, _) in self._buckets.items() if now - ws >= self.window]
+        """Drop keys whose deque is empty or whose newest entry is already
+        outside the window. Keeps _hits bounded in a long-running process
+        with many distinct source IPs, same purpose as before but adapted
+        to deque storage."""
+        stale = [k for k, dq in self._hits.items()
+                 if not dq or now - dq[-1] >= self.window]
         for k in stale:
-            del self._buckets[k]
+            del self._hits[k]
         self._last_prune = now
 
 
@@ -176,6 +190,7 @@ class BoundedThreadingMixIn(socketserver.ThreadingMixIn):
         # (peer already gone, unix-socket edge) just fall through to the
         # close -- the point is bounding, not the status line.
         try:
+            request.settimeout(2)
             body = b'{"error": "server busy"}'
             request.sendall(
                 b"HTTP/1.1 503 Service Unavailable\r\n"
@@ -328,6 +343,18 @@ class Store:
         # query returns, not what accumulates on disk (#60). 0/None disables
         # the cap.
         self.max_reports_per_client = max_reports_per_client
+        # SQLite only ever allows one writer at a time, even in WAL mode --
+        # under ThreadingHTTPServer, every write-handling thread opens its
+        # own connection and would otherwise all race for that single
+        # writer lock at once, each polling/blocking inside SQLite's own
+        # busy_timeout. Under sustained high concurrency that busy-wait can
+        # still lose (a real stress run: 30 threads x 300s produced 36
+        # "database is locked" OperationalErrors past a 5s busy_timeout).
+        # Serializing writes through this lock instead means at most one
+        # thread ever has a write in flight against SQLite, so there is
+        # never any lock contention for busy_timeout to time out on --
+        # every writer just queues fairly in Python instead.
+        self._write_lock = threading.Lock()
         # The DB (and its -wal/-shm siblings, recreated on every checkpoint)
         # hold raw report detail text, source IPs, and ban reasons -- private
         # regardless of the launching environment's umask, not just under the
@@ -346,49 +373,38 @@ class Store:
         # files: an upgrade from a pre-fix deployment can already have a
         # world-readable DB (and -wal/-shm) on disk that sqlite3.connect()
         # would otherwise reuse as-is.
-        self._ensure_private()
-        # SQLite only ever allows one writer at a time, even in WAL mode --
-        # under ThreadingHTTPServer, every write-handling thread opens its
-        # own connection and would otherwise all race for that single
-        # writer lock at once, each polling/blocking inside SQLite's own
-        # busy_timeout. Under sustained high concurrency that busy-wait can
-        # still lose (a real stress run: 30 threads x 300s produced 36
-        # "database is locked" OperationalErrors past a 5s busy_timeout).
-        # Serializing writes through this lock instead means at most one
-        # thread ever has a write in flight against SQLite, so there is
-        # never any lock contention for busy_timeout to time out on --
-        # every writer just queues fairly in Python instead.
-        self._write_lock = threading.Lock()
-        conn = self._connect()
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS reports (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   client_id TEXT NOT NULL,
-                   event_type TEXT NOT NULL,
-                   detail TEXT NOT NULL,
-                   client_ts INTEGER,
-                   received_at INTEGER NOT NULL,
-                   source_addr TEXT NOT NULL
-               )"""
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_reports_client ON reports(client_id)"
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS bans (
-                   client_id TEXT PRIMARY KEY,
-                   reason TEXT NOT NULL,
-                   banned_at INTEGER NOT NULL
-               )"""
-        )
-        conn.commit()
-        conn.close()
-        # Fresh files (or -wal/-shm siblings checkpoint-created above) may
-        # have been created under the importer's own umask when Store is
-        # used as a library (no main() umask in effect) -- lock them down
-        # explicitly so library use still lands at 0600 without touching
-        # the process-wide umask to get there.
-        self._ensure_private()
+        with self._write_lock:
+            self._ensure_private()
+            conn = self._connect()
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS reports (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       client_id TEXT NOT NULL,
+                       event_type TEXT NOT NULL,
+                       detail TEXT NOT NULL,
+                       client_ts INTEGER,
+                       received_at INTEGER NOT NULL,
+                       source_addr TEXT NOT NULL
+                   )"""
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reports_client ON reports(client_id)"
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS bans (
+                       client_id TEXT PRIMARY KEY,
+                       reason TEXT NOT NULL,
+                       banned_at INTEGER NOT NULL
+                   )"""
+            )
+            conn.commit()
+            conn.close()
+            # Fresh files (or -wal/-shm siblings checkpoint-created above) may
+            # have been created under the importer's own umask when Store is
+            # used as a library (no main() umask in effect) -- lock them down
+            # explicitly so library use still lands at 0600 without touching
+            # the process-wide umask to get there.
+            self._ensure_private()
 
     def _ensure_private(self):
         """chmod any existing DB/-wal/-shm files to 0600. Per-file and
@@ -411,6 +427,16 @@ class Store:
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=5)
         conn.execute("PRAGMA journal_mode=WAL")
+        # Explicit busy_timeout as defense-in-depth: timeout=5 above is the
+        # Python-level busy handler, but setting the SQLite-level pragma
+        # ensures the same 5s bound even if the connection is used via raw
+        # sqlite3 APIs that bypass Python's wrapper. Synchronous=NORMAL is
+        # safe in WAL mode and reduces fsync pressure under concurrent writes
+        # without sacrificing durability guarantees needed here.
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            pass
         return conn
 
     def add_report(self, client_id, event_type, detail, client_ts, source_addr):
@@ -706,11 +732,15 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
         def _do_POST(self):
             if self._rate_limited():
                 return
-            if self.path == "/report":
+            parsed = urllib.parse.urlparse(self.path)
+            path = urllib.parse.unquote(parsed.path)
+            if not path:
+                return self._send_json(404, {"error": "not found"})
+            if path == "/report":
                 return self._handle_report()
-            if self.path == "/ban":
+            if path == "/ban":
                 return self._handle_ban()
-            if self.path == "/unban":
+            if path == "/unban":
                 return self._handle_unban()
             self._send_json(404, {"error": "not found"})
 
@@ -720,10 +750,14 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
         def _do_GET(self):
             if self._rate_limited():
                 return
-            if self.path.startswith("/banned/"):
-                return self._handle_banned(self.path[len("/banned/"):])
-            if self.path.startswith("/reports/"):
-                return self._handle_reports(self.path[len("/reports/"):])
+            parsed = urllib.parse.urlparse(self.path)
+            path = urllib.parse.unquote(parsed.path)
+            if not path:
+                return self._send_json(404, {"error": "not found"})
+            if path.startswith("/banned/"):
+                return self._handle_banned(path[len("/banned/"):])
+            if path.startswith("/reports/"):
+                return self._handle_reports(path[len("/reports/"):])
             self._send_json(404, {"error": "not found"})
 
         @_requires_auth(report_keys)

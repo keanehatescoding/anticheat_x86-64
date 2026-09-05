@@ -12,6 +12,9 @@
  *   ioctl                        — implements the AC_IOCTL_* ABI
  *   close                        — swallows the fake fd
  *   geteuid/getuid               — returns 0 while AC_MOCK_ROOT=1
+ *   process_vm_readv/writev      — denies protected pids (AC_EV_PROCESS_VM)
+ *   pread/pread64                — fakes /proc/<pid>/mem for hook mock
+ *   opendir/readdir/closedir     — fakes implicit_layer.d for manifest mock
  *
  * State (protected list, lock, event queue) persists across CLI
  * invocations in $AC_MOCK_STATE (default /tmp/ac_mock_state), mirroring
@@ -29,6 +32,22 @@
  *   AC_MOCK_VERSION=N   report ioctl ABI version N instead of the real
  *                       AC_IOCTL_VERSION (simulates a stale module)
  *   AC_MOCK_STATE=path  state file location
+ *   AC_MOCK_HOOK_LIB=lib:symbol:status
+ *                       inject a synthetic VMA for render-hook checks;
+ *                       status is hooked|clean|inconclusive (e.g.
+ *                       libvulkan.so.1:vkQueuePresentKHR:hooked)
+ *   AC_MOCK_ENVIRON=entries
+ *                       fake /proc/<pid>/environ content; entries are
+ *                       KEY=VALUE separated by ';' (e.g.
+ *                       LD_PRELOAD=/tmp/evil.so;VK_INSTANCE_LAYERS=...)
+ *   AC_MOCK_MANIFEST=spec
+ *                       fake implicit Vulkan layer manifest; spec is
+ *                       name:library_path[:disable_env] or raw JSON
+ *                       containing "name"
+ *   AC_MOCK_ANON_EXEC_COUNT=N or pid:N,...
+ *                       override anon_exec_count for SCAN_BEGIN; when set
+ *                       the mock increments per-pid on each scan to
+ *                       simulate growth for --jit downgrade tests
  */
 #define _GNU_SOURCE
 
@@ -41,10 +60,14 @@
 #include <unistd.h>
 #include <time.h>
 #include <limits.h>
+#include <signal.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <sys/syscall.h>
 #include <dlfcn.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
-
 #include "../src/anticheat.h"
 
 #define MOCK_FD 4242
@@ -206,6 +229,376 @@ static void mock_fill_digest(char out_hex[65], char c)
     out_hex[64] = '\0';
 }
 
+/* ------------------------------------------------------------------ */
+/* helpers for env-driven mocks (hook, anon, environ, manifest)        */
+/* ------------------------------------------------------------------ */
+struct hook_cfg {
+    char lib[64];
+    char sym[64];
+    char status[16]; /* hooked|clean|inconclusive */
+    int valid;
+};
+static struct hook_cfg g_hook;
+static unsigned long long g_hook_base = 0x7f0000000000ULL;
+static char g_hook_tmp_path[PATH_MAX] = "";
+
+static int parse_hook_env(struct hook_cfg *out)
+{
+    const char *e = getenv("AC_MOCK_HOOK_LIB");
+    char buf[256];
+    char *p1, *p2;
+    if (!e || !*e) {
+        out->valid = 0;
+        return 0;
+    }
+    snprintf(buf, sizeof(buf), "%s", e);
+    p1 = strchr(buf, ':');
+    if (!p1) return 0;
+    *p1++ = '\0';
+    p2 = strchr(p1, ':');
+    if (!p2) return 0;
+    *p2++ = '\0';
+    strncpy(out->lib, buf, sizeof(out->lib)-1); out->lib[sizeof(out->lib)-1]='\0';
+    strncpy(out->sym, p1, sizeof(out->sym)-1); out->sym[sizeof(out->sym)-1]='\0';
+    strncpy(out->status, p2, sizeof(out->status)-1); out->status[sizeof(out->status)-1]='\0';
+    out->valid = 1;
+    return 1;
+}
+
+static int is_environ_path(const char *path)
+{
+    /* matches /proc/<pid>/environ exactly */
+    if (!path) return 0;
+    if (strncmp(path, "/proc/", 6) != 0) return 0;
+    const char *slash = strchr(path+6, '/');
+    if (!slash) return 0;
+    return strcmp(slash, "/environ") == 0;
+}
+static int is_mem_path(const char *path)
+{
+    if (!path) return 0;
+    if (strncmp(path, "/proc/", 6) != 0) return 0;
+    const char *slash = strchr(path+6, '/');
+    if (!slash) return 0;
+    return strcmp(slash, "/mem") == 0;
+}
+static int __attribute__((unused)) is_manifest_json_path(const char *path)
+{
+    if (!path) return 0;
+    if (!strstr(path, "implicit_layer.d")) return 0;
+    size_t l = strlen(path);
+    if (l < 5) return 0;
+    return strcmp(path + l - 5, ".json") == 0;
+}
+static int __attribute__((unused)) is_implicit_dir(const char *path)
+{
+    if (!path) return 0;
+    return strstr(path, "implicit_layer.d") != NULL;
+}
+
+/* locate host lib for hook: try /usr/lib/<lib>, /usr/lib64/<lib> etc. */
+static int locate_host_lib(const char *lib, char *out, size_t outsz)
+{
+    const char *cands[] = {
+        "/usr/lib/%s",
+        "/usr/lib64/%s",
+        "/usr/lib/x86_64-linux-gnu/%s",
+        "/lib/%s",
+        "/lib64/%s",
+        NULL
+    };
+    int i;
+    char tmp[PATH_MAX];
+    if (strchr(lib, '/')) {
+        if (access(lib, R_OK) == 0) {
+            snprintf(out, outsz, "%s", lib);
+            return 0;
+        }
+        return -1;
+    }
+    for (i = 0; cands[i]; i++) {
+        snprintf(tmp, sizeof(tmp), cands[i], lib);
+        if (access(tmp, R_OK) == 0) {
+            snprintf(out, outsz, "%s", tmp);
+            return 0;
+        }
+    }
+    /* try with .so suffix variations: lib may be libvulkan.so.1 but we have libvulkan.so */
+    return -1;
+}
+
+static int copy_file(const char *src, const char *dst)
+{
+    int sfd = -1, dfd = -1;
+    char buf[8192];
+    ssize_t n;
+    /* use real open via dlsym to avoid our own interposition */
+    int (*real_open)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
+    if (!real_open) return -1;
+    sfd = real_open(src, O_RDONLY);
+    if (sfd < 0) return -1;
+    dfd = real_open(dst, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if (dfd < 0) { close(sfd); return -1; }
+    while ((n = read(sfd, buf, sizeof(buf))) > 0) {
+        if (write(dfd, buf, (size_t)n) != n) break;
+    }
+    close(sfd);
+    close(dfd);
+    return 0;
+}
+
+static int ensure_hook_tmp_file(const char *lib)
+{
+    char host[PATH_MAX] = "";
+    char tmp[PATH_MAX];
+    if (!lib || !*lib) return -1;
+    snprintf(tmp, sizeof(tmp), "/tmp/%s", lib);
+    /* basename may contain slash? we used lib as basename, ensure no dir */
+    (void)tmp;
+    /* already /tmp/<lib> */
+    if (access(tmp, R_OK) == 0) {
+        snprintf(g_hook_tmp_path, sizeof(g_hook_tmp_path), "%s", tmp);
+        return 0;
+    }
+    if (locate_host_lib(lib, host, sizeof(host)) == 0) {
+        if (copy_file(host, tmp) == 0) {
+            snprintf(g_hook_tmp_path, sizeof(g_hook_tmp_path), "%s", tmp);
+            return 0;
+        }
+    }
+    /* fallback: try libvulkan as generic */
+    if (locate_host_lib("libvulkan.so.1", host, sizeof(host)) == 0) {
+        if (copy_file(host, tmp) == 0) {
+            snprintf(g_hook_tmp_path, sizeof(g_hook_tmp_path), "%s", tmp);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* anon exec count per-pid map for AC_MOCK_ANON_EXEC_COUNT */
+struct anon_mock_entry { int pid; unsigned int count; int in_use; };
+static struct anon_mock_entry anon_mocks[AC_MAX_PROTS];
+
+static unsigned int get_mock_anon_count(int pid, unsigned int real_count)
+{
+    const char *e = getenv("AC_MOCK_ANON_EXEC_COUNT");
+    char buf[256];
+    unsigned int base = 0;
+    int i, free_slot = -1;
+    if (!e || !*e) return real_count;
+    /* parse per-pid form pid:N or single N */
+    if (strchr(e, ':') && !strchr(e, ';') && !strchr(e, ',')) {
+        /* could be single pid:N or single N with colon? For hook env colon is different.
+         * For anon, treat "123:5" as pid:count if pid part is numeric */
+        const char *colon = strchr(e, ':');
+        if (colon) {
+            char left[64], right[64];
+            size_t llen = (size_t)(colon - e);
+            if (llen < sizeof(left)) {
+                memcpy(left, e, llen);
+                left[llen] = '\0';
+                snprintf(right, sizeof(right), "%s", colon+1);
+                int is_pid = 1;
+                for (char *c = left; *c; c++) if (*c < '0' || *c > '9') is_pid = 0;
+                if (is_pid) {
+                    int p = atoi(left);
+                    unsigned int c = (unsigned int)atoi(right);
+                    if (p == pid) return c; /* exact per-pid without growth */
+                    /* else fall through to generic */
+                }
+            }
+        }
+    }
+    /* generic integer or comma list */
+    if (strchr(e, ',')) {
+        /* pid:count, pid:count */
+        snprintf(buf, sizeof(buf), "%s", e);
+        char *tok = strtok(buf, ",");
+        while (tok) {
+            char *c = strchr(tok, ':');
+            if (c) {
+                *c++ = '\0';
+                int p = atoi(tok);
+                unsigned int cnt = (unsigned int)atoi(c);
+                if (p == pid) {
+                    /* found per-pid entry: handle growth via anon_mocks */
+                    for (i = 0; i < AC_MAX_PROTS; i++) {
+                        if (anon_mocks[i].in_use && anon_mocks[i].pid == pid) {
+                            anon_mocks[i].count++;
+                            return anon_mocks[i].count;
+                        }
+                        if (free_slot == -1 && !anon_mocks[i].in_use) free_slot = i;
+                    }
+                    if (free_slot != -1) {
+                        anon_mocks[free_slot].pid = pid;
+                        anon_mocks[free_slot].count = cnt;
+                        anon_mocks[free_slot].in_use = 1;
+                        return cnt;
+                    }
+                    return cnt;
+                }
+            }
+            tok = strtok(NULL, ",");
+        }
+        /* not found for this pid, use real */
+        return real_count;
+    }
+    /* single integer for all pids with growth */
+    base = (unsigned int)atoi(e);
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (anon_mocks[i].in_use && anon_mocks[i].pid == pid) {
+            anon_mocks[i].count++;
+            return anon_mocks[i].count;
+        }
+        if (free_slot == -1 && !anon_mocks[i].in_use) free_slot = i;
+    }
+    if (free_slot != -1) {
+        anon_mocks[free_slot].pid = pid;
+        anon_mocks[free_slot].count = base ? base : real_count;
+        anon_mocks[free_slot].in_use = 1;
+        return anon_mocks[free_slot].count;
+    }
+    return base ? base : real_count;
+}
+
+/* create temp file with given content and return fd (already unlinked) */
+static int make_temp_fd_with_content(const void *data, size_t len)
+{
+    char tmpl[] = "/tmp/ac_mock_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return -1;
+    unlink(tmpl);
+    if (len && write(fd, data, len) != (ssize_t)len) { close(fd); return -1; }
+    lseek(fd, 0, SEEK_SET);
+    return fd;
+}
+static int make_fake_environ_fd(void)
+{
+    const char *e = getenv("AC_MOCK_ENVIRON");
+    char buf[8192];
+    size_t off = 0;
+    char tmp[4096];
+    char *p, *save;
+    if (!e || !*e) return -1;
+    snprintf(tmp, sizeof(tmp), "%s", e);
+    /* entries separated by ';' or '\n' */
+    p = strtok_r(tmp, ";\n", &save);
+    while (p) {
+        /* trim leading spaces */
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p) {
+            size_t l = strlen(p);
+            if (off + l + 1 < sizeof(buf)) {
+                memcpy(buf + off, p, l);
+                off += l;
+                buf[off++] = '\0';
+            }
+        }
+        p = strtok_r(NULL, ";\n", &save);
+    }
+    if (off == 0) return -1;
+    return make_temp_fd_with_content(buf, off);
+}
+static int make_fake_manifest_fd(void)
+{
+    const char *e = getenv("AC_MOCK_MANIFEST");
+    char json[2048];
+    if (!e || !*e) return -1;
+    if (strchr(e, '{')) {
+        snprintf(json, sizeof(json), "%s", e);
+    } else {
+        /* parse name:library_path[:disable_env] */
+        char buf[1024];
+        char *p1, *p2;
+        char name[256]="", libpath[256]="", dis[256]="";
+        snprintf(buf, sizeof(buf), "%s", e);
+        p1 = strchr(buf, ':');
+        if (p1) {
+            *p1++ = '\0';
+            strncpy(name, buf, sizeof(name)-1); name[sizeof(name)-1]='\0';
+            p2 = strchr(p1, ':');
+            if (p2) {
+                *p2++ = '\0';
+                snprintf(libpath, sizeof(libpath), "%s", p1);
+                snprintf(dis, sizeof(dis), "%s", p2);
+            } else {
+                snprintf(libpath, sizeof(libpath), "%s", p1);
+            }
+        } else {
+            strncpy(name, buf, sizeof(name)-1); name[sizeof(name)-1]='\0';
+            strncpy(libpath, "/tmp/fake.so", sizeof(libpath)-1); libpath[sizeof(libpath)-1]='\0';
+        }
+        if (!name[0]) snprintf(name, sizeof(name), "VK_LAYER_mock");
+        if (!libpath[0]) snprintf(libpath, sizeof(libpath), "/tmp/fake.so");
+        if (dis[0]) {
+            snprintf(json, sizeof(json),
+                "{\"file_format_version\":\"1.0.0\",\"layer\":{"
+                "\"name\":\"%s\",\"library_path\":\"%s\","
+                "\"api_version\":\"1.0.0\",\"implementation_version\":\"1\","
+                "\"description\":\"mock\",\"disable_environment\":\"%s\"}}",
+                name, libpath, dis);
+        } else {
+            snprintf(json, sizeof(json),
+                "{\"file_format_version\":\"1.0.0\",\"layer\":{"
+                "\"name\":\"%s\",\"library_path\":\"%s\","
+                "\"api_version\":\"1.0.0\",\"implementation_version\":\"1\","
+                "\"description\":\"mock\"}}",
+                name, libpath);
+        }
+    }
+    return make_temp_fd_with_content(json, strlen(json));
+}
+
+/* mem fd tracking for hook */
+#define MAX_MEM_FDS 32
+static int mem_fds[MAX_MEM_FDS];
+static int mem_fds_cnt = 0;
+static void track_mem_fd(int fd) {
+    if (mem_fds_cnt < MAX_MEM_FDS) mem_fds[mem_fds_cnt++] = fd;
+}
+static int is_tracked_mem_fd(int fd) {
+    int i;
+    for (i=0;i<mem_fds_cnt;i++) if (mem_fds[i]==fd) return 1;
+    return 0;
+}
+static void untrack_mem_fd(int fd) {
+    int i, j;
+    for (i=0;i<mem_fds_cnt;i++) if (mem_fds[i]==fd) {
+        for (j=i;j+1<mem_fds_cnt;j++) mem_fds[j]=mem_fds[j+1];
+        mem_fds_cnt--;
+        break;
+    }
+}
+
+/* fake DIR handling */
+struct fake_dir {
+    int in_use;
+    int returned;
+    char path[PATH_MAX];
+};
+static struct fake_dir fake_dirs[16];
+static struct dirent fake_dirent;
+static struct dirent *fake_dirent_ptr = NULL;
+
+static DIR *alloc_fake_dir(const char *path)
+{
+    int i;
+    for (i=0;i<16;i++) if (!fake_dirs[i].in_use) {
+        fake_dirs[i].in_use = 1;
+        fake_dirs[i].returned = 0;
+        snprintf(fake_dirs[i].path, sizeof(fake_dirs[i].path), "%s", path);
+        return (DIR*)&fake_dirs[i];
+    }
+    return NULL;
+}
+static struct fake_dir *find_fake_dir(DIR *d)
+{
+    int i;
+    for (i=0;i<16;i++) if (fake_dirs[i].in_use && (DIR*)&fake_dirs[i]==d) return &fake_dirs[i];
+    return NULL;
+}
+
 static void do_scan(int pid)
 {
     char path[64], line[512];
@@ -300,6 +693,10 @@ static void build_mods(void)
 /* ------------------------------------------------------------------ */
 static int do_ioctl(unsigned long req, void *arg)
 {
+    /* Cross-process visibility: attacker pushes events from a different
+     * process (fork) via the state file; reload so this process sees them.
+     * All handlers save after mutating, so reloading here is safe. */
+    load_state();
     switch (req) {
     case AC_IOCTL_STATUS: {
         struct ac_status *st = arg;
@@ -381,6 +778,66 @@ static int do_ioctl(unsigned long req, void *arg)
         unsigned int i;
 
         do_scan(b->pid);
+        /* inject synthetic VMA for hook mock if requested */
+        {
+            struct hook_cfg hc;
+            if (parse_hook_env(&hc) && hc.valid) {
+                char tmp[PATH_MAX];
+                int found = 0;
+                for (i = 0; i < snap_n; i++) {
+                    const char *base = strrchr(snap[i].path, '/');
+                    base = base ? base + 1 : snap[i].path;
+                    if (strncmp(base, hc.lib, strlen(hc.lib)) == 0 ||
+                        strstr(snap[i].path, hc.lib)) { found = 1; break; }
+                }
+                if (!found && snap_n < AC_MAX_VMAS) {
+                    snprintf(tmp, sizeof(tmp), "/tmp/%s", hc.lib);
+                    /* ensure tmp file exists (copy host lib) */
+                    ensure_hook_tmp_file(hc.lib);
+                    struct ac_vma_info vi;
+                    memset(&vi, 0, sizeof(vi));
+                    vi.start = g_hook_base;
+                    vi.end = g_hook_base + 0x100000;
+                    vi.offset = 0;
+                    vi.inode = 0x12345;
+                    vi.flags = 0x1 | AC_VM_EXEC; /* R+X */
+                    vi.is_file = 1;
+                    { size_t _l = strlen(tmp); if (_l >= sizeof(vi.path)) _l = sizeof(vi.path)-1; memcpy(vi.path, tmp, _l); vi.path[_l]='\0'; }
+                    snap = realloc(snap, (snap_n + 1) * sizeof(*snap));
+                    if (snap) {
+                        snap[snap_n++] = vi;
+                        g_hook = hc;
+                        snprintf(g_hook_tmp_path, sizeof(g_hook_tmp_path), "%s", tmp);
+                    }
+                } else if (found) {
+                    g_hook = hc;
+                    /* try to ensure tmp path for existing lib */
+                    ensure_hook_tmp_file(hc.lib);
+                }
+            }
+        }
+        /* pagination overflow simulation */
+        if (getenv("AC_MOCK_PAGINATION") && strcmp(getenv("AC_MOCK_PAGINATION"), "1") == 0) {
+            free(snap);
+            snap = NULL;
+            snap_n = 5000;
+            snap = calloc(snap_n, sizeof(*snap));
+            if (snap) {
+                for (i = 0; i < snap_n; i++) {
+                    snap[i].start = 0x100000ULL + (unsigned long long)i * 0x1000ULL;
+                    snap[i].end = snap[i].start + 0x1000ULL;
+                    snap[i].offset = 0;
+                    snap[i].inode = 1000 + i;
+                    snap[i].flags = 0x1 | AC_VM_EXEC;
+                    if ((i % 7) == 0)
+                        snap[i].flags |= AC_VM_WRITE;
+                    snap[i].is_file = 1;
+                    snprintf(snap[i].path, sizeof(snap[i].path), "/tmp/fake_vma_%u.so", i % 10);
+                }
+            } else {
+                snap_n = 0;
+            }
+        }
         /* Mock has no real pid-namespace resolution -- mirror the input
          * pid, same as the real module's ref_pid<=0 (default) case. */
         b->resolved_pid = b->pid;
@@ -396,7 +853,14 @@ static int do_ioctl(unsigned long req, void *arg)
             if (!snap[i].is_file && (snap[i].flags & AC_VM_EXEC))
                 b->anon_exec_count++;
         }
-        b->truncated = 0;
+        /* override anon_exec_count if mock env set (with per-pid growth) */
+        b->anon_exec_count = get_mock_anon_count(b->pid, b->anon_exec_count);
+        /* pagination must show truncation */
+        if (getenv("AC_MOCK_PAGINATION") && strcmp(getenv("AC_MOCK_PAGINATION"), "1") == 0) {
+            b->truncated = 1;
+        } else {
+            b->truncated = 0;
+        }
         if (b->emit_events && b->rwx_count)
             push_event(AC_EV_RWX, b->pid, "", "mock: %u RWX mapping(s)",
                        b->rwx_count);
@@ -469,6 +933,27 @@ static int do_ioctl(unsigned long req, void *arg)
     }
     case AC_IOCTL_GET_EVENTS: {
         struct ac_event_list *el = arg;
+        int is_pag = getenv("AC_MOCK_PAGINATION") && strcmp(getenv("AC_MOCK_PAGINATION"), "1") == 0;
+
+        /* pagination overflow: seed 70 events on first drain after flush */
+        if (is_pag && S.n_evq == 0 && S.events_dropped_total == 0) {
+            /* push 70: first 64 fill, next 6 drop */
+            int i;
+            for (i = 0; i < 70; i++) {
+                push_event(AC_EV_INFO, 1000 + i, "pag", "pagination event %d", i);
+            }
+            /* load_state was done at entry; push_event already saved */
+        }
+        /* pagination block_ms clamp test: when ring empty and block_ms>1000,
+         * kernel clamps to AC_GET_EVENTS_MAX_BLOCK_MS (1000). Mock mirrors it
+         * so block_ms=5000 sleeps only ~1000ms, proving the clamp. */
+        if (is_pag && S.n_evq == 0 && el->block_ms > 0) {
+            unsigned int sleep_ms = el->block_ms;
+            if (sleep_ms > AC_GET_EVENTS_MAX_BLOCK_MS)
+                sleep_ms = AC_GET_EVENTS_MAX_BLOCK_MS;
+            /* usleep the clamped duration to simulate kernel blocking */
+            usleep(sleep_ms * 1000);
+        }
 
         /* Real module (#61): blocks interruptibly for up to
          * el->block_ms if the ring is empty, woken early the instant an
@@ -485,7 +970,8 @@ static int do_ioctl(unsigned long req, void *arg)
          * doesn't honor block_ms) and falls back to a client-side sleep
          * to keep its polling cadence sane -- that fallback path, not a
          * fake blocking wait here, is what mock_test.sh's
-         * "start --foreground" tests actually exercise. */
+         * "start --foreground" tests actually exercise. For pagination
+         * testing (AC_MOCK_PAGINATION=1) we DO sleep above, clamped. */
         el->count = S.n_evq;
         el->dropped = S.events_dropped_total;
         memcpy(el->events, S.evq, S.n_evq * sizeof(*S.evq));
@@ -508,10 +994,32 @@ static int do_ioctl(unsigned long req, void *arg)
         S.locked = 0;
         save_state();
         return 0;
-    case AC_IOCTL_MODS_BEGIN:
+    case AC_IOCTL_MODS_BEGIN: {
+        /* pagination overflow: synthesize 1100 mods */
+        if (getenv("AC_MOCK_PAGINATION") && strcmp(getenv("AC_MOCK_PAGINATION"), "1") == 0) {
+            unsigned int i;
+            free(mods);
+            mods = calloc(1100, sizeof(*mods));
+            if (!mods) {
+                mods_n = 0;
+                *(unsigned int *)arg = 0;
+                return 0;
+            }
+            mods_n = 1100;
+            for (i = 0; i < mods_n; i++) {
+                snprintf(mods[i].name, sizeof(mods[i].name), "pag_mod_%u", i);
+                mods[i].size = 0x1000 + i;
+                mods[i].state = 0;
+            }
+            /* keep hidden_rootkit semantics? ensure at least one hidden */
+            snprintf(mods[mods_n-1].name, sizeof(mods[mods_n-1].name), "hidden_rootkit");
+            *(unsigned int *)arg = mods_n;
+            return 0;
+        }
         build_mods();
         *(unsigned int *)arg = mods_n;
         return 0;
+    }
     case AC_IOCTL_MODS_GET: {
         struct ac_mod_get *g = arg;
 
@@ -560,6 +1068,15 @@ int open(const char *path, int flags, ...)
         real = dlsym(RTLD_NEXT, "open");
     if (is_mock_path(path))
         return mock_open_common();
+    /* environ mock */
+    if (getenv("AC_MOCK_ENVIRON") && is_environ_path(path)) {
+        int fd = make_fake_environ_fd();
+        if (fd >= 0) return fd;
+    }
+    if (getenv("AC_MOCK_MANIFEST") && strstr(path, "mock_layer.json")) {
+        int fd = make_fake_manifest_fd();
+        if (fd >= 0) return fd;
+    }
     if (flags & O_CREAT) {
         va_list ap;
 
@@ -567,7 +1084,13 @@ int open(const char *path, int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
-    return real(path, flags, mode);
+    {
+        int fd = real(path, flags, mode);
+        if (fd >= 0 && getenv("AC_MOCK_HOOK_LIB") && is_mem_path(path)) {
+            track_mem_fd(fd);
+        }
+        return fd;
+    }
 }
 
 int open64(const char *path, int flags, ...)
@@ -579,6 +1102,14 @@ int open64(const char *path, int flags, ...)
         real = dlsym(RTLD_NEXT, "open64");
     if (is_mock_path(path))
         return mock_open_common();
+    if (getenv("AC_MOCK_ENVIRON") && is_environ_path(path)) {
+        int fd = make_fake_environ_fd();
+        if (fd >= 0) return fd;
+    }
+    if (getenv("AC_MOCK_MANIFEST") && strstr(path, "mock_layer.json")) {
+        int fd = make_fake_manifest_fd();
+        if (fd >= 0) return fd;
+    }
     if (flags & O_CREAT) {
         va_list ap;
 
@@ -586,7 +1117,13 @@ int open64(const char *path, int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
-    return real(path, flags, mode);
+    {
+        int fd = real(path, flags, mode);
+        if (fd >= 0 && getenv("AC_MOCK_HOOK_LIB") && is_mem_path(path)) {
+            track_mem_fd(fd);
+        }
+        return fd;
+    }
 }
 
 int openat(int dirfd, const char *path, int flags, ...)
@@ -598,6 +1135,14 @@ int openat(int dirfd, const char *path, int flags, ...)
         real = dlsym(RTLD_NEXT, "openat");
     if (is_mock_path(path))
         return mock_open_common();
+    if (getenv("AC_MOCK_ENVIRON") && is_environ_path(path)) {
+        int fd = make_fake_environ_fd();
+        if (fd >= 0) return fd;
+    }
+    if (getenv("AC_MOCK_MANIFEST") && strstr(path, "mock_layer.json")) {
+        int fd = make_fake_manifest_fd();
+        if (fd >= 0) return fd;
+    }
     if (flags & O_CREAT) {
         va_list ap;
 
@@ -605,7 +1150,13 @@ int openat(int dirfd, const char *path, int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
-    return real(dirfd, path, flags, mode);
+    {
+        int fd = real(dirfd, path, flags, mode);
+        if (fd >= 0 && getenv("AC_MOCK_HOOK_LIB") && is_mem_path(path)) {
+            track_mem_fd(fd);
+        }
+        return fd;
+    }
 }
 
 int openat64(int dirfd, const char *path, int flags, ...)
@@ -617,6 +1168,14 @@ int openat64(int dirfd, const char *path, int flags, ...)
         real = dlsym(RTLD_NEXT, "openat64");
     if (is_mock_path(path))
         return mock_open_common();
+    if (getenv("AC_MOCK_ENVIRON") && is_environ_path(path)) {
+        int fd = make_fake_environ_fd();
+        if (fd >= 0) return fd;
+    }
+    if (getenv("AC_MOCK_MANIFEST") && strstr(path, "mock_layer.json")) {
+        int fd = make_fake_manifest_fd();
+        if (fd >= 0) return fd;
+    }
     if (flags & O_CREAT) {
         va_list ap;
 
@@ -624,7 +1183,13 @@ int openat64(int dirfd, const char *path, int flags, ...)
         mode = va_arg(ap, mode_t);
         va_end(ap);
     }
-    return real(dirfd, path, flags, mode);
+    {
+        int fd = real(dirfd, path, flags, mode);
+        if (fd >= 0 && getenv("AC_MOCK_HOOK_LIB") && is_mem_path(path)) {
+            track_mem_fd(fd);
+        }
+        return fd;
+    }
 }
 
 int ioctl(int fd, unsigned long request, ...)
@@ -646,12 +1211,156 @@ int ioctl(int fd, unsigned long request, ...)
 int close(int fd)
 {
     static int (*real)(int);
-
     if (!real)
         real = dlsym(RTLD_NEXT, "close");
     if (fd == MOCK_FD)
         return 0;
+    if (is_tracked_mem_fd(fd)) untrack_mem_fd(fd);
     return real(fd);
+}
+
+/* pread handling for hook mock */
+ssize_t pread(int fd, void *buf, size_t count, off_t offset)
+{
+    static ssize_t (*real)(int, void *, size_t, off_t);
+    if (!real) real = dlsym(RTLD_NEXT, "pread");
+    if (is_tracked_mem_fd(fd)) {
+        struct hook_cfg hc;
+        if (parse_hook_env(&hc) && hc.valid) {
+            unsigned long long off = (unsigned long long)offset;
+            if (off >= g_hook_base && off < g_hook_base + 0x100000) {
+                if (strcmp(hc.status, "hooked") == 0) {
+                    /* return differing bytes */
+                    memset(buf, 0xCC, count);
+                    return (ssize_t)count;
+                } else if (strcmp(hc.status, "clean") == 0) {
+                    /* return same as file: read from tmp file at file offset */
+                    if (g_hook_tmp_path[0]) {
+                        int (*real_open)(const char*, int, ...) = dlsym(RTLD_NEXT, "open");
+                        int tfd = real_open(g_hook_tmp_path, O_RDONLY);
+                        if (tfd >= 0) {
+                            ssize_t r = real(tfd, buf, count, (off_t)(off - g_hook_base));
+                            close(tfd);
+                            if (r >= 0) return r;
+                        }
+                    }
+                    memset(buf, 0xAA, count);
+                    return (ssize_t)count;
+                } else if (strcmp(hc.status, "inconclusive") == 0) {
+                    errno = EIO;
+                    return -1;
+                }
+            }
+        }
+    }
+    return real(fd, buf, count, offset);
+}
+ssize_t pread64(int fd, void *buf, size_t count, off_t offset)
+{
+    return pread(fd, buf, count, offset);
+}
+
+/* opendir / readdir / closedir for manifest mock */
+DIR *opendir(const char *name)
+{
+    static DIR *(*real)(const char *);
+    if (!real) real = dlsym(RTLD_NEXT, "opendir");
+    if (getenv("AC_MOCK_MANIFEST") && strcmp(name, "/etc/vulkan/implicit_layer.d") == 0) {
+        DIR *d = alloc_fake_dir(name);
+        if (d) return d;
+    }
+    return real(name);
+}
+struct dirent *readdir(DIR *dirp)
+{
+    static struct dirent *(*real)(DIR *);
+    if (!real) real = dlsym(RTLD_NEXT, "readdir");
+    struct fake_dir *fd = find_fake_dir(dirp);
+    if (fd) {
+        if (fd->returned) return NULL;
+        fd->returned = 1;
+        memset(&fake_dirent, 0, sizeof(fake_dirent));
+        snprintf(fake_dirent.d_name, sizeof(fake_dirent.d_name), "mock_layer.json");
+        fake_dirent_ptr = &fake_dirent;
+        return &fake_dirent;
+    }
+    return real(dirp);
+}
+int closedir(DIR *dirp)
+{
+    static int (*real)(DIR *);
+    if (!real) real = dlsym(RTLD_NEXT, "closedir");
+    struct fake_dir *fd = find_fake_dir(dirp);
+    if (fd) {
+        fd->in_use = 0;
+        fd->returned = 0;
+        return 0;
+    }
+    return real(dirp);
+}
+
+/* ------------------------------------------------------------------ */
+/* process_vm_readv/writev denial (mirrors ac_process_vm_pre())       */
+/* ------------------------------------------------------------------ */
+static int is_protected_pid(pid_t pid)
+{
+    unsigned int i;
+    /* refresh from file -- attacker is a different process from the
+     * protector, so its in-memory S may be stale */
+    load_state();
+    for (i = 0; i < S.nprots; i++)
+        if (S.prots[i].pid == pid)
+            return 1;
+    return 0;
+}
+
+static ssize_t mock_process_vm_deny(pid_t pid, const char *op)
+{
+    char comm[AC_MAX_COMM] = "?";
+    char self_comm[AC_MAX_COMM] = "?";
+    read_comm(pid, comm, sizeof(comm));
+    read_comm(getpid(), self_comm, sizeof(self_comm));
+    /* load before push to have current S */
+    load_state();
+    push_event(AC_EV_PROCESS_VM, pid, comm,
+               "process_vm_%s by pid %d (%s) DENIED", op, getpid(), self_comm);
+    /* async SIGKILL like the kernel workqueue: succeed the syscall first,
+     * then kill after a short delay so the caller sees ESRCH before dying */
+    if (getenv("AC_MOCK_ATTACK")) {
+        pid_t me = getpid();
+        pid_t k = fork();
+        if (k == 0) {
+            usleep(10 * 1000);
+            kill(me, SIGKILL);
+            _exit(0);
+        }
+        /* parent (attacker) continues to return ESRCH; killer is reaped via SIGCHLD ignore or later wait */
+    }
+    errno = ESRCH;
+    return -1;
+}
+
+ssize_t process_vm_readv(pid_t pid,
+                         const struct iovec *local_iov, unsigned long liovcnt,
+                         const struct iovec *remote_iov, unsigned long riovcnt,
+                         unsigned long flags)
+{
+    if (pid > 0 && pid != getpid() && is_protected_pid(pid))
+        return mock_process_vm_deny(pid, "readv");
+    /* live path: direct syscall to avoid recursion through libc wrapper */
+    return (ssize_t)syscall(SYS_process_vm_readv,
+                            pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+}
+
+ssize_t process_vm_writev(pid_t pid,
+                          const struct iovec *local_iov, unsigned long liovcnt,
+                          const struct iovec *remote_iov, unsigned long riovcnt,
+                          unsigned long flags)
+{
+    if (pid > 0 && pid != getpid() && is_protected_pid(pid))
+        return mock_process_vm_deny(pid, "writev");
+    return (ssize_t)syscall(SYS_process_vm_writev,
+                            pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
 }
 
 uid_t geteuid(void)

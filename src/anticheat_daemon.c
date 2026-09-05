@@ -64,6 +64,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <pwd.h>
+#include <sys/prctl.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -128,10 +129,13 @@ static void logmsg(int pri, const char *fmt, ...)
 
 static int ac_open(void)
 {
-    dev_fd = open(AC_DEV_PATH, O_RDWR);
+    dev_fd = open(AC_DEV_PATH, O_RDWR | O_CLOEXEC);
     if (dev_fd < 0)
         die("cannot open %s: %s (is the module loaded? try: sudo insmod anticheat.ko)",
             AC_DEV_PATH, strerror(errno));
+    /* O_CLOEXEC atomically sets FD_CLOEXEC, but set it explicitly too for
+     * kernels that ignore the flag and as defense in depth after the open. */
+    fcntl(dev_fd, F_SETFD, FD_CLOEXEC);
     return dev_fd;
 }
 
@@ -760,8 +764,20 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
     char tmp_path[PATH_MAX];
     int i, kept = 0, n, lock_fd, tmp_fd, saved_errno;
     FILE *f;
+    struct stat lst;
 
-    lock_fd = open(blpath, O_RDWR | O_CREAT, 0644);
+    /* Reject symlink baseline files: blpath is derived from SHA256(path)
+     * under AC_BASELINE_DIR, which should never be a symlink. An attacker
+     * with write access to the baseline dir could otherwise swap it for a
+     * symlink to an arbitrary file and have the daemon overwrite it via the
+     * save path. O_NOFOLLOW alone on the open below would give ELOOP,
+     * but lstat lets us fail closed explicitly before flock. */
+    if (lstat(blpath, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+        errno = ELOOP;
+        return -1;
+    }
+
+    lock_fd = open(blpath, O_RDWR | O_CREAT | O_NOFOLLOW, 0644);
     if (lock_fd < 0)
         return -1;
     if (flock(lock_fd, LOCK_EX) < 0) {
@@ -1030,6 +1046,12 @@ static int compare_render_symbol(int pid, const char *libpath,
     int fd;
     ssize_t r;
 
+    /* TOCTOU: pid may have been reused between SCAN_BEGIN and this check.
+     * Verify it still exists before opening control files. kill(pid,0)
+     * is the cheapest liveness probe; ESRCH means the pid is gone. */
+    if (kill(pid, 0) < 0 && errno == ESRCH)
+        return -1;
+
     /* libpath came from the kernel's d_path() on the target's VMA, which
      * is just a string -- opening it directly from the daemon's own
      * mount namespace trusts that whatever exists at that path here is
@@ -1048,7 +1070,7 @@ static int compare_render_symbol(int pid, const char *libpath,
      * no setns() or any persistent namespace switch needed. */
     snprintf(nspath, sizeof(nspath), "/proc/%d/root%s", pid, libpath);
 
-    fd = open(nspath, O_RDONLY);
+    fd = open(nspath, O_RDONLY | O_NOFOLLOW);
     if (fd < 0)
         return -1;
     if (elf_find_symbol_offset(fd, symbol, &offset, &size) != 0) {
@@ -1161,7 +1183,7 @@ static int find_libs_by_basenames(int pid, const char *const *prefixes,
             }
         }
     }
-    ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+    (void)ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL); /* END only frees snapshot; failure is non-fatal */
     return 0;
 }
 
@@ -1549,7 +1571,7 @@ static int cmd_scan(int argc, char **argv)
             }
         }
     }
-    ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+    (void)ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL); /* END only frees snapshot; failure is non-fatal */
     if (mem_fd >= 0)
         close(mem_fd);
 
@@ -1674,7 +1696,7 @@ static long crosscheck_modules(int verbose)
         if (!visible)
             hidden++;
     }
-    ioctl(dev_fd, AC_IOCTL_MODS_END, NULL);
+    (void)ioctl(dev_fd, AC_IOCTL_MODS_END, NULL); /* END only frees snapshot; failure is non-fatal */
     if (verbose)
         printf("hidden modules: %u\n", hidden);
     return hidden;
@@ -2851,7 +2873,7 @@ static int scan_protected_periodic(void)
             anon_baseline_check(pl.items[i].pid, pl.items[i].comm,
                                  b.anon_exec_count,
                                  pl.items[i].jit_allowed != 0);
-            ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+            (void)ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL); /* END only frees snapshot; failure is non-fatal */
         }
     }
     return 0;
@@ -2952,7 +2974,7 @@ static int check_baselines_periodic(void)
         }
         if (mem_fd >= 0)
             close(mem_fd);
-        ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+        (void)ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL); /* END only frees snapshot; failure is non-fatal */
     }
     return 0;
 }
@@ -3373,12 +3395,15 @@ struct ac_report_dest {
  * without needing a real socket -- see test/ac_report_url_test.c. */
 static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
 {
+    const char *host_start, *host_end, *port_str;
+    size_t host_len;
+    const char *orig_url = url;
+
     memset(out, 0, sizeof(*out));
 
     if (strncmp(url, AC_REPORT_UNIX_PREFIX,
                 strlen(AC_REPORT_UNIX_PREFIX)) == 0) {
         const char *path = url + strlen(AC_REPORT_UNIX_PREFIX);
-
         if (!*path) {
             fprintf(stderr,
                     "ac_report: unix:// AC_REPORT_URL missing a socket "
@@ -3399,22 +3424,115 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
         return 0;
     }
 
-    {
-        char *colon;
+    /* Optional http:// or https:// scheme prefix — accept but ignore for
+     * now. Daemon still speaks plain HTTP over TCP; in a TLS deployment
+     * the reverse proxy terminates TLS and this still connects via plain
+     * TCP to localhost (see THREAT_MODEL.md). Stripping the prefix lets
+     * an operator copy a full URL from documentation without getting a
+     * spurious "must be host:port" error, and keeps error messages
+     * referencing the original URL via orig_url. Path after port
+     * (e.g. /report) is also ignored — the request line is always
+     * POST /report. */
+    if (strncmp(url, "http://", 7) == 0)
+        url += 7;
+    else if (strncmp(url, "https://", 8) == 0)
+        url += 8;
 
-        snprintf(out->host, sizeof(out->host), "%s", url);
-        colon = strrchr(out->host, ':');
+    /* TCP host:port — support both "host:port" and "[ipv6]:port".
+     * Bracketed form is unambiguous for IPv6 literals; bare form keeps
+     * backwards compat via last-colon split (e.g. "::1:8787" -> host "::1"). */
+    if (url[0] == '[') {
+        const char *close = strchr(url, ']');
+
+        if (!close) {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL missing closing ']' in "
+                    "IPv6 literal: %s\n", orig_url);
+            return -1;
+        }
+        if (close[1] != ':') {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL IPv6 literal must be "
+                    "followed by ':port': %s\n", url);
+            return -1;
+        }
+        host_start = url + 1;
+        host_end = close;
+        port_str = close + 2;
+        if (host_end == host_start) {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL has empty host: %s\n", url);
+            return -1;
+        }
+        host_len = (size_t)(host_end - host_start);
+    } else {
+        const char *colon = strrchr(url, ':');
+
         if (!colon) {
             fprintf(stderr,
                     "ac_report: AC_REPORT_URL must be host:port or "
                     "unix:///path/to/socket\n");
             return -1;
         }
-        *colon = '\0';
-        snprintf(out->port, sizeof(out->port), "%s", colon + 1);
-        return 0;
+        host_start = url;
+        host_end = colon;
+        port_str = colon + 1;
+        host_len = (size_t)(host_end - host_start);
+        if (host_len == 0) {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL has empty host: %s\n", url);
+            return -1;
+        }
     }
+
+    {
+        const char *port_end = strchr(port_str, '/');
+        size_t port_len = port_end ? (size_t)(port_end - port_str) : strlen(port_str);
+
+        if (port_len == 0) {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL missing port: %s\n", orig_url);
+            return -1;
+        }
+        if (port_len >= sizeof(out->port)) {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL port too long: %s\n", orig_url);
+            return -1;
+        }
+        if (host_len >= sizeof(out->host)) {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL host too long: %s\n", orig_url);
+            return -1;
+        }
+        {
+            char port_buf[32];
+            char *end;
+            unsigned long port_val;
+
+            memcpy(port_buf, port_str, port_len);
+            port_buf[port_len] = '\0';
+            port_val = strtoul(port_buf, &end, 10);
+            if (end == port_buf || *end != '\0') {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL port is not numeric: %s\n",
+                        orig_url);
+                return -1;
+            }
+            if (port_val == 0 || port_val > 65535) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL port out of range (1-65535): "
+                        "%s\n", orig_url);
+                return -1;
+            }
+            memcpy(out->port, port_buf, port_len + 1);
+        }
+    }
+    memcpy(out->host, host_start, host_len);
+    out->host[host_len] = '\0';
+    return 0;
 }
+
+
 
 static void ac_report(const char *event_type, const char *detail)
 {
@@ -3444,11 +3562,16 @@ static void ac_report(const char *event_type, const char *detail)
     ac_json_escape(client_id, client_id_esc, sizeof(client_id_esc));
     ac_json_escape(event_type, et_esc, sizeof(et_esc));
     ac_json_escape(detail, detail_esc, sizeof(detail_esc));
-    snprintf(body, sizeof(body),
-             "{\"client_id\":\"%s\",\"event_type\":\"%s\",\"detail\":\"%s\","
-             "\"ts\":%lld}",
-             client_id_esc, et_esc, detail_esc, (long long)time(NULL));
-
+    {
+        int bodyn = snprintf(body, sizeof(body),
+                 "{\"client_id\":\"%s\",\"event_type\":\"%s\",\"detail\":\"%s\","
+                 "\"ts\":%lld}",
+                 client_id_esc, et_esc, detail_esc, (long long)time(NULL));
+        if (bodyn < 0 || (size_t)bodyn >= sizeof(body)) {
+            fprintf(stderr, "ac_report: report body too large to send\n");
+            return;
+        }
+    }
     if (dest.is_unix) {
         struct sockaddr_un sun;
 
@@ -3712,6 +3835,16 @@ static int cmd_start(int argc, char **argv)
             fprintf(stderr, "daemon: stdout redirect failed\n");
         if (!freopen("/var/log/anticheat.log", "a", stderr))
             fprintf(stderr, "daemon: stderr redirect failed\n");
+        /* Prevent non-root ptrace of the daemon via /proc/self/mem or
+         * PTRACE_ATTACH when running backgrounded: the daemon is already
+         * self-protected via AC_IOCTL_ADD_PROC (ptrace kprobe), but making
+         * it non-dumpable adds a second layer that stops even a
+         * same-uid attacker from reading its memory through /proc/<pid>/mem
+         * without CAP_SYS_PTRACE. Only when backgrounded: --foreground is
+         * the debug path where a developer may want to strace/gdb it. */
+        if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
+            fprintf(stderr, "daemon: prctl PR_SET_DUMPABLE failed: %s\n",
+                    strerror(errno));
     }
 
     openlog("anticheat", LOG_PID | LOG_NDELAY, LOG_AUTH);

@@ -95,6 +95,15 @@ ProtectKernelLogs=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=true
-
+ProtectKernelTunables=true
+ProtectClock=true
+ProtectHostname=true
+PrivateDevices=true
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+ProcSubset=pid
 [Install]
 WantedBy=multi-user.target

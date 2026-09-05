@@ -23,7 +23,7 @@ override_dh_auto_test:
 	# kernel's headers -- see dkms.conf). .github/workflows/ci.yml
 	# already runs the mock suite on every push; nothing to duplicate
 	# here.
-
+	python3 -m py_compile server/ac_server.py
 override_dh_auto_install:
 	install -Dm755 anticheat debian/hypranticheat/usr/bin/anticheat
 	install -dm755 debian/hypranticheat/var/lib/anticheat/baselines

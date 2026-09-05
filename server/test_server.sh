@@ -10,7 +10,8 @@ set -u
 cd "$(dirname "$0")" || exit 1
 
 PORT=18799
-DB="/tmp/ac_server_test_$$.db"
+TESTDIR="$(mktemp -d /tmp/ac_server_test.XXXXXXXX)"
+DB="$TESTDIR/ac.db"
 REPORT_KEY="test-report-key-$$"
 ADMIN_KEY="test-admin-key-$$"
 BASE="http://127.0.0.1:$PORT"
@@ -53,7 +54,7 @@ cleanup() {
     wait "$NOTP_SERVER_PID" 2>/dev/null
     wait "$ROT_SERVER_PID" 2>/dev/null
     wait "$UNIX_SERVER_PID" 2>/dev/null
-    rm -f "$DB" "$DB-wal" "$DB-shm"
+    rm -rf "$TESTDIR"
 }
 trap cleanup EXIT
 
@@ -72,7 +73,7 @@ umask 022
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$PORT" --db "$DB" \
     --rate-limit 500 --rate-window 60 \
-    >/tmp/ac_server_test_$$.log 2>&1 &
+    >"$TESTDIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 READY=0
@@ -474,14 +475,13 @@ else
     else
         fail "server should still answer normally after a recovered DB failure (got $CODE)"
     fi
-    if grep -q "Traceback" "/tmp/ac_server_test_$$.log"; then
+    if grep -q "Traceback" "$TESTDIR/server.log"; then
         pass "internal error was logged with a traceback for debugging"
     else
         fail "expected a traceback logged for the induced DB failure"
     fi
 fi
 
-rm -f "/tmp/ac_server_test_$$.log"
 
 # Rate limiting: a separate low-limit server instance, so this doesn't
 # interfere with (or get interfered with by) the ~11 requests the
@@ -489,11 +489,11 @@ rm -f "/tmp/ac_server_test_$$.log"
 RL_PORT=18800
 RL_LIMIT=3
 RL_WINDOW=2
-RL_DB="/tmp/ac_server_rl_test_$$.db"
+RL_DB="$TESTDIR/rl.db"
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$RL_PORT" --db "$RL_DB" \
     --rate-limit "$RL_LIMIT" --rate-window "$RL_WINDOW" \
-    >/tmp/ac_server_rl_test_$$.log 2>&1 &
+    >"$TESTDIR/rl.log" 2>&1 &
 RL_SERVER_PID=$!
 RL_BASE="http://127.0.0.1:$RL_PORT"
 
@@ -560,15 +560,16 @@ fi
 
 kill "$RL_SERVER_PID" 2>/dev/null
 wait "$RL_SERVER_PID" 2>/dev/null
-rm -f "$RL_DB" "$RL_DB-wal" "$RL_DB-shm" "/tmp/ac_server_rl_test_$$.log"
+
 
 # Graceful SIGTERM: a dedicated instance, confirm it exits on its own
 # within a few seconds (not needing a -9), with no traceback logged.
 TERM_PORT=18801
-TERM_DB="/tmp/ac_server_term_test_$$.db"
+TERM_TESTDIR="$(mktemp -d /tmp/ac_server_term_test.XXXXXXXX)"
+TERM_DB="$TERM_TESTDIR/ac.db"
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$TERM_PORT" --db "$TERM_DB" \
-    >/tmp/ac_server_term_test_$$.log 2>&1 &
+    >"$TERM_TESTDIR/server.log" 2>&1 &
 TERM_SERVER_PID=$!
 TERM_BASE="http://127.0.0.1:$TERM_PORT"
 
@@ -606,7 +607,7 @@ if [ "$TERM_READY" -eq 1 ]; then
     else
         fail "server did not exit cleanly within 2s of SIGTERM"
     fi
-    if grep -q "Traceback" "/tmp/ac_server_term_test_$$.log"; then
+    if grep -q "Traceback" "$TERM_TESTDIR/server.log"; then
         fail "SIGTERM shutdown logged an unexpected traceback"
     else
         pass "SIGTERM shutdown logged no traceback"
@@ -615,7 +616,7 @@ else
     fail "SIGTERM test server never became ready on port $TERM_PORT"
 fi
 TERM_SERVER_PID=""
-rm -f "$TERM_DB" "$TERM_DB-wal" "$TERM_DB-shm" "/tmp/ac_server_term_test_$$.log"
+rm -rf "$TERM_TESTDIR"
 
 # --trust-proxy: a dedicated instance started with the flag, at the
 # default (high) rate limit so these functional IP-handling checks don't
@@ -623,11 +624,12 @@ rm -f "$TERM_DB" "$TERM_DB-wal" "$TERM_DB-shm" "/tmp/ac_server_term_test_$$.log"
 # gets its own low-limit instance below, mirroring how the main suite
 # above already separates functional tests from rate-limit-specific ones.
 TP_PORT=18802
-TP_DB="/tmp/ac_server_tp_test_$$.db"
+TP_TESTDIR="$(mktemp -d /tmp/ac_server_tp_test.XXXXXXXX)"
+TP_DB="$TP_TESTDIR/ac.db"
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$TP_PORT" --db "$TP_DB" \
     --trust-proxy \
-    >/tmp/ac_server_tp_test_$$.log 2>&1 &
+    >"$TP_TESTDIR/server.log" 2>&1 &
 TP_SERVER_PID=$!
 TP_BASE="http://127.0.0.1:$TP_PORT"
 TP_CID="test-tp-$$"
@@ -692,7 +694,7 @@ fi
 kill "$TP_SERVER_PID" 2>/dev/null
 wait "$TP_SERVER_PID" 2>/dev/null
 TP_SERVER_PID=""
-rm -f "$TP_DB" "$TP_DB-wal" "$TP_DB-shm" "/tmp/ac_server_tp_test_$$.log"
+rm -rf "$TP_TESTDIR"
 
 # rate-limit key follows the trusted IP: a separate, dedicated low-limit
 # --trust-proxy instance (own budget, doesn't collide with the functional
@@ -701,22 +703,15 @@ rm -f "$TP_DB" "$TP_DB-wal" "$TP_DB-shm" "/tmp/ac_server_tp_test_$$.log"
 # proves the limiter key isn't varying per attacker-controlled prefix,
 # which would let a client evade rate limiting entirely.
 TPRL_PORT=18807
-TPRL_DB="/tmp/ac_server_tprl_test_$$.db"
+TPRL_TESTDIR="$(mktemp -d /tmp/ac_server_tprl_test.XXXXXXXX)"
+TPRL_DB="$TPRL_TESTDIR/ac.db"
 # Window wider than the main rate-limit block's 2s (this test issues
-# real HTTP round-trips sequentially, not against a mock clock -- a
-# slower/loaded CI runner could plausibly let a tight window roll over
-# mid-test, silently turning a real trip into a false pass), but the
-# limit itself stays low: fewer requests needed to exhaust the budget
-# means less cumulative request time consumed before the assertion
-# request, which is *more* margin against that same boundary risk, not
-# less -- widening both proportionally would have given back some of
-# the margin the wider window was meant to add.
 TPRL_LIMIT=3
 TPRL_WINDOW=5
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$TPRL_PORT" --db "$TPRL_DB" \
     --trust-proxy --rate-limit "$TPRL_LIMIT" --rate-window "$TPRL_WINDOW" \
-    >/tmp/ac_server_tprl_test_$$.log 2>&1 &
+    >"$TPRL_TESTDIR/server.log" 2>&1 &
 TP_SERVER_PID=$!
 TPRL_BASE="http://127.0.0.1:$TPRL_PORT"
 
@@ -751,7 +746,7 @@ fi
 kill "$TP_SERVER_PID" 2>/dev/null
 wait "$TP_SERVER_PID" 2>/dev/null
 TP_SERVER_PID=""
-rm -f "$TPRL_DB" "$TPRL_DB-wal" "$TPRL_DB-shm" "/tmp/ac_server_tprl_test_$$.log"
+rm -rf "$TPRL_TESTDIR"
 
 # default instance (flag off, from the very top of this script) must
 # ignore X-Forwarded-For entirely -- negative control against a future
@@ -759,10 +754,11 @@ rm -f "$TPRL_DB" "$TPRL_DB-wal" "$TPRL_DB-shm" "/tmp/ac_server_tprl_test_$$.log"
 # was already killed by this point in the script, so start a fresh
 # throwaway one rather than reordering everything above.
 NOTP_PORT=18803
-NOTP_DB="/tmp/ac_server_notp_test_$$.db"
+NOTP_TESTDIR="$(mktemp -d /tmp/ac_server_notp_test.XXXXXXXX)"
+NOTP_DB="$NOTP_TESTDIR/ac.db"
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$NOTP_PORT" --db "$NOTP_DB" \
-    >/tmp/ac_server_notp_test_$$.log 2>&1 &
+    >"$NOTP_TESTDIR/server.log" 2>&1 &
 NOTP_SERVER_PID=$!
 NOTP_BASE="http://127.0.0.1:$NOTP_PORT"
 NOTP_CID="test-notp-$$"
@@ -792,7 +788,7 @@ else
 fi
 kill "$NOTP_SERVER_PID" 2>/dev/null
 wait "$NOTP_SERVER_PID" 2>/dev/null
-rm -f "$NOTP_DB" "$NOTP_DB-wal" "$NOTP_DB-shm" "/tmp/ac_server_notp_test_$$.log"
+rm -rf "$NOTP_TESTDIR"
 
 # Key rotation: a dedicated instance started with both a current and an
 # "-old" key per tier, proving both are accepted during the rotation
@@ -1011,12 +1007,12 @@ rm -rf "$TPUS_TESTDIR"
 # request must be refused fast with 503 (not parked behind the slow ones),
 # and the server must serve normally again once the holders go away.
 CAP_PORT=18810
-CAP_DB="/tmp/ac_server_cap_test_$$.db"
-rm -f "$CAP_DB" "$CAP_DB-wal" "$CAP_DB-shm"
+CAP_TESTDIR="$(mktemp -d /tmp/ac_server_cap_test.XXXXXXXX)"
+CAP_DB="$CAP_TESTDIR/ac.db"
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$CAP_PORT" --db "$CAP_DB" \
     --rate-limit 1000 --rate-window 60 --max-connections 2 \
-    >/tmp/ac_server_cap_test_$$.log 2>&1 &
+    >"$CAP_TESTDIR/server.log" 2>&1 &
 CAP_SERVER_PID=$!
 CAP_BASE="http://127.0.0.1:$CAP_PORT"
 
@@ -1102,43 +1098,38 @@ fi
 kill "$CAP_SERVER_PID" 2>/dev/null
 wait "$CAP_SERVER_PID" 2>/dev/null
 CAP_SERVER_PID=""
-rm -f "$CAP_DB" "$CAP_DB-wal" "$CAP_DB-shm" "/tmp/ac_server_cap_test_$$.log"
+rm -rf "$CAP_TESTDIR"
 
 # Startup-failure paths: no server needed, just exit code + stderr.
 if AC_SERVER_REPORT_KEY='' AC_SERVER_ADMIN_KEY='' python3 ./ac_server.py \
-    --port 18804 --db "/tmp/ac_server_nokeys_$$.db" >/tmp/ac_nokeys_$$.log 2>&1; then
+    --port 18804 --db "$TESTDIR/nokeys.db" >/dev/null 2>&1; then
     fail "server should refuse to start with no auth configured"
 else
     pass "server refuses to start with no auth configured"
 fi
-rm -f "/tmp/ac_nokeys_$$.log"
 
 if AC_SERVER_REPORT_KEY=same AC_SERVER_ADMIN_KEY=same python3 ./ac_server.py \
-    --port 18805 --db "/tmp/ac_server_samekeys_$$.db" >/tmp/ac_samekeys_$$.log 2>&1; then
+    --port 18805 --db "$TESTDIR/samekeys.db" >/dev/null 2>&1; then
     fail "server should refuse to start with equal report/admin keys"
 else
     pass "server refuses to start with equal report/admin keys"
 fi
-rm -f "/tmp/ac_samekeys_$$.log"
 
 if AC_SERVER_REPORT_KEY=r AC_SERVER_ADMIN_KEY=a python3 ./ac_server.py \
-    --port 18806 --db "/tmp/ac_server_badrl_$$.db" --rate-limit 0 \
-    >/tmp/ac_badrl_$$.log 2>&1; then
+    --port 18806 --db "$TESTDIR/badrl.db" --rate-limit 0 \
+    >/dev/null 2>&1; then
     fail "server should refuse to start with --rate-limit 0"
 else
     pass "server refuses to start with --rate-limit 0"
 fi
-rm -f "/tmp/ac_badrl_$$.log"
 
 if AC_SERVER_REPORT_KEY=r AC_SERVER_ADMIN_KEY=a python3 ./ac_server.py \
-    --port 18811 --db "/tmp/ac_server_badcap_$$.db" --max-connections 0 \
-    >/tmp/ac_badcap_$$.log 2>&1; then
+    --port 18811 --db "$TESTDIR/badcap.db" --max-connections 0 \
+    >/dev/null 2>&1; then
     fail "server should refuse to start with --max-connections 0"
 else
     pass "server refuses to start with --max-connections 0"
 fi
-rm -f "/tmp/ac_badcap_$$.log"
-
 # an -old key that overlaps the other tier's current key is just as much
 # a tier-separation break as report-key == admin-key -- must be rejected
 # at startup too, not just the non-rotation case.

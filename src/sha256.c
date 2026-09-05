@@ -29,7 +29,7 @@ static const uint32_t K[64] = {
 
 static inline uint32_t rotr(uint32_t x, unsigned int n)
 {
-    return (x >> n) | (x << (32 - n));
+    return (x >> (n & 31)) | (x << ((32 - (n & 31)) & 31));
 }
 
 static inline uint32_t be32(const uint8_t *p)

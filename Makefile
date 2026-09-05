@@ -29,8 +29,8 @@ KVER ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KVER)/build
 PWD  := $(shell pwd)
 CC   ?= gcc
-CFLAGS ?= -O2 -Wall -Wextra
-LDFLAGS ?=
+CFLAGS ?= -O2 -Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+LDFLAGS ?= -Wl,-z,relro,-z,now
 DECK_PREFIX ?= $(HOME)/.local/share/anticheat
 
 # If the running kernel was built with clang/LLVM, build the module with
@@ -101,7 +101,7 @@ module:
 	$(MAKE) -C $(KDIR) M=$(PWD) LLVM=$(LLVM) $(if $(AC_MODULE_CC),CC="$(AC_MODULE_CC)") modules
 
 daemon: src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
-	$(CC) $(CFLAGS) -o anticheat src/anticheat_daemon.c src/sha256.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o anticheat src/anticheat_daemon.c src/sha256.c $(LDFLAGS) -pie
 
 mock: test/libmock_anticheat.so
 
@@ -160,14 +160,20 @@ test/thread_exit_migration_test: test/thread_exit_migration_test.c src/anticheat
 # already-protected thread must not get its own registry slot -- exercises
 # ac_clone_ret()'s CLONE_THREAD dedup (guards against duplicate registry
 # entries / AC_PROT_MAX exhaustion). Needs root and the module loaded --
-# see test.sh.
 thread-spawn-after-protect-test: test/thread_spawn_after_protect_test
 
 test/thread_spawn_after_protect_test: test/thread_spawn_after_protect_test.c src/anticheat.h
 	$(CC) $(CFLAGS) -pthread -o $@ $< $(LDFLAGS)
 
-# ioctl fuzz harness: hammers every AC_IOCTL_* with malformed sizes,
-# boundary values, and null/wild/unmapped pointers -- the actual attack
+# process_vm denial test: proves process_vm_readv/writev against a
+# protected victim are rewritten to -ESRCH and emit AC_EV_PROCESS_VM,
+# and with ac_policy 0x1 / AC_MOCK_ATTACK=1 the attacker is SIGKILLed.
+# Runs both natively and (on x86-64) via int $0x80 compat numbers when
+# available -- see test/process_vm_test.c.
+process-vm-test: test/process_vm_test
+
+test/process_vm_test: test/process_vm_test.c src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 # surface any local process holding an open fd can reach. Against the
 # mock this only proves the harness itself doesn't crash (see its own
 # header comment); the real run is against a loaded module, as root,
@@ -205,13 +211,17 @@ test/ac_report_status_test: test/ac_report_status_test.c src/anticheat_daemon.c 
 # AF_UNIX form, and rejects a malformed/oversized one. See
 # test/ac_report_url_test.c; the real AF_UNIX connect()/send()/recv()
 # path this feeds is exercised against a real server in
-# server/test_server.sh's --unix-socket block instead.
-ac-report-url-test: test/ac_report_url_test
-	./test/ac_report_url_test
-
 test/ac_report_url_test: test/ac_report_url_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ test/ac_report_url_test.c src/sha256.c $(LDFLAGS)
 
+# pagination/cap smoke test (Phase 5.4): mock returns n_vmas=5000, n_mods=1100,
+# n_events=70 when AC_MOCK_PAGINATION=1; pagination_test proves begin/get/end
+# truncation and AC_GET_EVENTS_MAX_BLOCK_MS clamping.
+pagination-test: test/pagination_test
+	./test/pagination_test
+
+test/pagination_test: test/pagination_test.c src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 # run the daemon CLI against the userspace mock (no kernel module, no root)
 test-mock: mock daemon
 	./test/mock_test.sh
@@ -226,8 +236,7 @@ ci:
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test
-
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/process_vm_test test/pagination_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat
 	install -D -m 0644 anticheat.ko /lib/modules/$(KVER)/extra/anticheat.ko
@@ -255,4 +264,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf $(DECK_PREFIX)
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test process-vm-test pagination-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ci clean install uninstall install-deck uninstall-deck

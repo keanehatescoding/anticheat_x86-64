@@ -10,7 +10,7 @@ Homepage: https://github.com/keanehatescoding/hypranticheat
 Package: hypranticheat
 Architecture: amd64
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Recommends: hypranticheat-dkms
+Recommends: hypranticheat-dkms (= ${binary:Version})
 Description: userspace daemon/CLI for a kernel-mode anticheat
  hypranticheat is a Linux kernel-mode anticheat: a loadable kernel module
  that performs syscall/module integrity checks and process protection,

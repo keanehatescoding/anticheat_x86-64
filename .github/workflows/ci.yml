@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Build with warnings-as-errors, run the full mock suite
         run: make ci
@@ -91,7 +91,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install toolchain
         run: |
@@ -113,6 +113,9 @@ jobs:
           curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
             -o linux-6.12.tar.xz \
             https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz
+          curl -fsSL -o sha256sums.asc \
+            https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc
+          grep "linux-6.12.tar.xz" sha256sums.asc | sha256sum -c -
           tar -xJf linux-6.12.tar.xz
           rm -f linux-6.12.tar.xz
           make -C linux-6.12 ARCH=x86_64 defconfig
@@ -173,7 +176,7 @@ jobs:
           modinfo ./anticheat.ko | head -6
 
       - name: Upload module artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: anticheat-ko
           path: anticheat.ko
@@ -217,7 +220,7 @@ jobs:
         # outcome, only skipping on a cancelled workflow (where the log
         # may never have been written at all).
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: sparse-log
           path: sparse.log
@@ -299,17 +302,21 @@ jobs:
       # checkout has neither, which would force it into the GitHub REST API
       # fallback path (needing broader permissions this workflow doesn't
       # otherwise grant) or fail outright on a push event.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
-      - name: Check whether src/anticheat_module.c changed
+      - name: Check whether kernel module sources changed
         id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         with:
           filters: |
             module:
-              - 'src/anticheat_module.c'
+              - 'src/**'
+              - 'src/anticheat.h'
+              - 'Makefile'
+              - 'dkms.conf'
+              - 'src/sha256.*'
 
   # --- real-module fuzz seed: short KASAN run against the actual module ---
   # THREAT_MODEL.md's "What 'production-ready' claims today" section
@@ -344,7 +351,7 @@ jobs:
     steps:
       # persist-credentials: false -- same reasoning as kasan-boot.yml:
       # no later step needs authenticated git access.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -400,7 +407,7 @@ jobs:
         # otherwise skip this step precisely when the partial console log
         # is most useful for diagnosing where it hung.
         if: ${{ failure() || cancelled() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: kasan-fuzz-seed-failure
           path: |
