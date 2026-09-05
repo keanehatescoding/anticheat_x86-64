@@ -148,8 +148,10 @@ static unsigned long ac_lookup(const char *name)
  * ftrace/CALL-thunk mitigations the kprobe can instead land 5 bytes past
  * a leading fentry pad -- either a CALL rel32 (0xe8 ..) or the common
  * 5-byte NOP (0f 1f 44 00 00) -- so detect that pad the same way and step
- * back 5; on kernels without either layout the address is already the
- * function start. See #91. */
+ * back 5.  The two can stack (endbr64 immediately followed by the fentry
+ * pad), so the pad step runs first and the endbr64 check runs on the
+ * adjusted address; on kernels with neither layout the address is
+ * already the function start. See #91. */
 static unsigned long ac_normalize_func(unsigned long addr)
 {
     unsigned int insn;
@@ -157,16 +159,16 @@ static unsigned long ac_normalize_func(unsigned long addr)
 
     if (!addr)
         return 0;
-    if (addr >= 4 &&
-        ac_kread(&insn, (void *)(addr - 4), sizeof(insn)) == 0 &&
-        insn == 0xfa1e0ff3)   /* endbr64, little-endian */
-        return addr - 4;
     if (addr >= 5 &&
         ac_kread(pad, (void *)(addr - 5), sizeof(pad)) == 0 &&
         (pad[0] == 0xe8 ||
          (pad[0] == 0x0f && pad[1] == 0x1f && pad[2] == 0x44 &&
           pad[3] == 0x00 && pad[4] == 0x00)))
-        return addr - 5;
+        addr -= 5;
+    if (addr >= 4 &&
+        ac_kread(&insn, (void *)(addr - 4), sizeof(insn)) == 0 &&
+        insn == 0xfa1e0ff3)   /* endbr64, little-endian */
+        return addr - 4;
     return addr;
 }
 
