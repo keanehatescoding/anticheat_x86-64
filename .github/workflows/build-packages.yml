@@ -116,8 +116,14 @@ jobs:
           persist-credentials: false
           # PKGBUILD's pkgver() runs `git describe --long --tags`,
           # which needs full tag history - the default shallow
-          # (depth-1) checkout has none of it.
+          # (depth-1) checkout has none of it. fetch-depth: 0 alone
+          # isn't enough either: actions/checkout only fetches the
+          # single ref being checked out at full depth, not tags,
+          # unless fetch-tags is also set - confirmed by a real CI
+          # run failing with "fatal: No names found, cannot describe
+          # anything." despite fetch-depth: 0 already being set.
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Install bootstrap dependencies
         # Only what's needed to get makepkg itself running as a
@@ -232,7 +238,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # Same fetch-tags gap as build-arch's checkout above: needed
+          # for the tag-triggered `git describe --long --tags` step
+          # below to find any tags at all.
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Install rpmbuild tooling
         run: |
