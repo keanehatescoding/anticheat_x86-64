@@ -295,22 +295,29 @@ else
     fail "start: expected exactly 1 checksum mismatch log line, got $checksum_crit_count"
 fi
 echo "== scan --check-hooks (mock) =="
+# shellcheck disable=SC2016 # $BASHPID is intentional: it must expand inside the inner bash -c, not the outer
 expect_out "scan --check-hooks hooked" "render hook" bash -c 'AC_MOCK_HOOK_LIB="libvulkan.so.1:vkQueuePresentKHR:hooked" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-hooks'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# shellcheck disable=SC2016
 expect_out "scan --check-hooks clean" "clean" bash -c 'AC_MOCK_HOOK_LIB="libvulkan.so.1:vkQueuePresentKHR:clean" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-hooks'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# shellcheck disable=SC2016
 expect_out "scan --check-hooks inconclusive" "could not verify" bash -c 'AC_MOCK_HOOK_LIB="libvulkan.so.1:vkQueuePresentKHR:inconclusive" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-hooks'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# shellcheck disable=SC2016
 expect_out "scan --check-hooks no mock -> not loaded" "not loaded" bash -c 'exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-hooks'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 
 echo "== scan --check-preload / --check-vklayers / --check-implicit-layers (mock) =="
+# shellcheck disable=SC2016
 expect_out "scan --check-preload detects LD_PRELOAD" "LD_PRELOAD check: /tmp/evil.so" bash -c 'AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/evil.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# shellcheck disable=SC2016
 expect_out "scan --check-preload not set" "not set" bash -c 'AC_MOCK_ENVIRON="EMPTY=1" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# shellcheck disable=SC2016
 expect_out "scan --check-vklayers detects" "VK_INSTANCE_LAYERS=VK_LAYER_test" bash -c 'AC_MOCK_ENVIRON="VK_INSTANCE_LAYERS=VK_LAYER_test" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-vklayers'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# shellcheck disable=SC2016
 expect_out "scan --check-implicit-layers detects mock" "VK_LAYER_mock" bash -c 'AC_MOCK_MANIFEST="VK_LAYER_mock:/tmp/fake.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-implicit-layers'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 
 echo "== anon-exec growth and --jit downgrade (mock) =="
+# shellcheck disable=SC2016
 expect_out "scan anon-exec count override" "anon-exec" bash -c 'AC_MOCK_ANON_EXEC_COUNT=5 exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 # periodic anon-exec growth: protect a sleep, run daemon with short interval, check that growth is logged
-# Use a fresh state file for the periodic run to avoid pollution from earlier protects
-ANON_SLEEP=$(mktemp -u)
 sleep 30 &
 ANON_PID=$!
 ./anticheat protect --pid $ANON_PID >/dev/null 2>&1
