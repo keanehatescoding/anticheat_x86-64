@@ -43,7 +43,14 @@ sha256sums=('SKIP')
 
 pkgver() {
   cd hyprav
-  git describe --long --tags | sed 's/^v//; s/-/.r/; s/-/./'
+  # No tag has ever been cut for this repo (see the top-of-file note),
+  # so `git describe --tags` always fails here with "No names found,
+  # cannot describe anything." - confirmed by a real CI run. Fall back
+  # to the standard untagged VCS-package scheme (r<total commits>.
+  # <short hash>) so this keeps building; once a real vX.Y.Z tag
+  # exists, `git describe` succeeds again and this reverts to using it.
+  git describe --long --tags 2>/dev/null | sed 's/^v//; s/-/.r/; s/-/./' \
+    || printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 build() {
