@@ -105,7 +105,7 @@ static mempool_t *ac_kill_pool;
 static atomic_t ac_kill_dropped = ATOMIC_INIT(0);
 
 /* ------------------------------------------------------------------ */
-/* safe kernel reads                                                   */
+/* safe kernel reads/writes                                            */
 /* ------------------------------------------------------------------ */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
 # define ac_kread(dst, src, n) copy_from_kernel_nofault((dst), (src), (n))
@@ -113,6 +113,68 @@ static atomic_t ac_kill_dropped = ATOMIC_INIT(0);
 # include <asm/uaccess.h>
 # define ac_kread(dst, src, n) probe_kernel_read((dst), (src), (n))
 #endif
+
+/* copy_to_kernel_nofault() -- the write-side twin of copy_from_kernel_
+ * nofault() that ac_kread() above wraps -- is not EXPORT_SYMBOL'd on
+ * every kernel this module targets (confirmed missing from this build's
+ * own symbol table), so it can't be called from a module. The only write
+ * this file ever needs through a nofault path is a single register-sized
+ * slot in a kprobe'd pt_regs frame (see ac_ptrace_pre()/ac_process_vm_
+ * pre()'s neutralisation writes), so rebuild just that with the same
+ * __put_kernel_nofault()/arch_put_kernel_nofault() building block
+ * copy_to_kernel_nofault() itself is implemented with -- header-inline,
+ * so no export is required. */
+static inline int ac_kwrite_long(void *dst, unsigned long val)
+{
+    __put_kernel_nofault(dst, &val, unsigned long, ac_kwrite_long_fault);
+    return 0;
+ac_kwrite_long_fault:
+    return -EFAULT;
+}
+/* Synchronous fail-closed override for the syscall-deny kprobes below.
+ *
+ * ac_schedule_kill() only queues a work item: the probed syscall resumes
+ * with its original arguments long before the worker sends SIGKILL, and a
+ * mempool-exhausted queue_work() may never send it at all. So whenever a
+ * neutralisation write fails -- meaning the syscall would otherwise run
+ * un-denied -- the pre-handler must also stop the probed function itself
+ * from executing, synchronously, before returning.
+ *
+ * At function entry (the probed first instruction hasn't run, so no frame
+ * of ours exists yet and the stack top still holds the caller's return
+ * address) that is: pop the return address, stash the error in %rax, and
+ * resume there with a non-zero pre-handler return so kprobes skips
+ * single-stepping. From the caller's (do_syscall_64's) point of view this
+ * is indistinguishable from the probed wrapper returning the error
+ * itself. Uses only a nofault read and register writes, so it is safe in
+ * atomic kprobe context; unlike override_function_with_return() it does
+ * not depend on CONFIG_FUNCTION_ERROR_INJECTION (a no-op stub when that
+ * is off). Returns 1 when the syscall was skipped, 0 when the stack slot
+ * itself was unreadable (caller falls back to the queued kill alone).
+ *
+ * NOTE: kprobes ignores a regs->ip change + non-zero return while the
+ * probe is jump/ftrace-optimized, so every probe whose pre-handler can
+ * take this path carries the empty ac_probe_post() below: a probe with a
+ * post_handler is never optimized, keeping this override honored. */
+static int ac_skip_syscall(struct pt_regs *regs, long err)
+{
+    unsigned long ret_addr;
+
+    if (ac_kread(&ret_addr, (const void *)regs->sp, sizeof(ret_addr)))
+        return 0;
+    regs_set_return_value(regs, (unsigned long)err);
+    regs->ip = ret_addr;
+    regs->sp += sizeof(ret_addr);
+    return 1;
+}
+
+/* Empty on purpose -- see ac_skip_syscall's NOTE. A post_handler never
+ * even fires on the override path (a non-zero pre-handler return
+ * suppresses it); its only job is to keep the probe unoptimized. */
+static void ac_probe_post(struct kprobe *p, struct pt_regs *regs,
+                          unsigned long flags)
+{
+}
 
 /* ------------------------------------------------------------------ */
 /* policy / parameters                                                 */
@@ -1402,10 +1464,28 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
      */
     struct pt_regs *args = (struct pt_regs *)regs->di;
     bool is_compat = (p == &ac_kp_ptrace32);
-    long request = is_compat ? args->bx : args->di;
-    long target = is_compat ? args->cx : args->si;
+    long request, target;
     char tcomm[AC_MAX_COMM] = "?";
-    bool deny = false, kill = false;
+    bool deny = false, kill = false, killed = false;
+    int rc;
+
+    /* `args` is trusted only as far as regs->di actually points at a real
+     * pt_regs frame -- if this probe ever lands on a different call site,
+     * or a future kernel changes the wrapper ABI, it's an arbitrary
+     * pointer. A raw args->field dereference here runs in atomic kprobe
+     * context, where a bad address is an unrecoverable oops, not a
+     * fault we can handle -- so every read/write through it goes through
+     * the same *_nofault() machinery ac_kread() already uses for the
+     * syscall-table scan. */
+    if (is_compat) {
+        if (ac_kread(&request, &args->bx, sizeof(request)) ||
+            ac_kread(&target, &args->cx, sizeof(target)))
+            return 0;
+    } else {
+        if (ac_kread(&request, &args->di, sizeof(request)) ||
+            ac_kread(&target, &args->si, sizeof(target)))
+            return 0;
+    }
 
     if (request == PTRACE_TRACEME) {
         /* the protected process itself asks to be traced; PTRACE_TRACEME
@@ -1429,16 +1509,46 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
             "ptrace req %ld by pid %d (%s) DENIED",
             request, current->pid, current->comm);
 
-    if (kill && (ac_policy & 0x1))
+    killed = kill && (ac_policy & 0x1);
+    if (killed)
         ac_schedule_kill(current);
 
     /* Neutralise the syscall: rewrite the request slot in the frame to an
      * invalid value.  ptrace() rejects unknown requests with -EIO and
-     * performs no side effects, so the tracer sees a clean failure. */
+     * performs no side effects, so the tracer sees a clean failure. The
+     * reads above having succeeded means `args` does point at readable
+     * memory, but a nofault write is still the right tool here: it's the
+     * same "don't oops in atomic context on a bad address" guarantee,
+     * and costs nothing on the expected path. */
     if (is_compat)
-        args->bx = -1;
+        rc = ac_kwrite_long(&args->bx, (unsigned long)-1);
     else
-        args->di = -1;
+        rc = ac_kwrite_long(&args->di, (unsigned long)-1);
+
+    if (rc) {
+        /* Should be unreachable: args->{bx,di} is the very address
+         * ac_kread() just read successfully above, on the same
+         * always-mapped-RW kernel stack page, with nothing in between
+         * that could change that. If it somehow fails anyway, we can no
+         * longer neutralise this call -- ptrace() may still run with its
+         * original, un-denied arguments. Escalate unconditionally: kill
+         * the caller regardless of ac_policy (that bit governs the
+         * normal deny path above, not this emergency fallback), since
+         * the primary defense has already failed and letting the caller
+         * keep running would defeat the deny entirely. A queued SIGKILL
+         * alone is not containment -- the worker runs after this handler
+         * returns, i.e. after the syscall has already run, and pool
+         * exhaustion can drop the kill outright -- so also skip the
+         * probed wrapper synchronously, returning the same -EIO the
+         * neutralisation would have produced. Either barrier stops the
+         * attack on its own. */
+        pr_crit("anticheat: ptrace neutralisation write failed for req %ld target %d (%s) by pid %d (%s) -- killing caller\n",
+                request, (int)target, tcomm, current->pid, current->comm);
+        if (!killed)
+            ac_schedule_kill(current);
+        if (ac_skip_syscall(regs, -EIO))
+            return 1;
+    }
     return 0;
 }
 
@@ -1462,10 +1572,24 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
     struct pt_regs *args = (struct pt_regs *)regs->di;
     bool is_compat = (p == &ac_kp_process_vm_readv32 ||
                        p == &ac_kp_process_vm_writev32);
-    pid_t target = (pid_t)(is_compat ? args->bx : args->di);
+    unsigned long raw_target;
+    pid_t target;
     struct task_struct *t;
     char tcomm[AC_MAX_COMM] = "?";
-    bool protected_target;
+    bool protected_target, killed;
+    int rc;
+
+    /* Same nofault requirement as ac_ptrace_pre() above: `args` is only
+     * as trustworthy as regs->di, and a raw dereference here runs in
+     * atomic kprobe context where a bad address oopses the kernel. */
+    if (is_compat) {
+        if (ac_kread(&raw_target, &args->bx, sizeof(raw_target)))
+            return 0;
+    } else {
+        if (ac_kread(&raw_target, &args->di, sizeof(raw_target)))
+            return 0;
+    }
+    target = (pid_t)raw_target;
 
     if (target <= 0)
         return 0;
@@ -1503,18 +1627,39 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
              p == &ac_kp_process_vm_readv) ? "readv" : "writev",
             current->pid, current->comm);
 
-    if (ac_policy & 0x1)
+    killed = ac_policy & 0x1;
+    if (killed)
         ac_schedule_kill(current);
 
     /* Neutralise the syscall: rewrite the pid slot in the frame to an
      * invalid value. find_get_task_by_vpid() only runs after the iovecs
      * are parsed but before any target memory is touched, so this fails
      * cleanly with -ESRCH and never copies a single byte to/from the
-     * protected process. */
+     * protected process. Written via ac_kwrite_long(), not a raw store --
+     * see ac_ptrace_pre()'s neutralisation comment. */
     if (is_compat)
-        args->bx = (unsigned long)-1;
+        rc = ac_kwrite_long(&args->bx, (unsigned long)-1);
     else
-        args->di = (unsigned long)-1;
+        rc = ac_kwrite_long(&args->di, (unsigned long)-1);
+
+    if (rc) {
+        /* See ac_ptrace_pre()'s identical fallback: should be unreachable
+         * (same address ac_kread() just read successfully, on an
+         * always-mapped-RW kernel stack page), but if the write ever
+         * does fail, the pid slot is unchanged and process_vm_{read,
+         * write}v may still run against the protected target. Escalate
+         * unconditionally, regardless of ac_policy, since the primary
+         * defense has already failed -- and skip the probed wrapper
+         * synchronously (the same -ESRCH it would have failed with),
+         * since the queued SIGKILL only lands after the syscall has run
+         * and pool exhaustion can drop it outright. */
+        pr_crit("anticheat: process_vm neutralisation write failed for target pid %d (%s) by pid %d (%s) -- killing caller\n",
+                target, tcomm, current->pid, current->comm);
+        if (!killed)
+            ac_schedule_kill(current);
+        if (ac_skip_syscall(regs, -ESRCH))
+            return 1;
+    }
     return 0;
 }
 
@@ -1748,6 +1893,7 @@ static unsigned int ac_kretprobes_registered;
 static struct kprobe ac_kp_ptrace = {
     .symbol_name = "__x64_sys_ptrace",
     .pre_handler = ac_ptrace_pre,
+    .post_handler = ac_probe_post,
 };
 static struct kprobe ac_kp_ptrace32 = {
     /* ptrace has a distinct COMPAT_SYSCALL_DEFINE (unlike process_vm_readv/
@@ -1758,22 +1904,27 @@ static struct kprobe ac_kp_ptrace32 = {
      * never fire for a real 32-bit ptrace() call. */
     .symbol_name = "__ia32_compat_sys_ptrace",
     .pre_handler = ac_ptrace_pre,
+    .post_handler = ac_probe_post,
 };
 static struct kprobe ac_kp_process_vm_readv = {
     .symbol_name = "__x64_sys_process_vm_readv",
     .pre_handler = ac_process_vm_pre,
+    .post_handler = ac_probe_post,
 };
 static struct kprobe ac_kp_process_vm_readv32 = {
     .symbol_name = "__ia32_sys_process_vm_readv",
     .pre_handler = ac_process_vm_pre,
+    .post_handler = ac_probe_post,
 };
 static struct kprobe ac_kp_process_vm_writev = {
     .symbol_name = "__x64_sys_process_vm_writev",
     .pre_handler = ac_process_vm_pre,
+    .post_handler = ac_probe_post,
 };
 static struct kprobe ac_kp_process_vm_writev32 = {
     .symbol_name = "__ia32_sys_process_vm_writev",
     .pre_handler = ac_process_vm_pre,
+    .post_handler = ac_probe_post,
 };
 
 static struct kprobe *ac_kprobes[] = {
