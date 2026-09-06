@@ -3831,10 +3831,48 @@ static int cmd_start(int argc, char **argv)
             fprintf(stderr, "daemon: chdir failed: %s\n", strerror(errno));
         if (!freopen("/dev/null", "r", stdin))
             fprintf(stderr, "daemon: stdin redirect failed\n");
-        if (!freopen("/var/log/anticheat.log", "a", stdout))
-            fprintf(stderr, "daemon: stdout redirect failed\n");
-        if (!freopen("/var/log/anticheat.log", "a", stderr))
-            fprintf(stderr, "daemon: stderr redirect failed\n");
+        /* freopen() on a fixed path follows symlinks with no ownership
+         * check: if /var/log/anticheat.log is ever replaced with a symlink
+         * (anything able to write /var/log before this runs, or a TOCTOU
+         * on loose directory perms), this root daemon would happily append
+         * its log content to an arbitrary target file. Open it ourselves
+         * with O_NOFOLLOW (rejects a symlink outright, ELOOP) and verify
+         * the resulting file is root-owned and not group/world-writable
+         * before handing the fd to stdout/stderr -- dup2() onto fd 1/2
+         * repoints the existing stdout/stderr FILE* streams without
+         * needing a second freopen(), so fprintf() etc. keep working
+         * unchanged for the rest of the process. A single open() (not one
+         * per stream) also halves the TOCTOU window versus the original
+         * two separate freopen() calls. */
+        {
+            int logfd = open("/var/log/anticheat.log",
+                              O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW,
+                              0640);
+            struct stat lst;
+
+            if (logfd < 0) {
+                fprintf(stderr, "daemon: log open failed: %s\n",
+                        strerror(errno));
+            } else if (fstat(logfd, &lst) < 0) {
+                fprintf(stderr, "daemon: log fstat failed: %s\n",
+                        strerror(errno));
+                close(logfd);
+            } else if (!S_ISREG(lst.st_mode) || lst.st_uid != 0 ||
+                       (lst.st_mode & (S_IWGRP | S_IWOTH))) {
+                fprintf(stderr, "daemon: refusing to log to "
+                        "/var/log/anticheat.log: not a root-owned regular "
+                        "file with group/world write bits clear\n");
+                close(logfd);
+            } else {
+                if (dup2(logfd, STDOUT_FILENO) < 0)
+                    fprintf(stderr, "daemon: stdout redirect failed: %s\n",
+                            strerror(errno));
+                if (dup2(logfd, STDERR_FILENO) < 0)
+                    fprintf(stderr, "daemon: stderr redirect failed: %s\n",
+                            strerror(errno));
+                close(logfd);
+            }
+        }
         /* Prevent non-root ptrace of the daemon via /proc/self/mem or
          * PTRACE_ATTACH when running backgrounded: the daemon is already
          * self-protected via AC_IOCTL_ADD_PROC (ptrace kprobe), but making
