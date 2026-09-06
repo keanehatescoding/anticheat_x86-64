@@ -98,6 +98,21 @@ enum {
                             * attacker (see #63). Appended after the
                             * pre-existing values for the same version-skew
                             * reason as AC_EV_PROCESS_VM above. */
+    AC_EV_FORK_DROPPED,     /* a kretprobe (kernel_clone, or one of the
+                            * execve/execveat variants) hit its maxactive
+                            * limit and the kernel silently dropped one or
+                            * more invocations -- under heavy fork/exec load
+                            * (e.g. a fork bomb) a child's registration or a
+                            * re-exec's rekey can be missed entirely, with no
+                            * indication of this from the normal AC_EV_FORK/
+                            * AC_EV_EXEC events, which only cover invocations
+                            * the probe actually saw. pid is not meaningful
+                            * here (the whole point is that the affected
+                            * pid was never observed); data names which
+                            * probe missed and by how much. Appended after
+                            * the pre-existing values for the same
+                            * version-skew reason as AC_EV_PROCESS_VM
+                            * above. */
 };
 
 /* ------------------------------------------------------------------ */
