@@ -562,9 +562,19 @@ static int hash_proc_mem(int mem_fd, uint64_t start, uint64_t size,
     return 0;
 }
 
+/* This daemon runs as root; plain getenv() would trust AC_* vars inherited
+ * from a privilege-elevating invocation (e.g. sudo/sudo -E) where the
+ * caller's environment shouldn't be. secure_getenv() returns NULL in that
+ * context (AT_SECURE, or real/effective uid or gid mismatch), so every
+ * AC_* var read below goes through this instead of getenv() directly. */
+static const char *ac_getenv(const char *name)
+{
+    return secure_getenv(name);
+}
+
 static const char *ac_baseline_dir(void)
 {
-    const char *e = getenv("AC_BASELINE_DIR");
+    const char *e = ac_getenv("AC_BASELINE_DIR");
 
     return (e && *e) ? e : AC_BASELINE_DIR;
 }
@@ -578,7 +588,7 @@ static const char *ac_baseline_dir(void)
  * case instead of silently misbehaving on operator typos. */
 static int ac_env_interval(const char *envname, int default_secs)
 {
-    const char *e = getenv(envname);
+    const char *e = ac_getenv(envname);
     char *end;
     long v;
 
@@ -3536,8 +3546,8 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
 
 static void ac_report(const char *event_type, const char *detail)
 {
-    const char *url = getenv("AC_REPORT_URL");
-    const char *key = getenv("AC_REPORT_KEY");
+    const char *url = ac_getenv("AC_REPORT_URL");
+    const char *key = ac_getenv("AC_REPORT_KEY");
     char client_id[128], client_id_esc[256], et_esc[64], detail_esc[600];
     char body[1024], req[2048], resp[64];
     struct ac_report_dest dest;
