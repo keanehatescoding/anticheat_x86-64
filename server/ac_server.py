@@ -906,7 +906,7 @@ def main():
 
     import os
 
-    def _key_arg(cli_value, env_name):
+    def _key_arg(cli_value, env_name, flag_name):
         # `cli_value or os.environ.get(...)` would treat an explicitly
         # passed `--report-key ""` the same as not passing the flag at
         # all (empty string is falsy), silently falling through to the
@@ -915,10 +915,54 @@ def main():
         # one -- argparse's own default for these flags is None, so this
         # still falls through to the env var exactly when the flag was
         # never passed.
-        return cli_value if cli_value is not None else os.environ.get(env_name)
+        if cli_value is not None:
+            # Anything passed on argv sits in /proc/<pid>/cmdline, readable
+            # by any local user on the same host (even without ptrace
+            # permission) for as long as this process lives. The env var
+            # form isn't perfectly hidden either, but it doesn't linger in
+            # a world-readable proc file, so steer people there instead.
+            sys.stderr.write(
+                "ac_server: warning: %s was passed on the command line -- "
+                "it is visible to any local user via /proc/<pid>/cmdline "
+                "for the life of this process; prefer the %s environment "
+                "variable instead\n" % (flag_name, env_name)
+            )
+            return cli_value
+        return os.environ.get(env_name)
 
-    report_key = _key_arg(args.report_key, "AC_SERVER_REPORT_KEY")
-    admin_key = _key_arg(args.admin_key, "AC_SERVER_ADMIN_KEY")
+    # A bearer key this short/uniform is brute-forceable outright, so it's
+    # rejected outright rather than merely warned about -- unlike the
+    # argv-exposure check above, there's no legitimate reason to allow it.
+    MIN_KEY_LENGTH = 16
+
+    def _check_key_strength(key, flag_name):
+        if key is None:
+            return
+        if len(key) < MIN_KEY_LENGTH:
+            sys.stderr.write(
+                "ac_server: %s is only %d character(s) long -- keys must "
+                "be at least %d characters (e.g. `python3 -c \"import "
+                "secrets; print(secrets.token_urlsafe(32))\"`) -- refusing "
+                "to start with a brute-forceable bearer key\n"
+                % (flag_name, len(key), MIN_KEY_LENGTH)
+            )
+            sys.exit(1)
+        # Cheap entropy floor: a key drawn from only a handful of distinct
+        # characters (all-same, "aaaa...b", a short repeated pattern) can
+        # pad out to MIN_KEY_LENGTH while still being trivially guessable.
+        # This isn't a real entropy estimate, just a sanity floor on
+        # character variety.
+        distinct = len(set(key))
+        if distinct < 8:
+            sys.stderr.write(
+                "ac_server: %s uses only %d distinct character(s) across "
+                "%d characters -- too predictable to be a real secret -- "
+                "refusing to start\n" % (flag_name, distinct, len(key))
+            )
+            sys.exit(1)
+
+    report_key = _key_arg(args.report_key, "AC_SERVER_REPORT_KEY", "--report-key")
+    admin_key = _key_arg(args.admin_key, "AC_SERVER_ADMIN_KEY", "--admin-key")
     if not report_key or not admin_key:
         sys.stderr.write(
             "ac_server: --report-key/--admin-key (or AC_SERVER_REPORT_KEY/"
@@ -926,9 +970,17 @@ def main():
             "auth configured\n"
         )
         sys.exit(1)
+    _check_key_strength(report_key, "--report-key/AC_SERVER_REPORT_KEY")
+    _check_key_strength(admin_key, "--admin-key/AC_SERVER_ADMIN_KEY")
 
-    report_key_old = _key_arg(args.report_key_old, "AC_SERVER_REPORT_KEY_OLD")
-    admin_key_old = _key_arg(args.admin_key_old, "AC_SERVER_ADMIN_KEY_OLD")
+    report_key_old = _key_arg(
+        args.report_key_old, "AC_SERVER_REPORT_KEY_OLD", "--report-key-old"
+    )
+    admin_key_old = _key_arg(
+        args.admin_key_old, "AC_SERVER_ADMIN_KEY_OLD", "--admin-key-old"
+    )
+    _check_key_strength(report_key_old, "--report-key-old/AC_SERVER_REPORT_KEY_OLD")
+    _check_key_strength(admin_key_old, "--admin-key-old/AC_SERVER_ADMIN_KEY_OLD")
     report_keys = frozenset({report_key} | ({report_key_old} if report_key_old else set()))
     admin_keys = frozenset({admin_key} | ({admin_key_old} if admin_key_old else set()))
 

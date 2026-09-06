@@ -1108,14 +1108,16 @@ else
     pass "server refuses to start with no auth configured"
 fi
 
-if AC_SERVER_REPORT_KEY=same AC_SERVER_ADMIN_KEY=same python3 ./ac_server.py \
+SAME_KEY="identical-secret-key-$$"
+if AC_SERVER_REPORT_KEY="$SAME_KEY" AC_SERVER_ADMIN_KEY="$SAME_KEY" python3 ./ac_server.py \
     --port 18805 --db "$TESTDIR/samekeys.db" >/dev/null 2>&1; then
     fail "server should refuse to start with equal report/admin keys"
 else
     pass "server refuses to start with equal report/admin keys"
 fi
 
-if AC_SERVER_REPORT_KEY=r AC_SERVER_ADMIN_KEY=a python3 ./ac_server.py \
+if AC_SERVER_REPORT_KEY="test-report-key-$$" AC_SERVER_ADMIN_KEY="test-admin-key-$$" \
+    python3 ./ac_server.py \
     --port 18806 --db "$TESTDIR/badrl.db" --rate-limit 0 \
     >/dev/null 2>&1; then
     fail "server should refuse to start with --rate-limit 0"
@@ -1123,7 +1125,8 @@ else
     pass "server refuses to start with --rate-limit 0"
 fi
 
-if AC_SERVER_REPORT_KEY=r AC_SERVER_ADMIN_KEY=a python3 ./ac_server.py \
+if AC_SERVER_REPORT_KEY="test-report-key-$$" AC_SERVER_ADMIN_KEY="test-admin-key-$$" \
+    python3 ./ac_server.py \
     --port 18811 --db "$TESTDIR/badcap.db" --max-connections 0 \
     >/dev/null 2>&1; then
     fail "server should refuse to start with --max-connections 0"
@@ -1134,7 +1137,9 @@ fi
 # a tier-separation break as report-key == admin-key -- must be rejected
 # at startup too, not just the non-rotation case.
 BADROT_TESTDIR="$(mktemp -d /tmp/ac_server_badrot_test.XXXXXXXX)"
-if AC_SERVER_REPORT_KEY=r AC_SERVER_ADMIN_KEY=a AC_SERVER_REPORT_KEY_OLD=a \
+BADROT_ADMIN_KEY="test-admin-key-$$"
+if AC_SERVER_REPORT_KEY="test-report-key-$$" AC_SERVER_ADMIN_KEY="$BADROT_ADMIN_KEY" \
+    AC_SERVER_REPORT_KEY_OLD="$BADROT_ADMIN_KEY" \
     python3 ./ac_server.py --port 18809 --db "$BADROT_TESTDIR/ac_server.db" \
     >"$BADROT_TESTDIR/server.log" 2>&1; then
     fail "server should refuse to start when an old report key equals the admin key"
@@ -1142,6 +1147,42 @@ else
     pass "server refuses to start when an old report key equals the admin key"
 fi
 rm -rf "$BADROT_TESTDIR"
+
+# Weak-key rejection (#15): a short or low-variety key is just as much of
+# an auth bypass as no key at all, so both must be refused at startup.
+if AC_SERVER_REPORT_KEY="short" AC_SERVER_ADMIN_KEY="test-admin-key-$$" \
+    python3 ./ac_server.py --port 18812 --db "$TESTDIR/shortkey.db" \
+    >/dev/null 2>&1; then
+    fail "server should refuse to start with a report key under the length floor"
+else
+    pass "server refuses to start with a too-short report key"
+fi
+
+if AC_SERVER_REPORT_KEY="aaaaaaaaaaaaaaaaaaaa" AC_SERVER_ADMIN_KEY="test-admin-key-$$" \
+    python3 ./ac_server.py --port 18813 --db "$TESTDIR/lowentropykey.db" \
+    >/dev/null 2>&1; then
+    fail "server should refuse to start with a low-entropy report key"
+else
+    pass "server refuses to start with a low-entropy (repeated-character) report key"
+fi
+
+# CLI-supplied keys leak to any local user via /proc/<pid>/cmdline; the
+# server should say so on stderr instead of silently accepting them.
+CLIWARN_TESTDIR="$(mktemp -d /tmp/ac_server_cliwarn_test.XXXXXXXX)"
+AC_SERVER_ADMIN_KEY="test-admin-key-$$" python3 ./ac_server.py \
+    --report-key "test-report-key-$$" \
+    --port 18814 --db "$CLIWARN_TESTDIR/ac_server.db" \
+    >"$CLIWARN_TESTDIR/server.log" 2>&1 &
+CLIWARN_SERVER_PID=$!
+sleep 0.3
+if grep -q '/proc/<pid>/cmdline' "$CLIWARN_TESTDIR/server.log"; then
+    pass "CLI-supplied --report-key triggers a /proc/<pid>/cmdline exposure warning"
+else
+    fail "expected a /proc/<pid>/cmdline warning when --report-key is passed on argv"
+fi
+kill "$CLIWARN_SERVER_PID" 2>/dev/null
+wait "$CLIWARN_SERVER_PID" 2>/dev/null
+rm -rf "$CLIWARN_TESTDIR"
 
 echo
 if [ "$FAIL" -eq 0 ]; then
