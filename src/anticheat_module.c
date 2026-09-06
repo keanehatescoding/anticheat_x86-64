@@ -105,7 +105,7 @@ static mempool_t *ac_kill_pool;
 static atomic_t ac_kill_dropped = ATOMIC_INIT(0);
 
 /* ------------------------------------------------------------------ */
-/* safe kernel reads                                                   */
+/* safe kernel reads/writes                                            */
 /* ------------------------------------------------------------------ */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
 # define ac_kread(dst, src, n) copy_from_kernel_nofault((dst), (src), (n))
@@ -113,6 +113,24 @@ static atomic_t ac_kill_dropped = ATOMIC_INIT(0);
 # include <asm/uaccess.h>
 # define ac_kread(dst, src, n) probe_kernel_read((dst), (src), (n))
 #endif
+
+/* copy_to_kernel_nofault() -- the write-side twin of copy_from_kernel_
+ * nofault() that ac_kread() above wraps -- is not EXPORT_SYMBOL'd on
+ * every kernel this module targets (confirmed missing from this build's
+ * own symbol table), so it can't be called from a module. The only write
+ * this file ever needs through a nofault path is a single register-sized
+ * slot in a kprobe'd pt_regs frame (see ac_ptrace_pre()/ac_process_vm_
+ * pre()'s neutralisation writes), so rebuild just that with the same
+ * __put_kernel_nofault()/arch_put_kernel_nofault() building block
+ * copy_to_kernel_nofault() itself is implemented with -- header-inline,
+ * so no export is required. */
+static inline int ac_kwrite_long(void *dst, unsigned long val)
+{
+    __put_kernel_nofault(dst, &val, unsigned long, ac_kwrite_long_fault);
+    return 0;
+ac_kwrite_long_fault:
+    return -EFAULT;
+}
 
 /* ------------------------------------------------------------------ */
 /* policy / parameters                                                 */
@@ -1402,10 +1420,27 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
      */
     struct pt_regs *args = (struct pt_regs *)regs->di;
     bool is_compat = (p == &ac_kp_ptrace32);
-    long request = is_compat ? args->bx : args->di;
-    long target = is_compat ? args->cx : args->si;
+    long request, target;
     char tcomm[AC_MAX_COMM] = "?";
     bool deny = false, kill = false;
+
+    /* `args` is trusted only as far as regs->di actually points at a real
+     * pt_regs frame -- if this probe ever lands on a different call site,
+     * or a future kernel changes the wrapper ABI, it's an arbitrary
+     * pointer. A raw args->field dereference here runs in atomic kprobe
+     * context, where a bad address is an unrecoverable oops, not a
+     * fault we can handle -- so every read/write through it goes through
+     * the same *_nofault() machinery ac_kread() already uses for the
+     * syscall-table scan. */
+    if (is_compat) {
+        if (ac_kread(&request, &args->bx, sizeof(request)) ||
+            ac_kread(&target, &args->cx, sizeof(target)))
+            return 0;
+    } else {
+        if (ac_kread(&request, &args->di, sizeof(request)) ||
+            ac_kread(&target, &args->si, sizeof(target)))
+            return 0;
+    }
 
     if (request == PTRACE_TRACEME) {
         /* the protected process itself asks to be traced; PTRACE_TRACEME
@@ -1434,11 +1469,15 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
 
     /* Neutralise the syscall: rewrite the request slot in the frame to an
      * invalid value.  ptrace() rejects unknown requests with -EIO and
-     * performs no side effects, so the tracer sees a clean failure. */
+     * performs no side effects, so the tracer sees a clean failure. The
+     * reads above having succeeded means `args` does point at readable
+     * memory, but a nofault write is still the right tool here: it's the
+     * same "don't oops in atomic context on a bad address" guarantee,
+     * and costs nothing on the expected path. */
     if (is_compat)
-        args->bx = -1;
+        ac_kwrite_long(&args->bx, (unsigned long)-1);
     else
-        args->di = -1;
+        ac_kwrite_long(&args->di, (unsigned long)-1);
     return 0;
 }
 
@@ -1462,10 +1501,23 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
     struct pt_regs *args = (struct pt_regs *)regs->di;
     bool is_compat = (p == &ac_kp_process_vm_readv32 ||
                        p == &ac_kp_process_vm_writev32);
-    pid_t target = (pid_t)(is_compat ? args->bx : args->di);
+    unsigned long raw_target;
+    pid_t target;
     struct task_struct *t;
     char tcomm[AC_MAX_COMM] = "?";
     bool protected_target;
+
+    /* Same nofault requirement as ac_ptrace_pre() above: `args` is only
+     * as trustworthy as regs->di, and a raw dereference here runs in
+     * atomic kprobe context where a bad address oopses the kernel. */
+    if (is_compat) {
+        if (ac_kread(&raw_target, &args->bx, sizeof(raw_target)))
+            return 0;
+    } else {
+        if (ac_kread(&raw_target, &args->di, sizeof(raw_target)))
+            return 0;
+    }
+    target = (pid_t)raw_target;
 
     if (target <= 0)
         return 0;
@@ -1510,11 +1562,12 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
      * invalid value. find_get_task_by_vpid() only runs after the iovecs
      * are parsed but before any target memory is touched, so this fails
      * cleanly with -ESRCH and never copies a single byte to/from the
-     * protected process. */
+     * protected process. Written via ac_kwrite_long(), not a raw store --
+     * see ac_ptrace_pre()'s neutralisation comment. */
     if (is_compat)
-        args->bx = (unsigned long)-1;
+        ac_kwrite_long(&args->bx, (unsigned long)-1);
     else
-        args->di = (unsigned long)-1;
+        ac_kwrite_long(&args->di, (unsigned long)-1);
     return 0;
 }
 
