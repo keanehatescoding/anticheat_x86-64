@@ -1649,29 +1649,46 @@ static int cmd_syscalls(void)
 #define AC_MAX_PROC_MODS 4096
 static char proc_names[AC_MAX_PROC_MODS][AC_MOD_NAME_LEN];
 
-static unsigned int collect_proc_modules(unsigned int cap)
+/* Returns the number of names collected (>= 0), or -1 if /proc/modules
+ * could not be opened at all -- callers must NOT treat -1 as "zero
+ * entries": collect_proc_modules() failing to read the userspace-visible
+ * module list says nothing about which modules are actually loaded, and
+ * proceeding as if the list were legitimately empty would flag every
+ * kernel-reported module as hidden. */
+static long collect_proc_modules(unsigned int cap)
 {
     FILE *f = fopen("/proc/modules", "r");
     char line[256];
     unsigned int n = 0;
 
     if (!f)
-        return 0;
+        return -1;
     while (fgets(line, sizeof(line), f) && n < cap) {
         if (sscanf(line, "%63s", proc_names[n]) == 1)
             n++;
     }
     fclose(f);
-    return n;
+    return (long)n;
 }
 
 static long crosscheck_modules(int verbose)
 {
     unsigned int count, i, hidden = 0, proc_count;
+    long proc_count_r;
 
     if (ioctl(dev_fd, AC_IOCTL_MODS_BEGIN, &count) < 0)
         return -1;
-    proc_count = collect_proc_modules(AC_MAX_PROC_MODS);
+    proc_count_r = collect_proc_modules(AC_MAX_PROC_MODS);
+    if (proc_count_r < 0) {
+        /* Can't rule out "hidden" vs "we just couldn't read the visible
+         * list" -- fail inconclusive rather than reporting every loaded
+         * module as hidden. */
+        (void)ioctl(dev_fd, AC_IOCTL_MODS_END, NULL);
+        logmsg(LOG_WARNING, "crosscheck_modules: /proc/modules unreadable "
+               "(%s) -- skipping hidden-module cross-check", strerror(errno));
+        return -1;
+    }
+    proc_count = (unsigned int)proc_count_r;
     if (verbose)
         printf("%u modules in kernel list:\n", count);
     for (i = 0; i < count; i++) {
