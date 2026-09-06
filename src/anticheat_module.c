@@ -65,6 +65,7 @@
 #include <linux/ptrace.h>
 #include <linux/err.h>
 #include <linux/bitops.h>
+#include <linux/rcupdate.h>
 #include <asm/unistd.h>
 
 #include "anticheat.h"
@@ -188,21 +189,37 @@ static void ac_resolve_text_bounds(void)
 
 /* ------------------------------------------------------------------ */
 /* module list walking (kernel-internal list; module_mutex is not      */
-/* exported, so we walk with preemption disabled — best effort)        */
+/* exported, so we walk under rcu_read_lock() instead — the same       */
+/* protection the kernel's own is_module_address()/is_module_text_     */
+/* address() use for this exact list).                                 */
+/*                                                                      */
+/* This is a real liveness guarantee, not best-effort: module unload   */
+/* (kernel/module/main.c: free_module()) does list_del_rcu() followed  */
+/* by synchronize_rcu() *before* freeing the module's core memory      */
+/* (which is where `struct module` itself lives). Holding rcu_read_    */
+/* lock() across the walk means that free can't complete until this    */
+/* reader leaves the critical section, so a `struct module *` handed   */
+/* out by list_for_each_entry_rcu() here is guaranteed live for as     */
+/* long as we hold the lock -- no UAF, no generation-counter retry     */
+/* loop needed. list_for_each_entry_rcu() (vs. plain list_for_each_    */
+/* entry()) additionally pairs with the list's own list_add_rcu()/     */
+/* list_del_rcu() writers via rcu_dereference(), so the ->next         */
+/* pointers themselves are read safely too, not just the memory they   */
+/* point at.                                                            */
 /* ------------------------------------------------------------------ */
 static bool ac_addr_in_module(unsigned long addr)
 {
     struct module *m;
     bool found = false;
 
-    preempt_disable();
-    list_for_each_entry(m, &THIS_MODULE->list, list) {
+    rcu_read_lock();
+    list_for_each_entry_rcu(m, &THIS_MODULE->list, list) {
         if (ac_module_sane(m) && within_module_core(addr, m)) {
             found = true;
             break;
         }
     }
-    preempt_enable();
+    rcu_read_unlock();
     return found;
 }
 
@@ -1913,18 +1930,19 @@ static unsigned long long ac_module_size(const struct module *mod)
 }
 
 /* A plausible module entry: LIVE with a non-zero, sane text mapping.
- * Guards the mutex-less module walk against torn/freed entries
- * (module_mutex is not exported).  A garbage entry with base=0 and a huge
- * size would otherwise make within_module_core() claim every kernel
- * address, poisoning both the hidden-module check and the syscall
- * plausibility filter.
+ * Guards the mutex-less module walk against torn entries (module_mutex
+ * is not exported; see ac_addr_in_module()'s comment for why the walk
+ * itself is RCU-protected against *freed* ones).  A garbage entry with
+ * base=0 and a huge size would otherwise make within_module_core() claim
+ * every kernel address, poisoning both the hidden-module check and the
+ * syscall plausibility filter.
  *
  * The is_vmalloc_addr() check guards against a subtler problem than a
  * torn entry: both walk sites below do
- * list_for_each_entry(m, &THIS_MODULE->list, list), which only stops
+ * list_for_each_entry_rcu(m, &THIS_MODULE->list, list), which only stops
  * once it circles back to THIS_MODULE's own list node -- not the
  * kernel's real (unexported) `modules` list_head sentinel. A full walk
- * necessarily passes through that sentinel too, and list_for_each_entry
+ * necessarily passes through that sentinel too, and list_for_each_entry_rcu
  * unconditionally container_of()s it into a `struct module *` as if it
  * were a real entry, even though it isn't embedded in one. Dereferencing
  * that bogus pointer reads whatever kernel global happens to sit at
@@ -2070,18 +2088,20 @@ static int ac_build_mod_snapshot(struct ac_fd_state *st)
     st->mods = NULL;
     st->n_mods = 0;
 
-    /* Single pass with a hard cap.  module_mutex is not exported, so the
-     * walk can race with concurrent load/unload (a torn entry is possible
-     * but bounded; the daemon tolerates it).  A single pass avoids the
+    /* Single pass with a hard cap.  module_mutex is not exported, so this
+     * walk uses rcu_read_lock() instead (see ac_addr_in_module()'s comment
+     * above for why that's a real liveness guarantee against concurrent
+     * load/unload, not just best-effort).  A single pass still avoids the
      * count/fill mismatch and the heap overflow a two-pass walk could
-     * cause when the list changes between passes. */
+     * cause when the list's *membership* changes between passes -- RCU
+     * protects the memory of entries we do visit, not the list shape. */
     st->mods = kvmalloc_array(AC_MAX_MODS, sizeof(struct ac_mod_info),
                               GFP_KERNEL);
     if (!st->mods)
         return -ENOMEM;
 
-    preempt_disable();
-    list_for_each_entry(mod, &THIS_MODULE->list, list) {
+    rcu_read_lock();
+    list_for_each_entry_rcu(mod, &THIS_MODULE->list, list) {
         struct ac_mod_info *mi;
 
         if (!ac_module_sane(mod))
@@ -2101,7 +2121,7 @@ static int ac_build_mod_snapshot(struct ac_fd_state *st)
         mi->state = mod->state;
         n++;
     }
-    preempt_enable();
+    rcu_read_unlock();
     st->n_mods = n;
     return 0;
 }
