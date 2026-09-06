@@ -761,7 +761,7 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
                                  const char *hex)
 {
     struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
-    char tmp_path[PATH_MAX];
+    char tmp_path[PATH_MAX], lock_path[PATH_MAX];
     int i, kept = 0, n, lock_fd, tmp_fd, saved_errno;
     FILE *f;
     struct stat lst;
@@ -777,7 +777,22 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
         return -1;
     }
 
-    lock_fd = open(blpath, O_RDWR | O_CREAT | O_NOFOLLOW, 0644);
+    /* flock() locks whatever inode the path resolves to *at open time*.
+     * Locking blpath itself doesn't work here: once a writer's rename()
+     * below swaps in a new inode, its own still-held lock refers to the
+     * now-unlinked old one, so a second writer that opens blpath *after*
+     * that rename gets the new inode and acquires an uncontended lock on
+     * it immediately -- no real mutual exclusion between concurrent
+     * writers' read-modify-write windows, silently losing whichever one
+     * loses the final rename(). Lock a separate, never-renamed .lock file
+     * instead, so every writer contends on the same stable inode
+     * regardless of how many renames have happened to blpath. */
+    if (snprintf(lock_path, sizeof(lock_path), "%s.lock", blpath) >=
+        (int)sizeof(lock_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_NOFOLLOW, 0644);
     if (lock_fd < 0)
         return -1;
     if (flock(lock_fd, LOCK_EX) < 0) {
