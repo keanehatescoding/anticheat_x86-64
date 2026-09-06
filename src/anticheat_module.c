@@ -554,7 +554,14 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
     out->checksum_mismatch = ac_syscall_baseline_ready &&
         strcmp(out->current_sha256, out->baseline_sha256) != 0;
 
-    out->ok = (out->hooked == 0);
+    /* hooked isn't the only sign of compromise: redirected covers a
+     * handler that's been repointed within core text (never left it, so
+     * ac_entry_bad() alone can't see it), and checksum_mismatch covers
+     * the whole-table hash diverging from the baseline even if no single
+     * slot's per-slot classification caught it. Any of the three means
+     * the table isn't in its expected state. */
+    out->ok = (out->hooked == 0 && out->redirected == 0 &&
+               !out->checksum_mismatch);
     return 0;
 }
 
