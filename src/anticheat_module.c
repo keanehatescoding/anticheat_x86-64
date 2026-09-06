@@ -62,6 +62,7 @@
 #include <linux/mempool.h>
 #include <linux/cred.h>
 #include <linux/capability.h>
+#include <linux/user_namespace.h>
 #include <linux/ptrace.h>
 #include <linux/err.h>
 #include <linux/bitops.h>
@@ -2293,8 +2294,17 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
      * entirely via SCM_RIGHTS or an inherited exec(). Without rechecking
      * here, whoever ends up holding the fd keeps full access -- including
      * LOCK (pin the module permanently) and ADD_PROC/DEL_PROC (rewrite
-     * protection state) -- regardless of their current privilege. */
-    if (!capable(CAP_SYS_ADMIN))
+     * protection state) -- regardless of their current privilege.
+     *
+     * ns_capable(&init_user_ns, ...), not plain capable(): capable()
+     * checks the capability against current_cred()'s own user_ns, so a
+     * process holding CAP_SYS_ADMIN only inside an unprivileged user
+     * namespace (e.g. "root" in a container) would pass. This device
+     * protects the host, so the check has to be against the host
+     * (init) namespace specifically -- that's exactly what
+     * ns_capable(&init_user_ns, ...) does, and is the kernel's own
+     * documented idiom for "real root only" checks. */
+    if (!ns_capable(&init_user_ns, CAP_SYS_ADMIN))
         return -EPERM;
 
     switch (cmd) {
@@ -2585,7 +2595,10 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 static int ac_open(struct inode *inode, struct file *file)
 {
-    if (!capable(CAP_SYS_ADMIN))
+    /* See ac_ioctl()'s identical check: ns_capable(&init_user_ns, ...)
+     * so a container "root" with CAP_SYS_ADMIN only in its own user
+     * namespace can't open this device at all. */
+    if (!ns_capable(&init_user_ns, CAP_SYS_ADMIN))
         return -EPERM;
     file->private_data = NULL;
     return 0;
