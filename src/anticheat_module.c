@@ -1179,28 +1179,59 @@ static bool ac_is_protected_pid(pid_t pid, char *comm_out)
 /* add/rekey requests can't call mmu_notifier_register()/_unregister()   */
 /* directly and must hand off to ac_wq instead.                         */
 /*                                                                      */
-/* Known gap (tracked in issue #87, not fixed here): a child's own      */
-/* exec racing ahead of its own not-yet-run fork-inherit request. If a  */
-/* protected process forks and the child execs before                  */
-/* ac_prot_add_worker() has dequeued and run the fork-inherit request   */
-/* ac_clone_ret() queued for it, ac_exec_entry() finds current->mm not  */
-/* yet in ac_prots[] (registration is still pending, not done) and      */
-/* treats the child as unprotected -- it does nothing, rather than      */
-/* redirecting the in-flight request to the child's new post-exec mm.   */
-/* The worker then goes on to register the child's now-orphaned         */
-/* pre-exec mm, which is a mostly harmless no-op (that mm has no live    */
-/* task using it and organically self-releases moments later, via the   */
-/* very mmput() ac_prot_add_worker() itself does once ac_add_prot_mm()   */
-/* returns -- no permanent slot leak), but leaves a real, narrow window  */
-/* where the freshly-exec'd child is NOT actually covered by             */
-/* ptrace/process_vm defenses despite the inherit policy intending it    */
-/* to be. Properly closing this needs a "pending transition" visible to  */
-/* ac_exec_entry() (and ac_is_protected_mm()'s other callers) so an      */
-/* exec racing an in-flight fork/rekey request can redirect it to the    */
-/* live mm instead of racing past it -- a materially bigger change than  */
-/* anything else in this file's mm-keyed registry, deliberately left for */
-/* a follow-up rather than folded into it under time pressure.           */
+/* Fork-then-exec race (#6): a protected process's child forks, and     */
+/* ac_clone_ret() queues a fork-inherit request for the child's mm onto */
+/* ac_wq -- but if the child execs before ac_prot_add_worker() dequeues */
+/* and runs that request, ac_exec_entry() (running in the exec's own    */
+/* entry_handler, before exec_mmap() replaces current->mm) finds        */
+/* current->mm not yet in ac_prots[] (registration is still queued, not */
+/* done) and would otherwise treat the child as unprotected: no rekey,  */
+/* nothing. The worker then goes on to register the child's now-stale   */
+/* pre-exec mm -- which nothing uses any more -- while the actual       */
+/* post-exec image the child is now running under is never registered   */
+/* at all, a real gap in ptrace/process_vm coverage for exactly the     */
+/* window inheritance is supposed to close.                             */
+/*                                                                      */
+/* ac_pending_forks below is what closes it: ac_schedule_prot_add()     */
+/* records the fork-inherit request's target mm and parent attribution  */
+/* here at queue time, and ac_exec_entry() -- finding current->mm       */
+/* neither in ac_prots[] nor covered by the vfork_inherit case -- checks */
+/* here too. A match means "there's a fork-inherit for exactly this mm  */
+/* still in flight"; it claims the slot and redirects it the same way   */
+/* the vfork_inherit path already redirects protection to a new image   */
+/* (see ac_exec_entry()/ac_exec_ret()). ac_prot_add_worker() checks the  */
+/* same table right before registering a fork-inherit mm and skips the   */
+/* now-stale registration if the exec path already claimed it.          */
+/*                                                                      */
+/* This closes the queued-but-not-started window, which is the one an   */
+/* attacker can actually make wide (workqueue dispatch latency, no      */
+/* upper bound). It does not close the much narrower window already     */
+/* inherent to ac_add_prot_mm() itself -- between claiming a slot as     */
+/* AC_PROT_RESERVED and mmu_notifier_register() actually returning,      */
+/* ac_is_protected_mm() still reads that mm as unprotected, since         */
+/* AC_PROT_RESERVED carries no mm identity by design (see its own        */
+/* comment). An exec landing in that specific, single-syscall-duration   */
+/* sliver still isn't redirected. Left as is: closing it would mean      */
+/* every ac_is_protected_mm() caller also has to understand claiming,    */
+/* for a window that -- unlike the one above -- isn't attacker-         */
+/* controllable to any useful degree.                                   */
 /* ------------------------------------------------------------------ */
+#define AC_PENDING_FORK_MAX 32
+
+struct ac_pending_fork {
+    struct mm_struct *mm;   /* pre-exec child mm; NULL = free slot */
+    pid_t parent_pid;
+    char parent_comm[AC_MAX_COMM];
+    bool jit_allowed;
+    /* Set by ac_exec_entry() when it finds and claims this slot: tells
+     * ac_prot_add_worker() the exec path is now responsible for
+     * registering (whatever mm the child ends up with), so the worker
+     * must not also register this now-stale pre-exec mm. */
+    bool claimed;
+};
+static struct ac_pending_fork ac_pending_forks[AC_PENDING_FORK_MAX];
+static DEFINE_SPINLOCK(ac_pending_fork_lock);
+
 struct ac_prot_add_req {
     struct work_struct work;
     struct mm_struct *mm;        /* new mm to register; ref owned by this
@@ -1218,7 +1249,42 @@ struct ac_prot_add_req {
 static void ac_prot_add_worker(struct work_struct *w)
 {
     struct ac_prot_add_req *r = container_of(w, struct ac_prot_add_req, work);
-    int ret = ac_add_prot_mm(r->mm, r->new_pid, r->new_comm, r->jit_allowed);
+    int ret;
+
+    if (!r->old_mm) {
+        /* Fork-inherit request: check whether an exec already raced
+         * ahead of us and claimed this mm (see ac_pending_forks'
+         * comment above). If so, that exec's own kretprobe is already
+         * responsible for registering whatever mm the child now has --
+         * registering this stale pre-exec mm here too would just be a
+         * dead entry nothing will ever touch again. */
+        unsigned long flags;
+        bool claimed = false;
+        int i;
+
+        spin_lock_irqsave(&ac_pending_fork_lock, flags);
+        for (i = 0; i < AC_PENDING_FORK_MAX; i++) {
+            if (ac_pending_forks[i].mm == r->mm) {
+                claimed = ac_pending_forks[i].claimed;
+                ac_pending_forks[i].mm = NULL;
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&ac_pending_fork_lock, flags);
+
+        if (claimed) {
+            ac_emit(AC_EV_INFO, r->new_pid, r->new_comm,
+                    "child of protected pid %d (%s) exec'd before "
+                    "fork-inherit landed; protection transferred to the "
+                    "new image instead",
+                    r->src_pid, r->src_comm);
+            mmput(r->mm);
+            mempool_free(r, ac_prot_add_pool);
+            return;
+        }
+    }
+
+    ret = ac_add_prot_mm(r->mm, r->new_pid, r->new_comm, r->jit_allowed);
 
     if (r->old_mm) {
         if (ret == 0) {
@@ -1246,7 +1312,7 @@ static void ac_prot_add_worker(struct work_struct *w)
     mempool_free(r, ac_prot_add_pool);
 }
 
-static void ac_schedule_prot_add_req(struct mm_struct *mm,
+static bool ac_schedule_prot_add_req(struct mm_struct *mm,
                                       struct mm_struct *old_mm,
                                       pid_t new_pid, const char *new_comm,
                                       pid_t src_pid, const char *src_comm,
@@ -1266,7 +1332,7 @@ static void ac_schedule_prot_add_req(struct mm_struct *mm,
         mmput_async(mm);
         if (old_mm)
             mmput_async(old_mm);
-        return;
+        return false;
     }
     INIT_WORK(&r->work, ac_prot_add_worker);
     r->mm = mm;
@@ -1277,18 +1343,55 @@ static void ac_schedule_prot_add_req(struct mm_struct *mm,
     strscpy(r->src_comm, src_comm, sizeof(r->src_comm));
     r->jit_allowed = jit_allowed;
     queue_work(ac_wq, &r->work);
+    return true;
 }
 
 /* Queue `mm` (caller's get_task_mm() reference -- handed off, always
  * consumed via mmput()/mmput_async() by the worker or on failure here) for
  * protection inherited from a fork. Callable from kretprobe context
- * (ac_clone_ret()). */
+ * (ac_clone_ret()), and also from ac_exec_ret() for the fork-race-inherit
+ * case (see ac_pending_forks' comment). */
 static void ac_schedule_prot_add(struct mm_struct *mm, pid_t new_pid,
                                   const char *new_comm, pid_t parent_pid,
                                   const char *parent_comm, bool jit_allowed)
 {
-    ac_schedule_prot_add_req(mm, NULL, new_pid, new_comm,
-                              parent_pid, parent_comm, jit_allowed);
+    unsigned long flags;
+    int i, slot = -1;
+
+    spin_lock_irqsave(&ac_pending_fork_lock, flags);
+    for (i = 0; i < AC_PENDING_FORK_MAX; i++) {
+        if (!ac_pending_forks[i].mm) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot >= 0) {
+        ac_pending_forks[slot].mm = mm;
+        ac_pending_forks[slot].parent_pid = parent_pid;
+        strscpy(ac_pending_forks[slot].parent_comm, parent_comm,
+                sizeof(ac_pending_forks[slot].parent_comm));
+        ac_pending_forks[slot].jit_allowed = jit_allowed;
+        ac_pending_forks[slot].claimed = false;
+    }
+    spin_unlock_irqrestore(&ac_pending_fork_lock, flags);
+    /* Table exhaustion (AC_PENDING_FORK_MAX fork-inherits simultaneously
+     * in flight) just forgoes the race closure for this one fork -- same
+     * exposure as before this table existed, not a new failure mode. */
+
+    if (!ac_schedule_prot_add_req(mm, NULL, new_pid, new_comm,
+                                   parent_pid, parent_comm, jit_allowed) &&
+        slot >= 0) {
+        /* The work item was never created (pool exhausted) -- mm's
+         * reference was already dropped by ac_schedule_prot_add_req()'s
+         * own failure path, so this slot can't be left pointing at it:
+         * a later, unrelated mm_struct allocation reusing the same
+         * address would otherwise be misidentified by ac_exec_entry()'s
+         * pointer-identity scan as this fork. */
+        spin_lock_irqsave(&ac_pending_fork_lock, flags);
+        if (ac_pending_forks[slot].mm == mm)
+            ac_pending_forks[slot].mm = NULL;
+        spin_unlock_irqrestore(&ac_pending_fork_lock, flags);
+    }
 }
 
 /* Queue a rekey from `old_mm` to `new_mm` after a protected task's
@@ -1624,7 +1727,14 @@ static struct kretprobe ac_kp_clone = {
 struct ac_exec_entry_data {
     struct mm_struct *old_mm;
     bool vfork_inherit;
-    bool jit_allowed;              /* only meaningful if vfork_inherit */
+    /* Fork-then-exec race closure (#6): current->mm matched an in-flight
+     * fork-inherit request in ac_pending_forks rather than an already-
+     * registered entry in ac_prots[] -- see that table's comment. Handled
+     * identically to vfork_inherit in ac_exec_ret() below (redirect
+     * protection to whatever mm current ends up with), so it reuses
+     * jit_allowed/parent_pid/parent_comm rather than duplicating them. */
+    bool fork_race_inherit;
+    bool jit_allowed;      /* meaningful if vfork_inherit or fork_race_inherit */
     pid_t parent_pid;
     char parent_comm[AC_MAX_COMM];
 };
@@ -1635,6 +1745,7 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
     d->old_mm = NULL;
     d->vfork_inherit = false;
+    d->fork_race_inherit = false;
     if (current->vfork_done) {
         if (current->mm && ac_is_protected_mm(current->mm)) {
             struct task_struct *parent;
@@ -1661,6 +1772,30 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
          * re-exec of a protected process. */
         ac_emit(AC_EV_INFO, current->pid, current->comm,
                 "execve() invoked (path is a user pointer, not resolved)");
+        return 0;
+    }
+
+    /* Not yet in ac_prots[] -- but a fork-inherit request queued for
+     * exactly this mm may still be sitting on ac_wq (see ac_pending_forks'
+     * comment). Claim it here so ac_prot_add_worker() knows the exec path
+     * has taken over. */
+    {
+        unsigned long flags;
+        int i;
+
+        spin_lock_irqsave(&ac_pending_fork_lock, flags);
+        for (i = 0; i < AC_PENDING_FORK_MAX; i++) {
+            if (ac_pending_forks[i].mm == current->mm) {
+                ac_pending_forks[i].claimed = true;
+                d->fork_race_inherit = true;
+                d->jit_allowed = ac_pending_forks[i].jit_allowed;
+                d->parent_pid = ac_pending_forks[i].parent_pid;
+                strscpy(d->parent_comm, ac_pending_forks[i].parent_comm,
+                        sizeof(d->parent_comm));
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&ac_pending_fork_lock, flags);
     }
     return 0;
 }
@@ -1680,6 +1815,23 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
             return 0;   /* shouldn't happen on a successful exec */
         ac_schedule_prot_add(new_mm, current->pid, current->comm,
                               d->parent_pid, d->parent_comm, d->jit_allowed);
+        return 0;
+    }
+
+    if (d->fork_race_inherit) {
+        /* Unlike d->old_mm below, this doesn't branch on rc: the worker
+         * for the original fork-inherit request already stood down (see
+         * ac_prot_add_worker()) once ac_exec_entry() claimed the slot, so
+         * *something* has to register current->mm now regardless of how
+         * this exec turned out. On success that's the new post-exec
+         * image; on failure current->mm is unchanged, so this simply
+         * finishes the registration the original request would have
+         * done. */
+        new_mm = get_task_mm(current);
+        if (new_mm)
+            ac_schedule_prot_add(new_mm, current->pid, current->comm,
+                                  d->parent_pid, d->parent_comm,
+                                  d->jit_allowed);
         return 0;
     }
 
