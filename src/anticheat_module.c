@@ -1422,7 +1422,8 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
     bool is_compat = (p == &ac_kp_ptrace32);
     long request, target;
     char tcomm[AC_MAX_COMM] = "?";
-    bool deny = false, kill = false;
+    bool deny = false, kill = false, killed = false;
+    int rc;
 
     /* `args` is trusted only as far as regs->di actually points at a real
      * pt_regs frame -- if this probe ever lands on a different call site,
@@ -1464,7 +1465,8 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
             "ptrace req %ld by pid %d (%s) DENIED",
             request, current->pid, current->comm);
 
-    if (kill && (ac_policy & 0x1))
+    killed = kill && (ac_policy & 0x1);
+    if (killed)
         ac_schedule_kill(current);
 
     /* Neutralise the syscall: rewrite the request slot in the frame to an
@@ -1475,9 +1477,26 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
      * same "don't oops in atomic context on a bad address" guarantee,
      * and costs nothing on the expected path. */
     if (is_compat)
-        ac_kwrite_long(&args->bx, (unsigned long)-1);
+        rc = ac_kwrite_long(&args->bx, (unsigned long)-1);
     else
-        ac_kwrite_long(&args->di, (unsigned long)-1);
+        rc = ac_kwrite_long(&args->di, (unsigned long)-1);
+
+    if (rc) {
+        /* Should be unreachable: args->{bx,di} is the very address
+         * ac_kread() just read successfully above, on the same
+         * always-mapped-RW kernel stack page, with nothing in between
+         * that could change that. If it somehow fails anyway, we can no
+         * longer neutralise this call -- ptrace() may still run with its
+         * original, un-denied arguments. Escalate unconditionally: kill
+         * the caller regardless of ac_policy (that bit governs the
+         * normal deny path above, not this emergency fallback), since
+         * the primary defense has already failed and letting the caller
+         * keep running would defeat the deny entirely. */
+        pr_crit("anticheat: ptrace neutralisation write failed for req %ld target %d (%s) by pid %d (%s) -- killing caller\n",
+                request, (int)target, tcomm, current->pid, current->comm);
+        if (!killed)
+            ac_schedule_kill(current);
+    }
     return 0;
 }
 
@@ -1505,7 +1524,8 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
     pid_t target;
     struct task_struct *t;
     char tcomm[AC_MAX_COMM] = "?";
-    bool protected_target;
+    bool protected_target, killed;
+    int rc;
 
     /* Same nofault requirement as ac_ptrace_pre() above: `args` is only
      * as trustworthy as regs->di, and a raw dereference here runs in
@@ -1555,7 +1575,8 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
              p == &ac_kp_process_vm_readv) ? "readv" : "writev",
             current->pid, current->comm);
 
-    if (ac_policy & 0x1)
+    killed = ac_policy & 0x1;
+    if (killed)
         ac_schedule_kill(current);
 
     /* Neutralise the syscall: rewrite the pid slot in the frame to an
@@ -1565,9 +1586,23 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
      * protected process. Written via ac_kwrite_long(), not a raw store --
      * see ac_ptrace_pre()'s neutralisation comment. */
     if (is_compat)
-        ac_kwrite_long(&args->bx, (unsigned long)-1);
+        rc = ac_kwrite_long(&args->bx, (unsigned long)-1);
     else
-        ac_kwrite_long(&args->di, (unsigned long)-1);
+        rc = ac_kwrite_long(&args->di, (unsigned long)-1);
+
+    if (rc) {
+        /* See ac_ptrace_pre()'s identical check: should be unreachable
+         * (same address ac_kread() just read successfully, on an
+         * always-mapped-RW kernel stack page), but if the write ever
+         * does fail, the pid slot is unchanged and process_vm_{read,
+         * write}v may still run against the protected target. Escalate
+         * unconditionally, regardless of ac_policy, since the primary
+         * defense has already failed. */
+        pr_crit("anticheat: process_vm neutralisation write failed for target pid %d (%s) by pid %d (%s) -- killing caller\n",
+                target, tcomm, current->pid, current->comm);
+        if (!killed)
+            ac_schedule_kill(current);
+    }
     return 0;
 }
 
