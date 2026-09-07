@@ -3900,6 +3900,13 @@ static int cmd_start(int argc, char **argv)
         sigaction(SIGINT, &sa, NULL);
     }
     signal(SIGHUP, SIG_IGN);
+    /* Without this, a report endpoint that accepts a connection and closes
+     * it mid-write (hostile or just misbehaving) sends SIGPIPE, whose
+     * default action terminates the process -- trivial remote DoS of the
+     * whole monitoring daemon via ac_report()'s socket write(). write()
+     * still reports EPIPE on the next call either way, which is already
+     * handled below as an ordinary send failure. */
+    signal(SIGPIPE, SIG_IGN);
 
     logmsg(LOG_INFO, "anticheat daemon started (foreground=%d)", foreground);
     {
