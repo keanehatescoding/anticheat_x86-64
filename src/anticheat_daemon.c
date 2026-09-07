@@ -563,9 +563,33 @@ static int hash_proc_mem(int mem_fd, uint64_t start, uint64_t size,
     return 0;
 }
 
+/* All AC_* overrides go through here instead of getenv() directly.
+ * secure_getenv() returns NULL when the process started across a real
+ * credential transition (setuid/setgid exec, file capabilities, or an
+ * LSM-forced transition -- i.e. AT_SECURE is set), so a privileged
+ * daemon never trusts environment inherited from a less-privileged
+ * caller across such a boundary. This binary is installed mode 0755
+ * with no setuid bit or file capabilities, so that boundary does not
+ * exist today; the wrapper is defense-in-depth for a future install
+ * mode, at zero cost while it is a no-op.
+ * Deliberately NOT filtered: variables passed via sudo/sudo -E. sudo
+ * elevates before execve(), so the daemon starts with ruid == euid ==
+ * 0 and AT_SECURE unset, where secure_getenv() == getenv(). That is
+ * intended, not a gap: anyone able to invoke the daemon through sudo
+ * is already the trusted operator (see THREAT_MODEL.md) with strictly
+ * stronger attacks available (SIGKILL the daemon, unload an unlocked
+ * module), and legitimate flows depend on sudo-passed overrides
+ * (Makefile install-deck's sudo AC_BASELINE_DIR=... start, test.sh's
+ * AC_*_INTERVAL overrides). */
+
+static const char *ac_getenv(const char *name)
+{
+    return secure_getenv(name);
+}
+
 static const char *ac_baseline_dir(void)
 {
-    const char *e = getenv("AC_BASELINE_DIR");
+    const char *e = ac_getenv("AC_BASELINE_DIR");
 
     return (e && *e) ? e : AC_BASELINE_DIR;
 }
@@ -579,7 +603,7 @@ static const char *ac_baseline_dir(void)
  * case instead of silently misbehaving on operator typos. */
 static int ac_env_interval(const char *envname, int default_secs)
 {
-    const char *e = getenv(envname);
+    const char *e = ac_getenv(envname);
     char *end;
     long v;
 
@@ -3543,8 +3567,8 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
 
 static void ac_report(const char *event_type, const char *detail)
 {
-    const char *url = getenv("AC_REPORT_URL");
-    const char *key = getenv("AC_REPORT_KEY");
+    const char *url = ac_getenv("AC_REPORT_URL");
+    const char *key = ac_getenv("AC_REPORT_KEY");
     char client_id[128], client_id_esc[256], et_esc[64], detail_esc[600];
     char body[1024], req[2048], resp[64];
     struct ac_report_dest dest;
