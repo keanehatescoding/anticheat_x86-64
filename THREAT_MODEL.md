@@ -169,10 +169,25 @@ where the relevant code lives:
 - **`kallsyms_lookup_name`/`module_mutex` are not exported** as of the
   targeted kernel floor (6.12+), so syscall-table discovery and the
   module-list walk are hand-implemented (kprobe-based address discovery;
-  a preemption-disabled, 1024-entry-capped single-pass walk). Both are
-  therefore racy against concurrent kernel-internal changes in a bounded,
-  documented way (a worst-case snapshot may contain a torn entry or miss
-  a module being unloaded at that instant) rather than wrong outright.
+  an RCU-protected, 1024-entry-capped single-pass walk of `THIS_MODULE->
+  list`). The walk is memory-safe, not merely best-effort: it uses
+  `rcu_read_lock()` + `list_for_each_entry_rcu()`, the same protection
+  the kernel's own `is_module_address()`/`is_module_text_address()` use
+  for this exact list. Module unload (`free_module()` in
+  `kernel/module/main.c`) does `list_del_rcu()` followed by
+  `synchronize_rcu()` *before* freeing the core memory a `struct module`
+  lives in, so `synchronize_rcu()` cannot complete — and the module can't
+  be freed — while this walk still holds the RCU read lock; a `struct
+  module *` handed out mid-walk is guaranteed live for the duration of
+  the walk. What remains racy, by design, is the list's *membership* and
+  *content* during that window: a module load/unload landing mid-walk can
+  make a single snapshot miss a module or see one still mid-`ac_module_
+  sane()`-filtered init/teardown state, and a concurrent writer can
+  change `mod->state`/`mod->mem[]` under the reader between individual
+  field reads (no UAF — the memory itself outlives the read; just a torn
+  logical snapshot). That residual raciness is bounded and tolerated by
+  callers exactly as before; see #2 for the prior weaker
+  (`preempt_disable()`-only) version of this walk and why it was upgraded.
 - **Secure Boot enrollment is a manual, one-time, interactive step** (MOK
   enrollment via the firmware's "MOK Management" screen) — nothing here
   can or should auto-approve a new trusted key.

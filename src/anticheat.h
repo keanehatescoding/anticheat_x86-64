@@ -196,7 +196,8 @@ struct ac_syscall_check {
     unsigned int       total;         /* non-NULL entries */
     unsigned int       non_text;      /* entries outside core kernel text */
     unsigned int       hooked;        /* = non_text (kept for compat) */
-    unsigned int       ok;            /* 1 if no hooks found */
+    unsigned int       ok;            /* 1 if no hooked, redirected, or
+                                          checksum_mismatch entries found */
     /* Boot-time handler-address baseline (#63): closes the gap
      * THREAT_MODEL.md calls out under "Within-core-kernel-text redirects"
      * -- table_addr/non_text/hooked above only ever look at *where* an

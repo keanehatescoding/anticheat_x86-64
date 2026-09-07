@@ -58,13 +58,16 @@
 #include <linux/dcache.h>
 #include <linux/version.h>
 #include <linux/timekeeping.h>
+#include <linux/completion.h>
 #include <linux/workqueue.h>
 #include <linux/mempool.h>
 #include <linux/cred.h>
 #include <linux/capability.h>
+#include <linux/user_namespace.h>
 #include <linux/ptrace.h>
 #include <linux/err.h>
 #include <linux/bitops.h>
+#include <linux/rcupdate.h>
 #include <asm/unistd.h>
 
 #include "anticheat.h"
@@ -250,21 +253,37 @@ static void ac_resolve_text_bounds(void)
 
 /* ------------------------------------------------------------------ */
 /* module list walking (kernel-internal list; module_mutex is not      */
-/* exported, so we walk with preemption disabled — best effort)        */
+/* exported, so we walk under rcu_read_lock() instead — the same       */
+/* protection the kernel's own is_module_address()/is_module_text_     */
+/* address() use for this exact list).                                 */
+/*                                                                      */
+/* This is a real liveness guarantee, not best-effort: module unload   */
+/* (kernel/module/main.c: free_module()) does list_del_rcu() followed  */
+/* by synchronize_rcu() *before* freeing the module's core memory      */
+/* (which is where `struct module` itself lives). Holding rcu_read_    */
+/* lock() across the walk means that free can't complete until this    */
+/* reader leaves the critical section, so a `struct module *` handed   */
+/* out by list_for_each_entry_rcu() here is guaranteed live for as     */
+/* long as we hold the lock -- no UAF, no generation-counter retry     */
+/* loop needed. list_for_each_entry_rcu() (vs. plain list_for_each_    */
+/* entry()) additionally pairs with the list's own list_add_rcu()/     */
+/* list_del_rcu() writers via rcu_dereference(), so the ->next         */
+/* pointers themselves are read safely too, not just the memory they   */
+/* point at.                                                            */
 /* ------------------------------------------------------------------ */
 static bool ac_addr_in_module(unsigned long addr)
 {
     struct module *m;
     bool found = false;
 
-    preempt_disable();
-    list_for_each_entry(m, &THIS_MODULE->list, list) {
+    rcu_read_lock();
+    list_for_each_entry_rcu(m, &THIS_MODULE->list, list) {
         if (ac_module_sane(m) && within_module_core(addr, m)) {
             found = true;
             break;
         }
     }
-    preempt_enable();
+    rcu_read_unlock();
     return found;
 }
 
@@ -616,7 +635,22 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
     out->checksum_mismatch = ac_syscall_baseline_ready &&
         strcmp(out->current_sha256, out->baseline_sha256) != 0;
 
-    out->ok = (out->hooked == 0);
+    /* hooked isn't the only sign of compromise: redirected covers a
+     * handler that's been repointed within core text (never left it, so
+     * ac_entry_bad() alone can't see it), and checksum_mismatch covers
+     * the whole-table hash diverging from the baseline even if no single
+     * slot's per-slot classification caught it. Any of the three means
+     * the table isn't in its expected state.
+     *
+     * Note: a slot whose live read failed this poll contributed its
+     * trusted baseline value to the hash and skipped the counters, so
+     * ok == 1 here means "nothing observed", not "everything verified".
+     * Masking a compromise this way requires faulting a pinned
+     * kernel-text page -- a kernel-privileged adversary, out of scope
+     * per THREAT_MODEL.md -- and a single failure self-heals on the
+     * next successful read, since the bitmaps above are preserved. */
+    out->ok = (out->hooked == 0 && out->redirected == 0 &&
+               !out->checksum_mismatch);
     return 0;
 }
 
@@ -1241,30 +1275,101 @@ static bool ac_is_protected_pid(pid_t pid, char *comm_out)
 /* add/rekey requests can't call mmu_notifier_register()/_unregister()   */
 /* directly and must hand off to ac_wq instead.                         */
 /*                                                                      */
-/* Known gap (tracked in issue #87, not fixed here): a child's own      */
-/* exec racing ahead of its own not-yet-run fork-inherit request. If a  */
-/* protected process forks and the child execs before                  */
-/* ac_prot_add_worker() has dequeued and run the fork-inherit request   */
-/* ac_clone_ret() queued for it, ac_exec_entry() finds current->mm not  */
-/* yet in ac_prots[] (registration is still pending, not done) and      */
-/* treats the child as unprotected -- it does nothing, rather than      */
-/* redirecting the in-flight request to the child's new post-exec mm.   */
-/* The worker then goes on to register the child's now-orphaned         */
-/* pre-exec mm, which is a mostly harmless no-op (that mm has no live    */
-/* task using it and organically self-releases moments later, via the   */
-/* very mmput() ac_prot_add_worker() itself does once ac_add_prot_mm()   */
-/* returns -- no permanent slot leak), but leaves a real, narrow window  */
-/* where the freshly-exec'd child is NOT actually covered by             */
-/* ptrace/process_vm defenses despite the inherit policy intending it    */
-/* to be. Properly closing this needs a "pending transition" visible to  */
-/* ac_exec_entry() (and ac_is_protected_mm()'s other callers) so an      */
-/* exec racing an in-flight fork/rekey request can redirect it to the    */
-/* live mm instead of racing past it -- a materially bigger change than  */
-/* anything else in this file's mm-keyed registry, deliberately left for */
-/* a follow-up rather than folded into it under time pressure.           */
+/* Fork-then-exec race (#6): a protected process's child forks, and     */
+/* ac_clone_ret() queues a fork-inherit request for the child's mm onto */
+/* ac_wq -- but if the child execs before ac_prot_add_worker() dequeues */
+/* and runs that request, ac_exec_entry() (running in the exec's own    */
+/* entry_handler, before exec_mmap() replaces current->mm) finds        */
+/* current->mm not yet in ac_prots[] (registration is still queued, not */
+/* done) and would otherwise treat the child as unprotected: no rekey,  */
+/* nothing. The worker then goes on to register the child's now-stale   */
+/* pre-exec mm -- which nothing uses any more -- while the actual       */
+/* post-exec image the child is now running under is never registered   */
+/* at all, a real gap in ptrace/process_vm coverage for exactly the     */
+/* window inheritance is supposed to close.                             */
+/*                                                                      */
+/* ac_pending_forks below is what closes it: a fork-inherit request     */
+/* links itself into this list at queue time (see                       */
+/* ac_schedule_prot_add_req()), and ac_exec_entry() -- finding           */
+/* current->mm neither in ac_prots[] nor covered by the vfork_inherit    */
+/* case -- scans it too. A match means "there's a fork-inherit for       */
+/* exactly this mm still in flight"; it claims the request and records   */
+/* the request pointer plus its generation tag (req_id, against struct   */
+/* recycling) in its own kretprobe instance data, where ac_exec_ret()   */
+/* can find it again. A chained second exec before the worker consumed   */
+/* the first handoff matches the same way via post_mm (see below).       */
+/*                                                                      */
+/* The worker owns the post-exec handoff, not the kretprobe: once        */
+/* claimed, ac_prot_add_worker() waits -- bounded by                      */
+/* AC_EXEC_HANDOFF_TIMEOUT_MS -- for ac_exec_ret() to post the mm        */
+/* current actually ended up with into the request itself (post_mm,      */
+/* reference included), then registers that instead of the stale         */
+/* pre-exec mm. Posting into an already-existing struct needs no         */
+/* allocation at all, so a mempool_alloc() failure can no longer strand  */
+/* current->mm unprotected after the worker stood down on the pre-exec   */
+/* mm: the previous shape queued a *second* request from atomic          */
+/* (kretprobe) context for the post-exec image and silently dropped it   */
+/* when the pool was dry. The only allocation left anywhere near this    */
+/* path is the fallback when the worker already resolved the request     */
+/* (timeout, see below) before ac_exec_ret() ran and a fresh request     */
+/* must be queued after all -- that failure is reported via AC_EV_INFO,  */
+/* never silently dropped.                                               */
+/*                                                                      */
+/* ac_prot_add_worker() checks the claim right before registering a      */
+/* fork-inherit mm -- but, critically, does not unlink its own request   */
+/* from this list until that registration attempt (skipped or not) is    */
+/* fully resolved: unlinking any earlier would open a window where a     */
+/* racing ac_exec_entry() finds neither this list (already unlinked) nor */
+/* ac_prots[] (registration not actually finished yet) and wrongly       */
+/* concludes there's nothing to claim. A claim landing while             */
+/* ac_add_prot_mm() itself is sleeping (it can, on mmap_lock) is         */
+/* likewise harmless: the worker re-checks post_mm under the same lock   */
+/* right after registering and registers the handoff too, so at worst    */
+/* both get registered (the stale one self-releases once the exec'd      */
+/* task drops it), never neither -- and the handoff reference is always  */
+/* consumed exactly once, so nothing leaks.                              */
+/*                                                                      */
+/* Deliberately not a fixed-size table: the request struct this list     */
+/* threads through (struct ac_prot_add_req) is itself mempool-backed, so */
+/* every fork-inherit request that can be queued at all already has      */
+/* somewhere to record its pending-claim state -- no separate capacity   */
+/* to run out of, and so no silent "table full" mode that would          */
+/* reintroduce this same race for whichever fork didn't get a slot.      */
+/*                                                                      */
+/* This closes the queued-but-not-started window, which is the one an   */
+/* attacker can actually make wide (workqueue dispatch latency, no      */
+/* upper bound). It does not close the much narrower windows already    */
+/* inherent to ac_add_prot_mm() itself -- between claiming a slot as     */
+/* AC_PROT_RESERVED and mmu_notifier_register() actually returning,      */
+/* ac_is_protected_mm() still reads that mm as unprotected, since        */
+/* AC_PROT_RESERVED carries no mm identity by design (see its own        */
+/* comment) -- nor the same sliver in the worker's own handoff           */
+/* registration after it consumed post_mm and unlinked: an exec landing  */
+/* in either single-syscall-duration sliver still isn't redirected.      */
+/* Left as is: closing either would mean every ac_is_protected_mm()      */
+/* caller also has to understand claiming, for windows that -- unlike    */
+/* the one above -- aren't attacker-controllable to any useful degree.   */
 /* ------------------------------------------------------------------ */
+static LIST_HEAD(ac_pending_forks);
+static DEFINE_SPINLOCK(ac_pending_fork_lock);
+static atomic_t ac_prot_req_seq = ATOMIC_INIT(0);
+/* Bound for ac_prot_add_worker() waiting on a claimed fork-inherit's exec */
+/* handoff (see ac_pending_forks' comment). An execve body is normally     */
+/* microseconds to milliseconds; this is orders of margin, and it bounds   */
+/* the workqueue stall -- and the module-unload flush -- when the ret      */
+/* probe never runs to post the handoff (kretprobe maxactive overflow, or  */
+/* the task dying mid-exec). On timeout the worker falls back to           */
+/* registering the stale pre-exec mm and says so loudly.                   */
+#define AC_EXEC_HANDOFF_TIMEOUT_MS 5000
+
 struct ac_prot_add_req {
     struct work_struct work;
+    struct list_head pending_link; /* linked into ac_pending_forks iff
+                                     * old_mm == NULL, from queue time
+                                     * until ac_prot_add_worker()'s own
+                                     * registration attempt for mm is
+                                     * resolved -- see ac_pending_forks'
+                                     * comment above */
     struct mm_struct *mm;        /* new mm to register; ref owned by this
                                    * request until the worker mmput()s it */
     struct mm_struct *old_mm;    /* exec-rekey only: entry to drop once mm
@@ -1275,12 +1380,163 @@ struct ac_prot_add_req {
     pid_t src_pid;                /* parent (fork) or pre-exec self (exec) */
     char src_comm[AC_MAX_COMM];
     bool jit_allowed;
+    /* Meaningful only while old_mm == NULL and still linked into
+     * ac_pending_forks. claimed is set by ac_exec_entry() when it finds
+     * and claims this request: tells ac_prot_add_worker() to wait for
+     * the exec path's handoff (post_mm et al.) and register that instead
+     * of the now-stale pre-exec mm -- see ac_pending_forks' comment. */
+    bool claimed;
+    struct completion handoff_done; /* signaled by ac_exec_ret() once it has
+                                     * posted post_mm (or found nothing to
+                                     * post); waited on by the worker iff
+                                     * claimed. Init at queue time so a
+                                     * complete() racing ahead of the wait
+                                     * can't be lost. */
+    struct mm_struct *post_mm;      /* exec handoff: the mm current ended up
+                                     * with, reference included. Set under
+                                     * ac_pending_fork_lock, consumed exactly
+                                     * once by the worker. */
+    pid_t post_pid;
+    char post_comm[AC_MAX_COMM];
+    int req_id;                     /* generation tag from ac_prot_req_seq:
+                                     * ac_exec_ret() validates pointer *and*
+                                     * id under the lock, so a recycled
+                                     * request struct at the same address
+                                     * can't be mistaken for the claimed one. */
 };
 
 static void ac_prot_add_worker(struct work_struct *w)
 {
     struct ac_prot_add_req *r = container_of(w, struct ac_prot_add_req, work);
-    int ret = ac_add_prot_mm(r->mm, r->new_pid, r->new_comm, r->jit_allowed);
+    int ret;
+    unsigned long flags;
+
+    if (!r->old_mm) {
+        /* Fork-inherit request: check whether an exec already raced
+         * ahead of us and claimed this mm (see ac_pending_forks'
+         * comment above). If so, the exec path posts the mm current
+         * actually ended up with into this request -- wait for that
+         * handoff (bounded) and register it instead of the stale
+         * pre-exec mm. The handoff itself needs no allocation, so unlike
+         * the old shape (queue a second request from atomic context)
+         * there is no failure mode that strands the new image
+         * unprotected here. */
+        bool claimed;
+
+        spin_lock_irqsave(&ac_pending_fork_lock, flags);
+        claimed = r->claimed;
+        spin_unlock_irqrestore(&ac_pending_fork_lock, flags);
+
+        if (claimed) {
+            struct mm_struct *post;
+
+            wait_for_completion_timeout(&r->handoff_done,
+                    msecs_to_jiffies(AC_EXEC_HANDOFF_TIMEOUT_MS));
+
+            spin_lock_irqsave(&ac_pending_fork_lock, flags);
+            post = r->post_mm;
+            r->post_mm = NULL;
+            if (post) {
+                r->new_pid = r->post_pid;
+                strscpy(r->new_comm, r->post_comm, sizeof(r->new_comm));
+            }
+            list_del(&r->pending_link);
+            spin_unlock_irqrestore(&ac_pending_fork_lock, flags);
+
+            if (post) {
+                mmput(r->mm);   /* stale pre-exec image: nothing runs it */
+                r->mm = post;   /* adopt the handoff reference */
+                ret = ac_add_prot_mm(r->mm, r->new_pid, r->new_comm,
+                                     r->jit_allowed);
+                if (ret == 0)
+                    ac_emit(AC_EV_FORK, r->new_pid, r->new_comm,
+                            "child of protected pid %d (%s) exec'd before "
+                            "fork-inherit landed; protection transferred to "
+                            "the new image",
+                            r->src_pid, r->src_comm);
+                else
+                    ac_emit(AC_EV_INFO, r->new_pid, r->new_comm,
+                            "child of protected pid %d (%s) exec'd before "
+                            "fork-inherit landed but new image NOT "
+                            "protected: %d",
+                            r->src_pid, r->src_comm, ret);
+            } else {
+                /* The ret probe never posted -- missed (kretprobe
+                 * maxactive overflow) or the task died mid-exec. Fall
+                 * back to the stale pre-exec mm rather than silently
+                 * dropping the inherit, and say so loudly: if the exec
+                 * did succeed, its image may be unprotected. */
+                ret = ac_add_prot_mm(r->mm, r->new_pid, r->new_comm,
+                                     r->jit_allowed);
+                ac_emit(AC_EV_INFO, r->new_pid, r->new_comm,
+                        "child of protected pid %d (%s) exec handoff lost; "
+                        "registered pre-exec image instead (post-exec image "
+                        "may be unprotected): %d",
+                        r->src_pid, r->src_comm, ret);
+            }
+            mmput(r->mm);
+            mempool_free(r, ac_prot_add_pool);
+            return;
+        }
+    }
+
+    ret = ac_add_prot_mm(r->mm, r->new_pid, r->new_comm, r->jit_allowed);
+
+    if (!r->old_mm) {
+        /* Unlink only now that our own registration attempt above is
+         * fully resolved (see ac_pending_forks' comment) -- regardless of
+         * whether ac_exec_entry() claimed this request while
+         * ac_add_prot_mm() was running (possible: it can sleep on
+         * mmap_lock inside mmu_notifier_register()). That race stays
+         * harmless: the exec path posts its handoff into this same
+         * request, which is picked up and registered below too, so at
+         * worst both this mm and the exec's own current get registered
+         * (the stale one self-releases once the exec'd task drops it),
+         * never neither. Consuming post_mm here (rather than leaving it)
+         * is also what keeps the handoff reference balanced: without
+         * this, a post landing between the claim check above and the
+         * unlink here would leak its reference and leave the new image
+         * unprotected. */
+        struct mm_struct *post;
+        pid_t post_pid;
+        char post_comm[AC_MAX_COMM];
+
+        spin_lock_irqsave(&ac_pending_fork_lock, flags);
+        post = r->post_mm;
+        r->post_mm = NULL;
+        if (post) {
+            post_pid = r->post_pid;
+            strscpy(post_comm, r->post_comm, sizeof(post_comm));
+        }
+        list_del(&r->pending_link);
+        spin_unlock_irqrestore(&ac_pending_fork_lock, flags);
+
+        if (post) {
+            if (post == r->mm) {
+                /* Failed exec: the handoff is the same mm as just
+                 * registered above (already covered) -- just drop the
+                 * extra reference. */
+                mmput(post);
+            } else {
+                int ret2 = ac_add_prot_mm(post, post_pid, post_comm,
+                                          r->jit_allowed);
+
+                if (ret2 == 0)
+                    ac_emit(AC_EV_FORK, post_pid, post_comm,
+                            "child of protected pid %d (%s) exec'd during "
+                            "fork-inherit registration; protection carried "
+                            "to the new image",
+                            r->src_pid, r->src_comm);
+                else
+                    ac_emit(AC_EV_INFO, post_pid, post_comm,
+                            "child of protected pid %d (%s) exec'd during "
+                            "fork-inherit registration but new image NOT "
+                            "protected: %d",
+                            r->src_pid, r->src_comm, ret2);
+                mmput(post);
+            }
+        }
+    }
 
     if (r->old_mm) {
         if (ret == 0) {
@@ -1308,7 +1564,7 @@ static void ac_prot_add_worker(struct work_struct *w)
     mempool_free(r, ac_prot_add_pool);
 }
 
-static void ac_schedule_prot_add_req(struct mm_struct *mm,
+static bool ac_schedule_prot_add_req(struct mm_struct *mm,
                                       struct mm_struct *old_mm,
                                       pid_t new_pid, const char *new_comm,
                                       pid_t src_pid, const char *src_comm,
@@ -1328,7 +1584,7 @@ static void ac_schedule_prot_add_req(struct mm_struct *mm,
         mmput_async(mm);
         if (old_mm)
             mmput_async(old_mm);
-        return;
+        return false;
     }
     INIT_WORK(&r->work, ac_prot_add_worker);
     r->mm = mm;
@@ -1338,30 +1594,61 @@ static void ac_schedule_prot_add_req(struct mm_struct *mm,
     r->src_pid = src_pid;
     strscpy(r->src_comm, src_comm, sizeof(r->src_comm));
     r->jit_allowed = jit_allowed;
+    r->claimed = false;
+    r->post_mm = NULL;
+    r->req_id = 0;
+    init_completion(&r->handoff_done);
+
+    if (!old_mm) {
+        /* Fork-inherit request: link into ac_pending_forks so a racing
+         * ac_exec_entry() for exactly this mm can find and claim it (see
+         * that list's comment above ac_prot_add_worker()). Linking here,
+         * before queue_work() below, and unlinking only once
+         * ac_prot_add_worker() has fully resolved its own registration
+         * attempt is what keeps this request visible for exactly as long
+         * as there's a window where neither ac_prots[] nor this list
+         * would otherwise reflect it. No capacity check needed: this
+         * request struct is itself mempool-backed, so linking it costs
+         * nothing beyond what allocating it already did. */
+        unsigned long flags;
+
+        spin_lock_irqsave(&ac_pending_fork_lock, flags);
+        r->req_id = atomic_inc_return(&ac_prot_req_seq);
+        list_add(&r->pending_link, &ac_pending_forks);
+        spin_unlock_irqrestore(&ac_pending_fork_lock, flags);
+    }
+
     queue_work(ac_wq, &r->work);
+    return true;
 }
 
 /* Queue `mm` (caller's get_task_mm() reference -- handed off, always
  * consumed via mmput()/mmput_async() by the worker or on failure here) for
  * protection inherited from a fork. Callable from kretprobe context
- * (ac_clone_ret()). */
-static void ac_schedule_prot_add(struct mm_struct *mm, pid_t new_pid,
+ * (ac_clone_ret()), and from ac_exec_ret()'s fallback paths. Returns false
+ * on allocation failure (refs already dropped); callers must report it --
+ * see ac_schedule_prot_add_req(). The fork-race handoff itself needs no
+ * allocation (see ac_pending_forks' comment), so its success path never
+ * touches this failure mode. */
+static bool ac_schedule_prot_add(struct mm_struct *mm, pid_t new_pid,
                                   const char *new_comm, pid_t parent_pid,
                                   const char *parent_comm, bool jit_allowed)
 {
-    ac_schedule_prot_add_req(mm, NULL, new_pid, new_comm,
-                              parent_pid, parent_comm, jit_allowed);
+    return ac_schedule_prot_add_req(mm, NULL, new_pid, new_comm, parent_pid,
+                              parent_comm, jit_allowed);
 }
 
 /* Queue a rekey from `old_mm` to `new_mm` after a protected task's
  * execve() replaced its address space. Both are caller-pinned references,
  * handed off the same way. Callable from kretprobe context (the exec
- * kretprobes below). */
-static void ac_schedule_prot_rekey(struct mm_struct *old_mm,
+ * kretprobes below). Same false-on-failure contract as above: on false
+ * the old entry is retained (never removed), so the caller must report
+ * the unprotected new image loudly. */
+static bool ac_schedule_prot_rekey(struct mm_struct *old_mm,
                                     struct mm_struct *new_mm, pid_t pid,
                                     const char *comm, bool jit_allowed)
 {
-    ac_schedule_prot_add_req(new_mm, old_mm, pid, comm, pid, comm,
+    return ac_schedule_prot_add_req(new_mm, old_mm, pid, comm, pid, comm,
                               jit_allowed);
 }
 
@@ -1713,8 +2000,13 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
      * protection before the deferred registration has even run would be
      * exactly the kind of false claim the old synchronous code's comment
      * warned about. */
-    ac_schedule_prot_add(child_mm, cpid, ccomm, current->pid, current->comm,
-                          ac_prot_jit_allowed_mm(current->mm));
+    if (!ac_schedule_prot_add(child_mm, cpid, ccomm, current->pid,
+                              current->comm,
+                              ac_prot_jit_allowed_mm(current->mm)))
+        ac_emit(AC_EV_INFO, cpid, ccomm,
+                "child of protected pid %d (%s) NOT protected: registration "
+                "request dropped (alloc failure)",
+                current->pid, current->comm);
     return 0;
 }
 
@@ -1769,7 +2061,17 @@ static struct kretprobe ac_kp_clone = {
 struct ac_exec_entry_data {
     struct mm_struct *old_mm;
     bool vfork_inherit;
-    bool jit_allowed;              /* only meaningful if vfork_inherit */
+    /* Fork-then-exec race closure (#6): current->mm matched an in-flight
+     * fork-inherit request in ac_pending_forks rather than an already-
+     * registered entry in ac_prots[] -- see that list's comment. The
+     * worker owns the post-exec handoff (it waits for ac_exec_ret() to
+     * post the new mm into the request), so this reuses
+     * jit_allowed/parent_pid/parent_comm rather than duplicating them;
+     * pending_req/pending_id locate the claimed request for the handoff. */
+    bool fork_race_inherit;
+    struct ac_prot_add_req *pending_req; /* claimed request, still linked */
+    int pending_id;                      /* req_id at claim time */
+    bool jit_allowed;      /* meaningful if vfork_inherit or fork_race_inherit */
     pid_t parent_pid;
     char parent_comm[AC_MAX_COMM];
 };
@@ -1780,6 +2082,9 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
     d->old_mm = NULL;
     d->vfork_inherit = false;
+    d->fork_race_inherit = false;
+    d->pending_req = NULL;
+    d->pending_id = 0;
     if (current->vfork_done) {
         if (current->mm && ac_is_protected_mm(current->mm)) {
             struct task_struct *parent;
@@ -1806,6 +2111,36 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
          * re-exec of a protected process. */
         ac_emit(AC_EV_INFO, current->pid, current->comm,
                 "execve() invoked (path is a user pointer, not resolved)");
+        return 0;
+    }
+    /* Not yet in ac_prots[] -- but a fork-inherit request queued for
+     * exactly this mm may still be sitting on ac_wq (see ac_pending_forks'
+     * comment). Claim it here so ac_prot_add_worker() waits for this
+     * exec's handoff instead of registering the stale pre-exec mm.
+     * The post_mm match covers a chained second exec before the worker
+     * consumed the first handoff: the request still advertises the
+     * previous handoff as current's mm, so re-claim it and let
+     * ac_exec_ret() overwrite the handoff with the latest image. */
+    {
+        struct ac_prot_add_req *pr;
+        unsigned long flags;
+
+        spin_lock_irqsave(&ac_pending_fork_lock, flags);
+        list_for_each_entry(pr, &ac_pending_forks, pending_link) {
+            if (pr->mm == current->mm ||
+                (pr->claimed && pr->post_mm == current->mm)) {
+                pr->claimed = true;
+                d->fork_race_inherit = true;
+                d->pending_req = pr;
+                d->pending_id = pr->req_id;
+                d->jit_allowed = pr->jit_allowed;
+                d->parent_pid = pr->src_pid;
+                strscpy(d->parent_comm, pr->src_comm,
+                        sizeof(d->parent_comm));
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&ac_pending_fork_lock, flags);
     }
     return 0;
 }
@@ -1823,8 +2158,80 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
         new_mm = get_task_mm(current);
         if (!new_mm)
             return 0;   /* shouldn't happen on a successful exec */
-        ac_schedule_prot_add(new_mm, current->pid, current->comm,
-                              d->parent_pid, d->parent_comm, d->jit_allowed);
+        if (!ac_schedule_prot_add(new_mm, current->pid, current->comm,
+                                  d->parent_pid, d->parent_comm,
+                                  d->jit_allowed))
+            ac_emit(AC_EV_INFO, current->pid, current->comm,
+                    "vfork child of protected pid %d (%s) NOT protected: "
+                    "registration request dropped (alloc failure)",
+                    d->parent_pid, d->parent_comm);
+        return 0;
+    }
+
+    if (d->fork_race_inherit) {
+        /* The worker for the original fork-inherit request is waiting on
+         * this handoff (see ac_pending_forks' comment), so post the mm
+         * current actually ended up with into the claimed request itself
+         * -- no allocation, hence no failure mode here. Deliberately not
+         * branched on rc: get_task_mm() reads current->mm as of *now*, so
+         * on success that's the new post-exec image, and on failure
+         * current->mm is unchanged and this simply finishes the
+         * registration the original request would have done. A chained
+         * second exec overwrites an unconsumed first handoff (dropping
+         * its reference -- nothing ever registered it); the worker
+         * always consumes the latest image, which is the only one that
+         * still needs protection. */
+        unsigned long flags;
+        struct ac_prot_add_req *pr;
+        struct mm_struct *drop = NULL;
+
+        new_mm = get_task_mm(current);
+        if (new_mm) {
+            spin_lock_irqsave(&ac_pending_fork_lock, flags);
+            list_for_each_entry(pr, &ac_pending_forks, pending_link) {
+                if (pr == d->pending_req &&
+                    pr->req_id == d->pending_id) {
+                    drop = pr->post_mm;
+                    pr->post_mm = new_mm;
+                    pr->post_pid = current->pid;
+                    strscpy(pr->post_comm, current->comm,
+                            sizeof(pr->post_comm));
+                    new_mm = NULL;  /* reference transferred */
+                    complete(&pr->handoff_done);
+                    break;
+                }
+            }
+            spin_unlock_irqrestore(&ac_pending_fork_lock, flags);
+            if (drop)
+                mmput_async(drop);  /* superseded chained handoff */
+            if (new_mm) {
+                /* The worker already resolved (and freed) the claimed
+                 * request before this ran -- its timeout fallback
+                 * registered the pre-exec mm, so queue a fresh request
+                 * for the post-exec image. */
+                if (!ac_schedule_prot_add(new_mm, current->pid,
+                                          current->comm, d->parent_pid,
+                                          d->parent_comm, d->jit_allowed))
+                    ac_emit(AC_EV_INFO, current->pid, current->comm,
+                            "child of protected pid %d (%s) exec'd but new "
+                            "image NOT protected: registration request "
+                            "dropped (alloc failure)",
+                            d->parent_pid, d->parent_comm);
+            }
+        } else {
+            /* Exiting already: nothing to hand off. Still wake the
+             * worker if it is waiting so it falls back instead of
+             * timing out. */
+            spin_lock_irqsave(&ac_pending_fork_lock, flags);
+            list_for_each_entry(pr, &ac_pending_forks, pending_link) {
+                if (pr == d->pending_req &&
+                    pr->req_id == d->pending_id) {
+                    complete(&pr->handoff_done);
+                    break;
+                }
+            }
+            spin_unlock_irqrestore(&ac_pending_fork_lock, flags);
+        }
         return 0;
     }
 
@@ -1844,9 +2251,14 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
             mmput_async(new_mm);
         return 0;
     }
-
-    ac_schedule_prot_rekey(d->old_mm, new_mm, current->pid, current->comm,
-                            ac_prot_jit_allowed_mm(d->old_mm));
+    if (!ac_schedule_prot_rekey(d->old_mm, new_mm, current->pid,
+                                current->comm,
+                                ac_prot_jit_allowed_mm(d->old_mm)))
+        ac_emit(AC_EV_INFO, current->pid, current->comm,
+                "protected pid %d re-exec'd but new image NOT protected: "
+                "registration request dropped (alloc failure); old entry "
+                "retained",
+                current->pid);
     return 0;
 }
 
@@ -2109,18 +2521,19 @@ static unsigned long long ac_module_size(const struct module *mod)
 }
 
 /* A plausible module entry: LIVE with a non-zero, sane text mapping.
- * Guards the mutex-less module walk against torn/freed entries
- * (module_mutex is not exported).  A garbage entry with base=0 and a huge
- * size would otherwise make within_module_core() claim every kernel
- * address, poisoning both the hidden-module check and the syscall
- * plausibility filter.
+ * Guards the mutex-less module walk against torn entries (module_mutex
+ * is not exported; see ac_addr_in_module()'s comment for why the walk
+ * itself is RCU-protected against *freed* ones).  A garbage entry with
+ * base=0 and a huge size would otherwise make within_module_core() claim
+ * every kernel address, poisoning both the hidden-module check and the
+ * syscall plausibility filter.
  *
  * The is_vmalloc_addr() check guards against a subtler problem than a
  * torn entry: both walk sites below do
- * list_for_each_entry(m, &THIS_MODULE->list, list), which only stops
+ * list_for_each_entry_rcu(m, &THIS_MODULE->list, list), which only stops
  * once it circles back to THIS_MODULE's own list node -- not the
  * kernel's real (unexported) `modules` list_head sentinel. A full walk
- * necessarily passes through that sentinel too, and list_for_each_entry
+ * necessarily passes through that sentinel too, and list_for_each_entry_rcu
  * unconditionally container_of()s it into a `struct module *` as if it
  * were a real entry, even though it isn't embedded in one. Dereferencing
  * that bogus pointer reads whatever kernel global happens to sit at
@@ -2266,18 +2679,20 @@ static int ac_build_mod_snapshot(struct ac_fd_state *st)
     st->mods = NULL;
     st->n_mods = 0;
 
-    /* Single pass with a hard cap.  module_mutex is not exported, so the
-     * walk can race with concurrent load/unload (a torn entry is possible
-     * but bounded; the daemon tolerates it).  A single pass avoids the
+    /* Single pass with a hard cap.  module_mutex is not exported, so this
+     * walk uses rcu_read_lock() instead (see ac_addr_in_module()'s comment
+     * above for why that's a real liveness guarantee against concurrent
+     * load/unload, not just best-effort).  A single pass still avoids the
      * count/fill mismatch and the heap overflow a two-pass walk could
-     * cause when the list changes between passes. */
+     * cause when the list's *membership* changes between passes -- RCU
+     * protects the memory of entries we do visit, not the list shape. */
     st->mods = kvmalloc_array(AC_MAX_MODS, sizeof(struct ac_mod_info),
                               GFP_KERNEL);
     if (!st->mods)
         return -ENOMEM;
 
-    preempt_disable();
-    list_for_each_entry(mod, &THIS_MODULE->list, list) {
+    rcu_read_lock();
+    list_for_each_entry_rcu(mod, &THIS_MODULE->list, list) {
         struct ac_mod_info *mi;
 
         if (!ac_module_sane(mod))
@@ -2297,7 +2712,7 @@ static int ac_build_mod_snapshot(struct ac_fd_state *st)
         mi->state = mod->state;
         n++;
     }
-    preempt_enable();
+    rcu_read_unlock();
     st->n_mods = n;
     return 0;
 }
@@ -2318,8 +2733,17 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
      * entirely via SCM_RIGHTS or an inherited exec(). Without rechecking
      * here, whoever ends up holding the fd keeps full access -- including
      * LOCK (pin the module permanently) and ADD_PROC/DEL_PROC (rewrite
-     * protection state) -- regardless of their current privilege. */
-    if (!capable(CAP_SYS_ADMIN))
+     * protection state) -- regardless of their current privilege.
+     *
+     * ns_capable(&init_user_ns, ...), not plain capable(): capable()
+     * checks the capability against current_cred()'s own user_ns, so a
+     * process holding CAP_SYS_ADMIN only inside an unprivileged user
+     * namespace (e.g. "root" in a container) would pass. This device
+     * protects the host, so the check has to be against the host
+     * (init) namespace specifically -- that's exactly what
+     * ns_capable(&init_user_ns, ...) does, and is the kernel's own
+     * documented idiom for "real root only" checks. */
+    if (!ns_capable(&init_user_ns, CAP_SYS_ADMIN))
         return -EPERM;
 
     switch (cmd) {
@@ -2610,7 +3034,10 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 static int ac_open(struct inode *inode, struct file *file)
 {
-    if (!capable(CAP_SYS_ADMIN))
+    /* See ac_ioctl()'s identical check: ns_capable(&init_user_ns, ...)
+     * so a container "root" with CAP_SYS_ADMIN only in its own user
+     * namespace can't open this device at all. */
+    if (!ns_capable(&init_user_ns, CAP_SYS_ADMIN))
         return -EPERM;
     file->private_data = NULL;
     return 0;
