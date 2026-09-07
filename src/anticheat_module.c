@@ -2319,8 +2319,17 @@ static unsigned int ac_kretprobes_registered;
  * just a counter the caller has to poll -- so ac_missed_check_worker()
  * below polls it periodically on ac_wq and emits AC_EV_FORK_DROPPED the
  * moment any registered probe's count moves, so the daemon can flag
- * incomplete coverage instead of silently assuming completeness. */
-static unsigned long ac_kretp_last_nmissed[ARRAY_SIZE(ac_kretprobes)];
+ * incomplete coverage instead of silently assuming completeness.
+ *
+ * struct kretprobe.nmissed is an int bumped with a plain rp->nmissed++ on
+ * the probe's miss path, so the poller loads it with READ_ONCE() (an
+ * aligned-int load never tears; the accessor just stops the compiler from
+ * merging/repeating it) and keeps its baseline at the same int width. The
+ * delta is computed in the unsigned domain so a 32-bit wrap of a small
+ * forward step still yields a small delta; a backwards step means the
+ * counter was reset (re-registration zeroes nmissed), so the worker
+ * rebaselines silently instead of emitting a ~4-billion false delta. */
+static int ac_kretp_last_nmissed[ARRAY_SIZE(ac_kretprobes)];
 static struct delayed_work ac_missed_check_work;
 #define AC_MISSED_CHECK_INTERVAL_MS 5000
 
@@ -2329,16 +2338,27 @@ static void ac_missed_check_worker(struct work_struct *w)
     unsigned int i;
 
     for (i = 0; i < ARRAY_SIZE(ac_kretprobes); i++) {
-        unsigned long missed, delta;
+        int missed, last;
+        unsigned int delta;
 
+        /* Plain stores in ac_register/unregister_kprobes() only run while
+         * this worker is queued-but-never-running (init) or after it is
+         * disabled and drained (teardown), so no concurrent access here. */
         if (!ac_kretp_ok[i])
             continue;
-        missed = (unsigned long)ac_kretprobes[i]->nmissed;
-        delta = missed - ac_kretp_last_nmissed[i];
+        missed = READ_ONCE(ac_kretprobes[i]->nmissed);
+        last = ac_kretp_last_nmissed[i]; /* only this worker writes it */
+        if (missed == last)
+            continue;
+        delta = (unsigned int)missed - (unsigned int)last;
+        ac_kretp_last_nmissed[i] = missed;
+        /* < 2^31 forward misses per 5s poll is the only physically
+         * plausible step; a negative signed delta is a counter reset. */
+        if ((int)delta < 0)
+            continue;
         if (delta) {
-            ac_kretp_last_nmissed[i] = missed;
             ac_emit(AC_EV_FORK_DROPPED, -1, "?",
-                    "kretprobe %s missed %lu invocation%s (maxactive=%d exhausted) -- affected fork/exec was not registered",
+                    "kretprobe %s missed %u invocation%s (maxactive=%d exhausted) -- affected fork/exec was not registered",
                     ac_kretprobes[i]->kp.symbol_name, delta,
                     delta == 1 ? "" : "s", ac_kretprobes[i]->maxactive);
         }
@@ -3188,8 +3208,13 @@ static int __init ac_init(void)
     ret = misc_register(&ac_misc);
     if (ret) {
         pr_err("misc_register failed: %d\n", ret);
+        /* Disable (not just cancel) the self-requeueing poller first: it
+         * reads ac_kretprobes[]/ac_kretp_ok[] below, and a concurrent
+         * requeue after cancel_delayed_work_sync() returns would outlive
+         * the flush/destroy. disable_*_sync() drains an in-flight
+         * iteration and makes any further queue attempt a no-op. */
+        disable_delayed_work_sync(&ac_missed_check_work);
         ac_unregister_kprobes();
-        cancel_delayed_work_sync(&ac_missed_check_work);
         /* A clone/exec could in principle have fired between
          * ac_register_kprobes() and here and queued deferred registry
          * work; drain it before tearing the workqueue down (see the same
@@ -3211,11 +3236,10 @@ static int __init ac_init(void)
 static void __exit ac_exit(void)
 {
     misc_deregister(&ac_misc);
+    /* Same ordering as the init-failure path above: the poller dereferences
+     * the kretprobes, so disable and drain it before unregistering them. */
+    disable_delayed_work_sync(&ac_missed_check_work);
     ac_unregister_kprobes();
-    /* Stops the self-requeueing chain before the workqueue it runs on goes
-     * away; _sync so a worker iteration already in flight finishes first
-     * rather than racing the flush/destroy below. */
-    cancel_delayed_work_sync(&ac_missed_check_work);
     /* ac_unregister_kprobes() stops new deferred add/rekey work from being
      * queued, but doesn't wait for work already in flight (queued by a
      * clone/exec that fired moments before unload) to finish running --
