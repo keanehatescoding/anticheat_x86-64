@@ -2302,6 +2302,71 @@ static struct kretprobe *ac_kretprobes[] = {
 static bool ac_kretp_ok[ARRAY_SIZE(ac_kretprobes)];
 static unsigned int ac_kretprobes_registered;
 
+/* kretprobe maxactive overflow tracking (#7): a kretprobe has a fixed
+ * pool of `maxactive` kretprobe_instance slots (128 for kernel_clone, 64
+ * for each execve/execveat variant above). Under heavy fork/exec load --
+ * a fork bomb, or just many threads execve()'ing at once -- that pool can
+ * run out; the kernel's response is to silently count the miss in
+ * kretprobe.nmissed and skip calling our handler entirely, with no
+ * fallback and nothing in this module's own code path to notice. A missed
+ * kernel_clone return means a forked child never gets ac_schedule_prot_add()
+ * called for it, so it's permanently unregistered and unprotected --
+ * exactly the same as if it had bypassed monitoring outright, except this
+ * looks identical to "process was never protected in the first place"
+ * from the daemon's side unless it's told otherwise.
+ *
+ * There's no notification hook for this in the kretprobe API -- nmissed is
+ * just a counter the caller has to poll -- so ac_missed_check_worker()
+ * below polls it periodically on ac_wq and emits AC_EV_FORK_DROPPED the
+ * moment any registered probe's count moves, so the daemon can flag
+ * incomplete coverage instead of silently assuming completeness.
+ *
+ * struct kretprobe.nmissed is an int bumped with a plain rp->nmissed++ on
+ * the probe's miss path, so the poller loads it with READ_ONCE() (an
+ * aligned-int load never tears; the accessor just stops the compiler from
+ * merging/repeating it) and keeps its baseline at the same int width. The
+ * delta is computed in the unsigned domain so a 32-bit wrap of a small
+ * forward step still yields a small delta; a backwards step means the
+ * counter was reset (re-registration zeroes nmissed), so the worker
+ * rebaselines silently instead of emitting a ~4-billion false delta. */
+static int ac_kretp_last_nmissed[ARRAY_SIZE(ac_kretprobes)];
+static struct delayed_work ac_missed_check_work;
+#define AC_MISSED_CHECK_INTERVAL_MS 5000
+
+static void ac_missed_check_worker(struct work_struct *w)
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(ac_kretprobes); i++) {
+        int missed, last;
+        unsigned int delta;
+
+        /* Plain stores in ac_register/unregister_kprobes() only run while
+         * this worker is queued-but-never-running (init) or after it is
+         * disabled and drained (teardown), so no concurrent access here. */
+        if (!ac_kretp_ok[i])
+            continue;
+        missed = READ_ONCE(ac_kretprobes[i]->nmissed);
+        last = ac_kretp_last_nmissed[i]; /* only this worker writes it */
+        if (missed == last)
+            continue;
+        delta = (unsigned int)missed - (unsigned int)last;
+        ac_kretp_last_nmissed[i] = missed;
+        /* < 2^31 forward misses per 5s poll is the only physically
+         * plausible step; a negative signed delta is a counter reset. */
+        if ((int)delta < 0)
+            continue;
+        if (delta) {
+            ac_emit(AC_EV_FORK_DROPPED, -1, "?",
+                    "kretprobe %s missed %u invocation%s (maxactive=%d exhausted) -- affected fork/exec was not registered",
+                    ac_kretprobes[i]->kp.symbol_name, delta,
+                    delta == 1 ? "" : "s", ac_kretprobes[i]->maxactive);
+        }
+    }
+    queue_delayed_work(ac_wq, &ac_missed_check_work,
+                        msecs_to_jiffies(AC_MISSED_CHECK_INTERVAL_MS));
+}
+
 static struct kprobe ac_kp_ptrace = {
     .symbol_name = "__x64_sys_ptrace",
     .pre_handler = ac_ptrace_pre,
@@ -3136,9 +3201,19 @@ static int __init ac_init(void)
 
     ac_register_kprobes();
 
+    INIT_DELAYED_WORK(&ac_missed_check_work, ac_missed_check_worker);
+    queue_delayed_work(ac_wq, &ac_missed_check_work,
+                        msecs_to_jiffies(AC_MISSED_CHECK_INTERVAL_MS));
+
     ret = misc_register(&ac_misc);
     if (ret) {
         pr_err("misc_register failed: %d\n", ret);
+        /* Disable (not just cancel) the self-requeueing poller first: it
+         * reads ac_kretprobes[]/ac_kretp_ok[] below, and a concurrent
+         * requeue after cancel_delayed_work_sync() returns would outlive
+         * the flush/destroy. disable_*_sync() drains an in-flight
+         * iteration and makes any further queue attempt a no-op. */
+        disable_delayed_work_sync(&ac_missed_check_work);
         ac_unregister_kprobes();
         /* A clone/exec could in principle have fired between
          * ac_register_kprobes() and here and queued deferred registry
@@ -3161,6 +3236,9 @@ static int __init ac_init(void)
 static void __exit ac_exit(void)
 {
     misc_deregister(&ac_misc);
+    /* Same ordering as the init-failure path above: the poller dereferences
+     * the kretprobes, so disable and drain it before unregistering them. */
+    disable_delayed_work_sync(&ac_missed_check_work);
     ac_unregister_kprobes();
     /* ac_unregister_kprobes() stops new deferred add/rekey work from being
      * queued, but doesn't wait for work already in flight (queued by a

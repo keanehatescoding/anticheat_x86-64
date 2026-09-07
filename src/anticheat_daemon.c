@@ -169,6 +169,7 @@ static const char *ev_type_str(unsigned int t)
     case AC_EV_RWX:         return "RWX";
     case AC_EV_ANON_EXEC:   return "ANON-EXEC";
     case AC_EV_INFO:        return "INFO";
+    case AC_EV_FORK_DROPPED:return "FORK-DROPPED";
     default:                return "UNKNOWN";
     }
 }
@@ -3953,7 +3954,8 @@ static int cmd_start(int argc, char **argv)
                         logmsg(LOG_ALERT, "%s pid=%d comm=%s %s",
                                ev_type_str(e->type), e->pid, e->comm, e->data);
                     else if (e->type == AC_EV_SYSCALL_HOOK ||
-                             e->type == AC_EV_SYSCALL_REDIRECT)
+                             e->type == AC_EV_SYSCALL_REDIRECT ||
+                             e->type == AC_EV_FORK_DROPPED)
                         logmsg(LOG_CRIT, "%s %s", ev_type_str(e->type), e->data);
                     else
                         logmsg(LOG_INFO, "%s pid=%d comm=%s %s",
