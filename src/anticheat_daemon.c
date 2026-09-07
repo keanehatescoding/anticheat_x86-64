@@ -169,6 +169,7 @@ static const char *ev_type_str(unsigned int t)
     case AC_EV_RWX:         return "RWX";
     case AC_EV_ANON_EXEC:   return "ANON-EXEC";
     case AC_EV_INFO:        return "INFO";
+    case AC_EV_FORK_DROPPED:return "FORK-DROPPED";
     default:                return "UNKNOWN";
     }
 }
@@ -1632,14 +1633,20 @@ static int cmd_syscalls(void)
     } else {
         printf("  boot baseline    : unavailable (syscall table not located at load)\n");
     }
-    if (c.ok && c.redirected == 0 && !c.checksum_mismatch)
+    /* Branch on the individual counters, not c.ok: ok is false whenever
+     * any of hooked/redirected/checksum_mismatch is set (see
+     * ac_entry_bad()'s caller), so testing !c.ok here can't distinguish
+     * which one(s) actually fired and would print the generic "hooks
+     * present" message even for a redirect- or checksum-only
+     * compromise. Same rationale as check_syscalls_periodic() above. */
+    if (!c.hooked && c.redirected == 0 && !c.checksum_mismatch)
         printf("  result           : OK — no hooks detected\n");
     else {
-        if (!c.ok)
+        if (c.hooked)
             printf("  result           : COMPROMISED — syscall hooks present!\n");
         if (c.redirected)
             printf("  result           : COMPROMISED — in-text syscall redirect(s) present!\n");
-        if (c.checksum_mismatch && c.ok && c.redirected == 0)
+        if (c.checksum_mismatch && !c.hooked && c.redirected == 0)
             printf("  result           : COMPROMISED — syscall checksum mismatch"
                    " (handler churn not caught by per-slot checks)!\n");
         return 2;
@@ -3957,7 +3964,8 @@ static int cmd_start(int argc, char **argv)
                         logmsg(LOG_ALERT, "%s pid=%d comm=%s %s",
                                ev_type_str(e->type), e->pid, e->comm, e->data);
                     else if (e->type == AC_EV_SYSCALL_HOOK ||
-                             e->type == AC_EV_SYSCALL_REDIRECT)
+                             e->type == AC_EV_SYSCALL_REDIRECT ||
+                             e->type == AC_EV_FORK_DROPPED)
                         logmsg(LOG_CRIT, "%s %s", ev_type_str(e->type), e->data);
                     else
                         logmsg(LOG_INFO, "%s pid=%d comm=%s %s",
