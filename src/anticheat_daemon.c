@@ -563,11 +563,25 @@ static int hash_proc_mem(int mem_fd, uint64_t start, uint64_t size,
     return 0;
 }
 
-/* This daemon runs as root; plain getenv() would trust AC_* vars inherited
- * from a privilege-elevating invocation (e.g. sudo/sudo -E) where the
- * caller's environment shouldn't be. secure_getenv() returns NULL in that
- * context (AT_SECURE, or real/effective uid or gid mismatch), so every
- * AC_* var read below goes through this instead of getenv() directly. */
+/* All AC_* overrides go through here instead of getenv() directly.
+ * secure_getenv() returns NULL when the process started across a real
+ * credential transition (setuid/setgid exec, file capabilities, or an
+ * LSM-forced transition -- i.e. AT_SECURE is set), so a privileged
+ * daemon never trusts environment inherited from a less-privileged
+ * caller across such a boundary. This binary is installed mode 0755
+ * with no setuid bit or file capabilities, so that boundary does not
+ * exist today; the wrapper is defense-in-depth for a future install
+ * mode, at zero cost while it is a no-op.
+ * Deliberately NOT filtered: variables passed via sudo/sudo -E. sudo
+ * elevates before execve(), so the daemon starts with ruid == euid ==
+ * 0 and AT_SECURE unset, where secure_getenv() == getenv(). That is
+ * intended, not a gap: anyone able to invoke the daemon through sudo
+ * is already the trusted operator (see THREAT_MODEL.md) with strictly
+ * stronger attacks available (SIGKILL the daemon, unload an unlocked
+ * module), and legitimate flows depend on sudo-passed overrides
+ * (Makefile install-deck's sudo AC_BASELINE_DIR=... start, test.sh's
+ * AC_*_INTERVAL overrides). */
+
 static const char *ac_getenv(const char *name)
 {
     return secure_getenv(name);
