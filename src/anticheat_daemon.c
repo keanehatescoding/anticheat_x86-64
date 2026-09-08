@@ -169,6 +169,7 @@ static const char *ev_type_str(unsigned int t)
     case AC_EV_RWX:         return "RWX";
     case AC_EV_ANON_EXEC:   return "ANON-EXEC";
     case AC_EV_INFO:        return "INFO";
+    case AC_EV_FORK_DROPPED:return "FORK-DROPPED";
     default:                return "UNKNOWN";
     }
 }
@@ -562,9 +563,33 @@ static int hash_proc_mem(int mem_fd, uint64_t start, uint64_t size,
     return 0;
 }
 
+/* All AC_* overrides go through here instead of getenv() directly.
+ * secure_getenv() returns NULL when the process started across a real
+ * credential transition (setuid/setgid exec, file capabilities, or an
+ * LSM-forced transition -- i.e. AT_SECURE is set), so a privileged
+ * daemon never trusts environment inherited from a less-privileged
+ * caller across such a boundary. This binary is installed mode 0755
+ * with no setuid bit or file capabilities, so that boundary does not
+ * exist today; the wrapper is defense-in-depth for a future install
+ * mode, at zero cost while it is a no-op.
+ * Deliberately NOT filtered: variables passed via sudo/sudo -E. sudo
+ * elevates before execve(), so the daemon starts with ruid == euid ==
+ * 0 and AT_SECURE unset, where secure_getenv() == getenv(). That is
+ * intended, not a gap: anyone able to invoke the daemon through sudo
+ * is already the trusted operator (see THREAT_MODEL.md) with strictly
+ * stronger attacks available (SIGKILL the daemon, unload an unlocked
+ * module), and legitimate flows depend on sudo-passed overrides
+ * (Makefile install-deck's sudo AC_BASELINE_DIR=... start, test.sh's
+ * AC_*_INTERVAL overrides). */
+
+static const char *ac_getenv(const char *name)
+{
+    return secure_getenv(name);
+}
+
 static const char *ac_baseline_dir(void)
 {
-    const char *e = getenv("AC_BASELINE_DIR");
+    const char *e = ac_getenv("AC_BASELINE_DIR");
 
     return (e && *e) ? e : AC_BASELINE_DIR;
 }
@@ -578,7 +603,7 @@ static const char *ac_baseline_dir(void)
  * case instead of silently misbehaving on operator typos. */
 static int ac_env_interval(const char *envname, int default_secs)
 {
-    const char *e = getenv(envname);
+    const char *e = ac_getenv(envname);
     char *end;
     long v;
 
@@ -1637,14 +1662,20 @@ static int cmd_syscalls(void)
     } else {
         printf("  boot baseline    : unavailable (syscall table not located at load)\n");
     }
-    if (c.ok && c.redirected == 0 && !c.checksum_mismatch)
+    /* Branch on the individual counters, not c.ok: ok is false whenever
+     * any of hooked/redirected/checksum_mismatch is set (see
+     * ac_entry_bad()'s caller), so testing !c.ok here can't distinguish
+     * which one(s) actually fired and would print the generic "hooks
+     * present" message even for a redirect- or checksum-only
+     * compromise. Same rationale as check_syscalls_periodic() above. */
+    if (!c.hooked && c.redirected == 0 && !c.checksum_mismatch)
         printf("  result           : OK — no hooks detected\n");
     else {
-        if (!c.ok)
+        if (c.hooked)
             printf("  result           : COMPROMISED — syscall hooks present!\n");
         if (c.redirected)
             printf("  result           : COMPROMISED — in-text syscall redirect(s) present!\n");
-        if (c.checksum_mismatch && c.ok && c.redirected == 0)
+        if (c.checksum_mismatch && !c.hooked && c.redirected == 0)
             printf("  result           : COMPROMISED — syscall checksum mismatch"
                    " (handler churn not caught by per-slot checks)!\n");
         return 2;
@@ -3551,8 +3582,8 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
 
 static void ac_report(const char *event_type, const char *detail)
 {
-    const char *url = getenv("AC_REPORT_URL");
-    const char *key = getenv("AC_REPORT_KEY");
+    const char *url = ac_getenv("AC_REPORT_URL");
+    const char *key = ac_getenv("AC_REPORT_KEY");
     char client_id[128], client_id_esc[256], et_esc[64], detail_esc[600];
     char body[1024], req[2048], resp[64];
     struct ac_report_dest dest;
@@ -3846,10 +3877,67 @@ static int cmd_start(int argc, char **argv)
             fprintf(stderr, "daemon: chdir failed: %s\n", strerror(errno));
         if (!freopen("/dev/null", "r", stdin))
             fprintf(stderr, "daemon: stdin redirect failed\n");
-        if (!freopen("/var/log/anticheat.log", "a", stdout))
-            fprintf(stderr, "daemon: stdout redirect failed\n");
-        if (!freopen("/var/log/anticheat.log", "a", stderr))
-            fprintf(stderr, "daemon: stderr redirect failed\n");
+        /* freopen() on a fixed path follows symlinks with no ownership
+         * check: if /var/log/anticheat.log is ever replaced with a symlink
+         * (anything able to write /var/log before this runs, or a TOCTOU
+         * on loose directory perms), this root daemon would happily append
+         * its log content to an arbitrary target file. Open it ourselves
+         * with O_NOFOLLOW (rejects a symlink outright, ELOOP) and verify
+         * the containing directory (/var/log) is a root-owned directory
+         * without group/world write bits plus the resulting file is a
+         * root-owned regular file with link count 1 and not
+         * group/world-writable -- the nlink check rejects a hard link to
+         * another root-owned file, which O_NOFOLLOW does not stop -- before
+         * handing the fd to stdout/stderr via dup2(), which repoints the
+         * existing stdout/stderr FILE* streams without needing a second
+         * freopen(), so fprintf() etc. keep working unchanged for the rest
+         * of the process. A single open() (not one per stream) also halves
+         * the TOCTOU window versus the original two separate freopen()
+         * calls. Never close logfd when it is 0/1/2: if stdout/stderr was
+         * inherited closed, open() can return 1 or 2, and close() would
+         * then close the just-redirected stream. */
+        {
+            int logfd = open("/var/log/anticheat.log",
+                              O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW,
+                              0640);
+            struct stat lst, dst;
+
+            if (logfd < 0) {
+                fprintf(stderr, "daemon: log open failed: %s\n",
+                        strerror(errno));
+            } else if (fstat(logfd, &lst) < 0) {
+                fprintf(stderr, "daemon: log fstat failed: %s\n",
+                        strerror(errno));
+                if (logfd > STDERR_FILENO)
+                    close(logfd);
+            } else if (stat("/var/log", &dst) < 0 || !S_ISDIR(dst.st_mode) ||
+                       dst.st_uid != 0 ||
+                       (dst.st_mode & (S_IWGRP | S_IWOTH))) {
+                fprintf(stderr, "daemon: refusing to log to "
+                        "/var/log/anticheat.log: /var/log is not a root-owned "
+                        "directory with group/world write bits clear\n");
+                if (logfd > STDERR_FILENO)
+                    close(logfd);
+            } else if (!S_ISREG(lst.st_mode) || lst.st_uid != 0 ||
+                       lst.st_nlink != 1 ||
+                       (lst.st_mode & (S_IWGRP | S_IWOTH))) {
+                fprintf(stderr, "daemon: refusing to log to "
+                        "/var/log/anticheat.log: not a root-owned regular "
+                        "file with link count 1 and group/world write bits "
+                        "clear\n");
+                if (logfd > STDERR_FILENO)
+                    close(logfd);
+            } else {
+                if (dup2(logfd, STDOUT_FILENO) < 0)
+                    fprintf(stderr, "daemon: stdout redirect failed: %s\n",
+                            strerror(errno));
+                if (dup2(logfd, STDERR_FILENO) < 0)
+                    fprintf(stderr, "daemon: stderr redirect failed: %s\n",
+                            strerror(errno));
+                if (logfd > STDERR_FILENO)
+                    close(logfd);
+            }
+        }
         /* Prevent non-root ptrace of the daemon via /proc/self/mem or
          * PTRACE_ATTACH when running backgrounded: the daemon is already
          * self-protected via AC_IOCTL_ADD_PROC (ptrace kprobe), but making
@@ -3884,6 +3972,13 @@ static int cmd_start(int argc, char **argv)
         sigaction(SIGINT, &sa, NULL);
     }
     signal(SIGHUP, SIG_IGN);
+    /* Without this, a report endpoint that accepts a connection and closes
+     * it mid-write (hostile or just misbehaving) sends SIGPIPE, whose
+     * default action terminates the process -- trivial remote DoS of the
+     * whole monitoring daemon via ac_report()'s socket write(). write()
+     * still reports EPIPE on the next call either way, which is already
+     * handled below as an ordinary send failure. */
+    signal(SIGPIPE, SIG_IGN);
 
     logmsg(LOG_INFO, "anticheat daemon started (foreground=%d)", foreground);
     {
@@ -3962,7 +4057,8 @@ static int cmd_start(int argc, char **argv)
                         logmsg(LOG_ALERT, "%s pid=%d comm=%s %s",
                                ev_type_str(e->type), e->pid, e->comm, e->data);
                     else if (e->type == AC_EV_SYSCALL_HOOK ||
-                             e->type == AC_EV_SYSCALL_REDIRECT)
+                             e->type == AC_EV_SYSCALL_REDIRECT ||
+                             e->type == AC_EV_FORK_DROPPED)
                         logmsg(LOG_CRIT, "%s %s", ev_type_str(e->type), e->data);
                     else
                         logmsg(LOG_INFO, "%s pid=%d comm=%s %s",
