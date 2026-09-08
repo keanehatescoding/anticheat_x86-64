@@ -3505,6 +3505,21 @@ struct ac_report_dest {
     char sock_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 };
 
+/* Header-safety gate for #24: dest.host and AC_REPORT_KEY are interpolated
+ * verbatim into "Host:" / "Authorization:" header lines (see the snprintf()
+ * in ac_report() below). A length-overflow guard already exists there, but
+ * nothing rejects embedded CR/LF -- "evil\r\nInjected: x" would split the
+ * request and inject attacker-controlled headers. secure_getenv() (#46)
+ * shrinks who can smuggle such a value in, but header-safe input is still
+ * validated independently as defense in depth. Returns 1 when s holds no
+ * '\r' or '\n', 0 otherwise (NULL counts as unsafe). */
+static int ac_header_value_safe(const char *s)
+{
+    if (!s)
+        return 0;
+    return strchr(s, '\r') == NULL && strchr(s, '\n') == NULL;
+}
+
 /* Parses AC_REPORT_URL into *out. Returns 0 on success; returns -1 on a
  * malformed URL, having already logged what's wrong to stderr. Kept
  * separate from ac_report() itself so the parsing logic is unit-testable
@@ -3601,6 +3616,18 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
         }
     }
 
+    /* #24: host is interpolated verbatim into the "Host:" header line, so
+     * an embedded CR/LF would split the request and inject headers. Port
+     * needs no such check -- the strtoul() validation below already
+     * rejects anything non-numeric. */
+    if (memchr(host_start, '\r', host_len) != NULL ||
+        memchr(host_start, '\n', host_len) != NULL) {
+        fprintf(stderr,
+                "ac_report: AC_REPORT_URL host contains CR/LF: %s\n",
+                orig_url);
+        return -1;
+    }
+
     {
         const char *port_end = strchr(port_str, '/');
         size_t port_len = port_end ? (size_t)(port_end - port_str) : strlen(port_str);
@@ -3667,6 +3694,19 @@ static void ac_report(const char *event_type, const char *detail)
 
     if (ac_report_parse_url(url, &dest) != 0)
         return;   /* ac_report_parse_url() already logged what's wrong */
+
+    /* #24 defense in depth: both values are interpolated verbatim into
+     * HTTP header lines below ("Host:" / "Authorization: Bearer"), so an
+     * embedded CR/LF would split the request and inject attacker headers.
+     * The host is already CRLF-screened by ac_report_parse_url(), but the
+     * key never passes through the parser -- and re-checking the host here
+     * keeps this call site safe even if the parser ever changes. Fail
+     * closed: log and send nothing. */
+    if (!ac_header_value_safe(dest.host) || !ac_header_value_safe(key)) {
+        fprintf(stderr, "ac_report: AC_REPORT_URL host or AC_REPORT_KEY "
+                "contains CR/LF, refusing to send\n");
+        return;
+    }
 
     ac_report_client_id(client_id, sizeof(client_id));
     /* Defense in depth for #96: even though ac_report_client_id()

@@ -83,6 +83,26 @@ int main(void)
 
     CHECK(ac_report_parse_url("unix://", &dest) == -1,
           "unix:// with an empty path is rejected");
+    /* #24: a host interpolated verbatim into "Host:" must not carry CR/LF */
+    CHECK(ac_report_parse_url("evil\r\nInjected: x:8787", &dest) == -1,
+          "a host containing CRLF is rejected");
+    CHECK(ac_report_parse_url("evil\nhost:8787", &dest) == -1,
+          "a host containing LF is rejected");
+    CHECK(ac_report_parse_url("[::1\r\nx]:8787", &dest) == -1,
+          "a bracketed IPv6 host containing CRLF is rejected");
+
+    /* the header-safety helper itself: AC_REPORT_KEY never passes through
+     * the URL parser, so ac_report() screens it separately before
+     * formatting "Authorization: Bearer %s" */
+    CHECK(ac_header_value_safe("normal-key-123") == 1,
+          "a plain header value is accepted");
+    CHECK(ac_header_value_safe("a\rb") == 0,
+          "a header value containing CR is rejected");
+    CHECK(ac_header_value_safe("a\nb") == 0,
+          "a header value containing LF is rejected");
+    CHECK(ac_header_value_safe("a\r\nb") == 0,
+          "a header value containing CRLF is rejected");
+
 
     {
         /* sizeof(dest.sock_path) mirrors sizeof(sun_path) -- build a
