@@ -1008,6 +1008,14 @@ static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_o
             if (shdrs[i].sh_name >= shstr->sh_size)
                 continue;
             name = shstrtab + shdrs[i].sh_name;
+            /* shstrtab is exactly sh_size bytes from pread(): the
+             * start-offset check above does not guarantee a NUL before
+             * the buffer's end, so an unterminated entry would make the
+             * strcmp() below over-read the heap as root. Require the
+             * terminator inside the buffer first; a crafted table is a
+             * skip, never a read past the allocation. */
+            if (!memchr(name, '\0', (size_t)(shstr->sh_size - shdrs[i].sh_name)))
+                continue;
             if (shdrs[i].sh_type == SHT_DYNSYM && strcmp(name, ".dynsym") == 0)
                 dynsym = &shdrs[i];
             else if (shdrs[i].sh_type == SHT_STRTAB && strcmp(name, ".dynstr") == 0)
@@ -1036,6 +1044,13 @@ static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_o
     for (i = 0; i < nsyms; i++) {
         if (syms[i].st_name == 0 || syms[i].st_name >= dynstr->sh_size ||
             syms[i].st_value == 0)
+            continue;
+        /* Same bound as the shstrtab loop above: dynstrtab is exactly
+         * sh_size bytes, so require a NUL within the buffer before the
+         * strcmp(). An attacker-influenced library without one is a
+         * skip, not a heap over-read as root. */
+        if (!memchr(dynstrtab + syms[i].st_name, '\0',
+                    (size_t)(dynstr->sh_size - syms[i].st_name)))
             continue;
         if (strcmp(dynstrtab + syms[i].st_name, symbol) == 0) {
             *offset_out = syms[i].st_value;
@@ -1110,9 +1125,31 @@ static int compare_render_symbol(int pid, const char *libpath,
      * no setns() or any persistent namespace switch needed. */
     snprintf(nspath, sizeof(nspath), "/proc/%d/root%s", pid, libpath);
 
-    fd = open(nspath, O_RDONLY | O_NOFOLLOW);
+    /* nspath resolves through /proc/<pid>/root/, i.e. attacker-influenced
+     * content (see above): a FIFO with no writer would hang a plain
+     * O_RDONLY open() forever, stalling the whole periodic scan. Same
+     * pattern as the manifest scan -- open O_NONBLOCK so FIFOs return
+     * immediately, reject anything that isn't a regular file, then clear
+     * O_NONBLOCK so the subsequent pread() has plain blocking semantics.
+     * O_NOFOLLOW (already here) stays: unlike the loader manifests, a
+     * symlinked library reference is not something to follow into. */
+    fd = open(nspath, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0)
         return -1;
+    {
+        struct stat st;
+
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            close(fd);
+            return -1;
+        }
+        {
+            int fl = fcntl(fd, F_GETFL);
+
+            if (fl >= 0)
+                (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+        }
+    }
     if (elf_find_symbol_offset(fd, symbol, &offset, &size) != 0) {
         close(fd);
         return -1;
