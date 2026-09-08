@@ -40,6 +40,10 @@ on:
 
 permissions:
   contents: read
+  # build-daemon/build-module/build-flatpak/build-appimage all end in
+  # actions/upload-artifact, which needs actions:write to finalize
+  # (bytes upload fine, then FinalizeArtifact 403s without it).
+  actions: write
 
 jobs:
   # Reuses build-deb/build-arch/build-rpm as-is (see the header
@@ -159,6 +163,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Job-level permissions replace the top-level block wholesale, so
+      # the top-level actions:write above does not reach this job:
+      # re-grant the minimum the download-artifact step needs.
+      actions: read
     steps:
       - uses: actions/checkout@v7
         with:

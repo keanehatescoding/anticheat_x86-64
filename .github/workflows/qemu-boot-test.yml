@@ -24,6 +24,9 @@ on:
 
 permissions:
   contents: read
+  # Same as build-matrix.yml: the serial-log upload-artifact step needs
+  # actions:write or FinalizeArtifact 403s after the bytes land.
+  actions: write
 
 jobs:
   # Same job as build-matrix.yml's own load-kernel-matrix - reads

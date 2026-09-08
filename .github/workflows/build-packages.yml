@@ -25,11 +25,15 @@ on:
   workflow_call:
 
 # None of these jobs push, comment, or otherwise write anything back to
-# the repository - read-only is enough, and persist-credentials: false
-# below on every checkout means there's no token to abuse even if a
-# build step somehow got compromised.
+# the repository, but every packaging job ends in actions/upload-artifact
+# (v4+), which finalizes through the Actions API with the job token and
+# 403s on FinalizeArtifact without actions:write - so read-only is *not*
+# enough despite persist-credentials:false below on every checkout (which
+# still means there's no repo token to abuse even if a build step somehow
+# got compromised).
 permissions:
   contents: read
+  actions: write
 
 jobs:
   build-deb:
