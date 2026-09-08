@@ -895,11 +895,9 @@ static int do_ioctl(unsigned long req, void *arg)
         if (getenv("AC_MOCK_HOOKED")) {
             c->non_text = 1;
             c->hooked = 1;
-            c->ok = 0;
         } else {
             c->non_text = 0;
             c->hooked = 0;
-            c->ok = 1;
         }
         c->redirected = mock_redirect ? 1 : 0;
 
@@ -909,14 +907,19 @@ static int do_ioctl(unsigned long req, void *arg)
          * here), with the live checksum diverging whenever either kind of
          * tampering -- out-of-text hook or in-text redirect -- is
          * simulated. AC_MOCK_CHECKSUM_ONLY simulates handler churn the
-         * per-slot walk doesn't individually flag (out->ok stays 1 and
-         * out->redirected stays 0): a slot going non-zero -> 0 flips the
-         * whole-table checksum without tripping either per-slot counter. */
+         * per-slot walk doesn't individually flag (out->redirected stays
+         * 0): a slot going non-zero -> 0 flips the whole-table checksum
+         * without tripping either per-slot counter. */
         c->baseline_ready = 1;
         mock_fill_digest(c->baseline_sha256, '1');
         mock_fill_digest(c->current_sha256,
                           (c->hooked || c->redirected || mock_checksum_only) ? '2' : '1');
         c->checksum_mismatch = (c->hooked || c->redirected || mock_checksum_only) ? 1 : 0;
+
+        /* Mirrors ac_check_syscalls(): ok is clear whenever any of the
+         * three signals fires, not just hooked. */
+        c->ok = (c->hooked == 0 && c->redirected == 0 &&
+                 !c->checksum_mismatch);
 
         /* Mirrors the real module's rising-edge gating (see #52): only
          * push a ring event on the clean->hooked/redirected transition,
