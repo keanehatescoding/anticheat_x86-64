@@ -56,6 +56,9 @@ jobs:
       - name: Store per-client report retention unit test (no root, no network)
         run: python3 server/test_store_retention_unit.py
 
+      - name: Server auth-dispatch + trusted-proxy unit test (no root, no network)
+        run: python3 server/test_auth_dispatch_unit.py
+
       # A rebase, auto-fix commit, or artifact re-download can silently
       # drop a script's mode from 100755 to 100644 (this happened to
       # scripts/kasan_boot_test.sh once, and only surfaced when the

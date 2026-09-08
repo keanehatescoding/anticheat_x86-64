@@ -28,6 +28,8 @@ TERM_SERVER_PID=""
 TERM_KILLER_PID=""
 TP_SERVER_PID=""
 NOTP_SERVER_PID=""
+UTP_SERVER_PID=""
+WARNTP_SERVER_PID=""
 ROT_SERVER_PID=""
 UNIX_SERVER_PID=""
 # cleanup is invoked via trap below; shellcheck cannot always see that
@@ -43,6 +45,8 @@ cleanup() {
     [ -n "$TERM_KILLER_PID" ] && kill "$TERM_KILLER_PID" 2>/dev/null
     [ -n "$TP_SERVER_PID" ] && kill "$TP_SERVER_PID" 2>/dev/null
     [ -n "$NOTP_SERVER_PID" ] && kill "$NOTP_SERVER_PID" 2>/dev/null
+    [ -n "$UTP_SERVER_PID" ] && kill "$UTP_SERVER_PID" 2>/dev/null
+    [ -n "$WARNTP_SERVER_PID" ] && kill "$WARNTP_SERVER_PID" 2>/dev/null
     [ -n "$ROT_SERVER_PID" ] && kill "$ROT_SERVER_PID" 2>/dev/null
     [ -n "$UNIX_SERVER_PID" ] && kill "$UNIX_SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
@@ -52,6 +56,8 @@ cleanup() {
     wait "$TERM_KILLER_PID" 2>/dev/null
     wait "$TP_SERVER_PID" 2>/dev/null
     wait "$NOTP_SERVER_PID" 2>/dev/null
+    wait "$UTP_SERVER_PID" 2>/dev/null
+    wait "$WARNTP_SERVER_PID" 2>/dev/null
     wait "$ROT_SERVER_PID" 2>/dev/null
     wait "$UNIX_SERVER_PID" 2>/dev/null
     rm -rf "$TESTDIR"
@@ -256,6 +262,16 @@ else
     fail "admin key on /report should be 401 (got $CODE)"
 fi
 
+# 3b. report with no Authorization header at all -> 401
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
+    -H 'Content-Type: application/json' \
+    -d "{\"client_id\":\"$CID\",\"event_type\":\"CRITICAL\",\"detail\":\"x\",\"ts\":1}")
+if [ "$CODE" = "401" ]; then
+    pass "POST /report with no key -> 401"
+else
+    fail "POST /report with no key should be 401 (got $CODE)"
+fi
+
 # 4. invalid client_id -> 400
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
     -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
@@ -358,6 +374,30 @@ if [ "$CODE" = "401" ]; then
 else
     fail "report key on /banned should be 401 (got $CODE)"
 fi
+
+# 12b. every remaining route with no Authorization header at all -> 401.
+# The per-endpoint checks above prove the tiers stay separate; this sweep
+# proves the dispatcher itself denies unauthenticated requests on each
+# route (#13) -- a future endpoint that forgot its decorator would 401
+# here (and fail test_auth_dispatch_unit.py) instead of serving open.
+for _path in "/banned/$CID" "/reports/$CID"; do
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE$_path")
+    if [ "$CODE" = "401" ]; then
+        pass "GET $_path with no key -> 401"
+    else
+        fail "GET $_path with no key should be 401 (got $CODE)"
+    fi
+done
+for _path in /ban /unban; do
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE$_path" \
+        -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$CID\",\"reason\":\"x\"}")
+    if [ "$CODE" = "401" ]; then
+        pass "POST $_path with no key -> 401"
+    else
+        fail "POST $_path with no key should be 401 (got $CODE)"
+    fi
+done
 
 # 13. reports listing shows the earlier report
 OUT=$(curl -s "$BASE/reports/$CID" -H "Authorization: Bearer $ADMIN_KEY")
@@ -626,9 +666,13 @@ rm -rf "$TERM_TESTDIR"
 TP_PORT=18802
 TP_TESTDIR="$(mktemp -d /tmp/ac_server_tp_test.XXXXXXXX)"
 TP_DB="$TP_TESTDIR/ac.db"
+# The test peer is curl over localhost, so the allowlist must cover
+# 127.0.0.1 for the trusted-path assertions below to hold -- and since
+# --trust-proxy now refuses to start without one (#14), this flag is
+# required, not just illustrative.
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$TP_PORT" --db "$TP_DB" \
-    --trust-proxy \
+    --trust-proxy --trusted-proxy-cidr 127.0.0.0/8 \
     >"$TP_TESTDIR/server.log" 2>&1 &
 TP_SERVER_PID=$!
 TP_BASE="http://127.0.0.1:$TP_PORT"
@@ -710,7 +754,8 @@ TPRL_LIMIT=3
 TPRL_WINDOW=5
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$TPRL_PORT" --db "$TPRL_DB" \
-    --trust-proxy --rate-limit "$TPRL_LIMIT" --rate-window "$TPRL_WINDOW" \
+    --trust-proxy --trusted-proxy-cidr 127.0.0.0/8 \
+    --rate-limit "$TPRL_LIMIT" --rate-window "$TPRL_WINDOW" \
     >"$TPRL_TESTDIR/server.log" 2>&1 &
 TP_SERVER_PID=$!
 TPRL_BASE="http://127.0.0.1:$TPRL_PORT"
@@ -789,6 +834,91 @@ fi
 kill "$NOTP_SERVER_PID" 2>/dev/null
 wait "$NOTP_SERVER_PID" 2>/dev/null
 rm -rf "$NOTP_TESTDIR"
+
+# --trust-proxy with a CIDR that does NOT cover the TCP peer: the header
+# must be ignored and the raw peer used (#14). The test peer is curl
+# over localhost, so an allowlist of 10.0.0.0/8 leaves it untrusted --
+# the mirror image of the TP instance above, whose allowlist covers it.
+UTP_PORT=18815
+UTP_TESTDIR="$(mktemp -d /tmp/ac_server_utp_test.XXXXXXXX)"
+UTP_DB="$UTP_TESTDIR/ac.db"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --host 127.0.0.1 --port "$UTP_PORT" --db "$UTP_DB" \
+    --trust-proxy --trusted-proxy-cidr 10.0.0.0/8 \
+    >"$UTP_TESTDIR/server.log" 2>&1 &
+UTP_SERVER_PID=$!
+UTP_BASE="http://127.0.0.1:$UTP_PORT"
+UTP_CID="test-utp-$$"
+
+UTP_READY=0
+for _ in $(seq 1 50); do
+    if curl -s "$UTP_BASE/banned/x" -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        UTP_READY=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$UTP_READY" -eq 1 ]; then
+    curl -s -o /dev/null -X POST "$UTP_BASE/report" \
+        -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+        -H "X-Forwarded-For: 9.9.9.9, 10.0.0.5" \
+        -d "{\"client_id\":\"$UTP_CID\",\"event_type\":\"X\",\"detail\":\"untrusted\",\"ts\":1}"
+    UTP_OUT=$(curl -s "$UTP_BASE/reports/$UTP_CID" -H "Authorization: Bearer $ADMIN_KEY")
+    if printf '%s' "$UTP_OUT" | grep -q '"source_addr": "127.0.0.1"' \
+        && ! printf '%s' "$UTP_OUT" | grep -qE '"source_addr": "(9\.9\.9\.9|10\.0\.0\.5)"'; then
+        pass "--trust-proxy ignores X-Forwarded-For from peers outside --trusted-proxy-cidr"
+    else
+        fail "untrusted peer's X-Forwarded-For must not be honored (out: $UTP_OUT)"
+    fi
+else
+    fail "--trust-proxy untrusted-peer test server never became ready on port $UTP_PORT"
+fi
+kill "$UTP_SERVER_PID" 2>/dev/null
+wait "$UTP_SERVER_PID" 2>/dev/null
+UTP_SERVER_PID=""
+rm -rf "$UTP_TESTDIR"
+
+# --trust-proxy without any --trusted-proxy-cidr would trust the header
+# from any direct connection -- the server must refuse to start (#14),
+# not run open. Exits before binding, so no instance to clean up.
+if AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --host 127.0.0.1 --port 18817 --db "$TESTDIR/notrustcidr.db" \
+    --trust-proxy >/dev/null 2>&1; then
+    fail "server should refuse to start with --trust-proxy and no --trusted-proxy-cidr"
+else
+    pass "server refuses to start with --trust-proxy and no --trusted-proxy-cidr"
+fi
+
+# A garbage CIDR is a startup refusal, not a silently-ignored allowlist.
+if AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --host 127.0.0.1 --port 18818 --db "$TESTDIR/badcidr.db" \
+    --trust-proxy --trusted-proxy-cidr not-a-cidr >/dev/null 2>&1; then
+    fail "server should refuse to start with an invalid --trusted-proxy-cidr"
+else
+    pass "server refuses to start with an invalid --trusted-proxy-cidr"
+fi
+
+# --trusted-proxy-cidr without --trust-proxy does nothing by itself --
+# the allowlist only matters when the header is trusted -- so the server
+# says so on stderr instead of running a dead flag silently.
+WARNTP_TESTDIR="$(mktemp -d /tmp/ac_server_warntp_test.XXXXXXXX)"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --host 127.0.0.1 --port 18816 \
+    --db "$WARNTP_TESTDIR/ac_server.db" \
+    --trusted-proxy-cidr 10.0.0.0/8 \
+    >"$WARNTP_TESTDIR/server.log" 2>&1 &
+WARNTP_SERVER_PID=$!
+sleep 0.3
+if grep -q 'trusted-proxy-cidr given without' "$WARNTP_TESTDIR/server.log"; then
+    pass "--trusted-proxy-cidr without --trust-proxy warns on stderr"
+else
+    fail "expected a --trusted-proxy-cidr ineffectual-flag warning"
+fi
+kill "$WARNTP_SERVER_PID" 2>/dev/null
+wait "$WARNTP_SERVER_PID" 2>/dev/null
+WARNTP_SERVER_PID=""
+rm -rf "$WARNTP_TESTDIR"
 
 # Key rotation: a dedicated instance started with both a current and an
 # "-old" key per tier, proving both are accepted during the rotation
