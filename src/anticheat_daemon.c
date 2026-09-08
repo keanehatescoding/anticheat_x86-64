@@ -80,7 +80,11 @@
 
 #define AC_BASELINE_DIR "/var/lib/anticheat/baselines"
 #define AC_HASH_CAP      (16UL * 1024 * 1024)   /* max bytes hashed per mapping */
-#define AC_READ_CHUNK    (1024 * 1024)
+/* 64 KiB read chunk for hash_proc_mem(): the buffer is function-static (the
+ * daemon is single-threaded, same rationale as proc_names[] below), and 64
+ * KiB keeps BSS small while avoiding a 1 MiB on-stack array that is fragile
+ * under small ulimit -s / LimitSTACK= (see #20). */
+#define AC_READ_CHUNK    (64 * 1024)
 
 static int dev_fd = -1;
 static int g_verbose = 0;
@@ -519,7 +523,11 @@ static int hash_proc_mem(int mem_fd, uint64_t start, uint64_t size,
 {
     ac_sha256_ctx ctx;
     uint64_t done = 0;
-    uint8_t buf[AC_READ_CHUNK];
+    /* Static, not stack: 1 MiB (now 64 KiB) of stack per VMA hash is fragile
+     * under a reduced ulimit -s / LimitSTACK= in a root process. Safe
+     * because the daemon is single-threaded (same as proc_names[]); the
+     * fork()ed resolve/connect helpers never call this. */
+    static uint8_t buf[AC_READ_CHUNK];
 
     ac_sha256_init(&ctx);
     while (done < size) {
@@ -3065,8 +3073,16 @@ static int check_baselines_periodic(void)
                 }
             }
 
-            if (hash_proc_mem(mem_fd, vi->start, size, hex) < 0)
+            if (hash_proc_mem(mem_fd, vi->start, size, hex) < 0) {
+                /* Fail inconclusive, not silent: an unreadable segment is
+                 * exactly the signal this checker exists to produce, and a
+                 * deliberately-unreadable mapping must not vanish without a
+                 * trace (see #23). */
+                logmsg(LOG_WARNING, "pid %d (%s): could not hash %s "
+                       "-- skipping baseline check for this segment this cycle",
+                       pl.items[i].pid, pl.items[i].comm, vi->path);
                 continue;
+            }
             if (strcmp(bhex, hex) != 0)
                 logmsg(LOG_CRIT, "pid %d (%s): memory content of %s differs "
                        "from saved baseline (possible runtime patching)",
