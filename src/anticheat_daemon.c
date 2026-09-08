@@ -3862,10 +3862,67 @@ static int cmd_start(int argc, char **argv)
             fprintf(stderr, "daemon: chdir failed: %s\n", strerror(errno));
         if (!freopen("/dev/null", "r", stdin))
             fprintf(stderr, "daemon: stdin redirect failed\n");
-        if (!freopen("/var/log/anticheat.log", "a", stdout))
-            fprintf(stderr, "daemon: stdout redirect failed\n");
-        if (!freopen("/var/log/anticheat.log", "a", stderr))
-            fprintf(stderr, "daemon: stderr redirect failed\n");
+        /* freopen() on a fixed path follows symlinks with no ownership
+         * check: if /var/log/anticheat.log is ever replaced with a symlink
+         * (anything able to write /var/log before this runs, or a TOCTOU
+         * on loose directory perms), this root daemon would happily append
+         * its log content to an arbitrary target file. Open it ourselves
+         * with O_NOFOLLOW (rejects a symlink outright, ELOOP) and verify
+         * the containing directory (/var/log) is a root-owned directory
+         * without group/world write bits plus the resulting file is a
+         * root-owned regular file with link count 1 and not
+         * group/world-writable -- the nlink check rejects a hard link to
+         * another root-owned file, which O_NOFOLLOW does not stop -- before
+         * handing the fd to stdout/stderr via dup2(), which repoints the
+         * existing stdout/stderr FILE* streams without needing a second
+         * freopen(), so fprintf() etc. keep working unchanged for the rest
+         * of the process. A single open() (not one per stream) also halves
+         * the TOCTOU window versus the original two separate freopen()
+         * calls. Never close logfd when it is 0/1/2: if stdout/stderr was
+         * inherited closed, open() can return 1 or 2, and close() would
+         * then close the just-redirected stream. */
+        {
+            int logfd = open("/var/log/anticheat.log",
+                              O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW,
+                              0640);
+            struct stat lst, dst;
+
+            if (logfd < 0) {
+                fprintf(stderr, "daemon: log open failed: %s\n",
+                        strerror(errno));
+            } else if (fstat(logfd, &lst) < 0) {
+                fprintf(stderr, "daemon: log fstat failed: %s\n",
+                        strerror(errno));
+                if (logfd > STDERR_FILENO)
+                    close(logfd);
+            } else if (stat("/var/log", &dst) < 0 || !S_ISDIR(dst.st_mode) ||
+                       dst.st_uid != 0 ||
+                       (dst.st_mode & (S_IWGRP | S_IWOTH))) {
+                fprintf(stderr, "daemon: refusing to log to "
+                        "/var/log/anticheat.log: /var/log is not a root-owned "
+                        "directory with group/world write bits clear\n");
+                if (logfd > STDERR_FILENO)
+                    close(logfd);
+            } else if (!S_ISREG(lst.st_mode) || lst.st_uid != 0 ||
+                       lst.st_nlink != 1 ||
+                       (lst.st_mode & (S_IWGRP | S_IWOTH))) {
+                fprintf(stderr, "daemon: refusing to log to "
+                        "/var/log/anticheat.log: not a root-owned regular "
+                        "file with link count 1 and group/world write bits "
+                        "clear\n");
+                if (logfd > STDERR_FILENO)
+                    close(logfd);
+            } else {
+                if (dup2(logfd, STDOUT_FILENO) < 0)
+                    fprintf(stderr, "daemon: stdout redirect failed: %s\n",
+                            strerror(errno));
+                if (dup2(logfd, STDERR_FILENO) < 0)
+                    fprintf(stderr, "daemon: stderr redirect failed: %s\n",
+                            strerror(errno));
+                if (logfd > STDERR_FILENO)
+                    close(logfd);
+            }
+        }
         /* Prevent non-root ptrace of the daemon via /proc/self/mem or
          * PTRACE_ATTACH when running backgrounded: the daemon is already
          * self-protected via AC_IOCTL_ADD_PROC (ptrace kprobe), but making
