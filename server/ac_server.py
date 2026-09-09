@@ -89,8 +89,13 @@ class RateLimiter:
     DEFAULT_MAX_KEYS = 4096
 
     def __init__(self, limit, window, max_keys=DEFAULT_MAX_KEYS):
-        if max_keys < 1:
-            raise ValueError("max_keys must be positive")
+        # isinstance(True, int) is True, so bool needs its own carve-out:
+        # True == 1 would otherwise silently cap the table at one bucket.
+        # Floats are rejected outright too -- inf/nan sail past a `< 1`
+        # check and then make `len(...) >= max_keys` permanently False,
+        # reopening the unbounded growth this cap exists to close (#25).
+        if isinstance(max_keys, bool) or not isinstance(max_keys, int) or max_keys < 1:
+            raise ValueError("max_keys must be a positive integer")
         self.limit = limit
         self.window = window
         self.max_keys = max_keys

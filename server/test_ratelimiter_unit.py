@@ -134,11 +134,12 @@ check(
     rl_lim.allow("victim"),
 )
 
-try:
-    ac_server.RateLimiter(limit=1, window=1, max_keys=0)
-    check("max_keys=0 rejected", False)
-except ValueError:
-    check("max_keys=0 rejected", True)
+for bad in (0, -1, True, False, 1.5, float("inf"), float("nan"), "64", None):
+    try:
+        ac_server.RateLimiter(limit=1, window=1, max_keys=bad)
+        check(f"max_keys={bad!r} rejected", False)
+    except ValueError:
+        check(f"max_keys={bad!r} rejected", True)
 
 print()
 if FAIL:
