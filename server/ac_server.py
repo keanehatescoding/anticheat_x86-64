@@ -62,6 +62,7 @@ import time
 import traceback
 import urllib.parse
 import collections
+import functools
 
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 MAX_BODY_BYTES = 4096
@@ -313,20 +314,34 @@ class ThreadingUnixHTTPServer(BoundedThreadingMixIn, http.server.HTTPServer):
 def _requires_auth(keys):
     """Method decorator for a Handler._handle_*() method: send 401 and
     skip the wrapped handler if the request's bearer token isn't in
-    `keys`. Centralizes the `if not self._authed(...)` check that would
-    otherwise be copy-pasted at the top of each handler -- but it's still
-    opt-in per handler, not enforced by the dispatch table, so a new
-    endpoint still has to remember to apply this decorator."""
+    `keys`. The decorator marks the wrapper with `_ac_auth_keys` so the
+    dispatcher (_route_guarded) can tell an intentionally-authed handler
+    apart from a new endpoint that merely forgot this decorator -- see
+    PUBLIC_HANDLERS below."""
 
     def deco(fn):
+        @functools.wraps(fn)
         def wrapper(self, *args, **kwargs):
             if not self._authed(keys):
                 return self._send_json(401, {"error": "unauthorized"})
             return fn(self, *args, **kwargs)
 
+        wrapper._ac_auth_keys = frozenset(keys)
         return wrapper
 
     return deco
+
+
+# Handler names (the _handle_* method's __name__) explicitly allowed to
+# serve without auth, enforced deny-by-default by _route_guarded(): every
+# routed handler must either carry @_requires_auth (marked above) or be
+# named here, else the dispatcher 401s instead of serving. Empty today --
+# every endpoint needs a key tier -- so this is purely the explicit
+# allow-list a future public endpoint (health check, version probe) would
+# have to be added to deliberately, rather than becoming public by
+# forgetting a decorator. test_auth_dispatch_unit.py asserts the
+# invariant over every registered route.
+PUBLIC_HANDLERS = frozenset()
 
 
 class Store:
@@ -527,7 +542,33 @@ class Store:
             conn.close()
 
 
-def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False):
+def _parse_proxy_cidrs(values):
+    """Parse --trusted-proxy-cidr values into ipaddress networks.
+    Raises ValueError naming the first bad entry -- main() turns that
+    into a startup refusal, and the unit test asserts on it directly.
+    Strict: host bits are rejected (10.0.0.1/8 does NOT silently become
+    10.0.0.0/8 and trust 16M peers the operator never named) -- write
+    the network address itself, or a single host as /32."""
+    nets = []
+    for v in values or []:
+        try:
+            nets.append(ipaddress.ip_network(v, strict=True))
+        except ValueError:
+            raise ValueError("invalid --trusted-proxy-cidr %r: use a "
+                             "network address (e.g. 10.0.0.0/8) or a "
+                             "single host (e.g. 10.0.0.5/32), with no "
+                             "host bits set" % (v,)) from None
+    return nets
+
+
+def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False,
+                 trusted_proxy_cidrs=()):
+    # Tuple of ipaddress._BaseNetwork parsed once in main(): X-Forwarded-For
+    # is only honored for TCP peers inside one of these (see
+    # _peer_is_trusted_proxy). main() refuses --trust-proxy without at
+    # least one --trusted-proxy-cidr, so a non-empty tuple here whenever
+    # trust_proxy is True is a startup guarantee, not a per-request check.
+    trusted_proxy_nets = tuple(trusted_proxy_cidrs)
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "ac_server/1"
         # Bounds every INDIVIDUAL blocking socket read on this connection
@@ -615,8 +656,24 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             self.end_headers()
             self.wfile.write(body)
 
+        def _peer_is_trusted_proxy(self):
+            # --trust-proxy alone used to honor X-Forwarded-For from ANY
+            # direct connection, so a client reaching the server itself
+            # could forge its own rate-limit bucket and source_addr (#14).
+            # Only peers inside a configured --trusted-proxy-cidr count as
+            # the reverse proxy; everyone else falls back to the raw peer
+            # exactly as if the header were absent. An unparseable peer
+            # (including the "unix" placeholder on the unix-socket
+            # transport, where --trust-proxy is refused at startup anyway)
+            # is untrusted by definition.
+            try:
+                peer = ipaddress.ip_address(self.client_address[0])
+            except ValueError:
+                return False
+            return any(peer in net for net in trusted_proxy_nets)
+
         def _client_ip(self):
-            if not trust_proxy:
+            if not trust_proxy or not self._peer_is_trusted_proxy():
                 return self.client_address[0]
             # self.headers.get() returns only the FIRST occurrence of a
             # repeated header -- a client could send its own
@@ -726,6 +783,29 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 return None
             return body
 
+        def _route_guarded(self, handler_fn, *args):
+            # Deny-by-default dispatch (#13): auth used to be opt-in per
+            # handler via @_requires_auth, so a future endpoint that forgot
+            # the decorator would have served unauthenticated with nothing
+            # to catch the omission. Every routed handler must now either
+            # carry the decorator's `_ac_auth_keys` marker (the decorator
+            # itself still performs the actual key check) or be named in
+            # PUBLIC_HANDLERS -- anything else 401s here instead of ever
+            # running. The log line names the handler so the omission shows
+            # up in stderr during development rather than silently 401ing
+            # in production.
+            name = getattr(handler_fn, "__name__", "?")
+            if name in PUBLIC_HANDLERS:
+                return handler_fn(*args)
+            if getattr(handler_fn, "_ac_auth_keys", None) is None:
+                self.log_message(
+                    "denying unmarked handler %s (missing @_requires_auth "
+                    "and not in PUBLIC_HANDLERS)",
+                    name,
+                )
+                return self._send_json(401, {"error": "unauthorized"})
+            return handler_fn(*args)
+
         def do_POST(self):
             self._dispatch(self._do_POST)
 
@@ -737,11 +817,11 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             if not path:
                 return self._send_json(404, {"error": "not found"})
             if path == "/report":
-                return self._handle_report()
+                return self._route_guarded(self._handle_report)
             if path == "/ban":
-                return self._handle_ban()
+                return self._route_guarded(self._handle_ban)
             if path == "/unban":
-                return self._handle_unban()
+                return self._route_guarded(self._handle_unban)
             self._send_json(404, {"error": "not found"})
 
         def do_GET(self):
@@ -755,9 +835,11 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             if not path:
                 return self._send_json(404, {"error": "not found"})
             if path.startswith("/banned/"):
-                return self._handle_banned(path[len("/banned/"):])
+                return self._route_guarded(
+                    self._handle_banned, path[len("/banned/"):])
             if path.startswith("/reports/"):
-                return self._handle_reports(path[len("/reports/"):])
+                return self._route_guarded(
+                    self._handle_reports, path[len("/reports/"):])
             self._send_json(404, {"error": "not found"})
 
         @_requires_auth(report_keys)
@@ -895,12 +977,29 @@ def main():
         action="store_true",
         help="trust the last hop of the X-Forwarded-For header as the "
         "real client IP for rate limiting and report source_addr, "
-        "instead of the raw TCP peer. Only enable this if a reverse "
-        "proxy you control -- configured to APPEND to any existing "
-        "X-Forwarded-For, e.g. nginx's proxy_add_x_forwarded_for -- is "
-        "the only thing that can reach this process; otherwise a client "
-        "can set this header itself to spoof its rate-limit bucket and "
-        "the audit trail (default: off, use the raw TCP peer)",
+        "instead of the raw TCP peer -- but ONLY for TCP peers inside "
+        "a --trusted-proxy-cidr (below). Requires at least one "
+        "--trusted-proxy-cidr; without it the server refuses to start, "
+        "since trusting the header from any direct connection would let "
+        "a client spoof its rate-limit bucket and the audit trail. The "
+        "upstream proxy must be configured to APPEND to any existing "
+        "X-Forwarded-For, e.g. nginx's proxy_add_x_forwarded_for "
+        "(default: off, use the raw TCP peer)",
+    )
+    ap.add_argument(
+        "--trusted-proxy-cidr",
+        action="append",
+        default=[],
+        metavar="CIDR",
+        help="IPv4/IPv6 CIDR whose TCP peers are trusted reverse proxies "
+        "when --trust-proxy is on (repeatable; e.g. --trusted-proxy-cidr "
+        "10.0.0.5/32 for one proxy host). Name the smallest range "
+        "containing only your proxies -- every reachable peer inside "
+        "these ranges can forge X-Forwarded-For outright, so a broad "
+        "subnet shared with untrusted clients defeats the allowlist. "
+        "X-Forwarded-For from any peer outside these ranges is ignored "
+        "and the raw TCP peer is used instead, exactly as if the header "
+        "were absent",
     )
     args = ap.parse_args()
 
@@ -1011,6 +1110,35 @@ def main():
         sys.stderr.write("ac_server: --max-connections must be positive\n")
         sys.exit(1)
 
+    try:
+        trusted_proxy_cidrs = _parse_proxy_cidrs(args.trusted_proxy_cidr)
+    except ValueError as e:
+        sys.stderr.write("ac_server: %s -- refusing to start\n" % (e,))
+        sys.exit(1)
+    if args.trust_proxy and not trusted_proxy_cidrs:
+        # Fail closed: without a CIDR allowlist _client_ip() would trust
+        # X-Forwarded-For from ANY direct connection, letting a client
+        # that can reach this process forge its rate-limit bucket and
+        # source_addr (#14). Refusing to start beats silently running
+        # either open (old behavior) or with XFF dead (a --trust-proxy
+        # that trusts nothing would just confuse the operator).
+        sys.stderr.write(
+            "ac_server: --trust-proxy requires at least one "
+            "--trusted-proxy-cidr naming only your reverse proxies "
+            "(e.g. --trusted-proxy-cidr 10.0.0.5/32) -- refusing to "
+            "start with X-Forwarded-For trusted from any peer\n"
+        )
+        sys.exit(1)
+    if trusted_proxy_cidrs and not args.trust_proxy:
+        # Fail-safe direction (header stays ignored, raw peer used), but
+        # almost certainly not what the operator meant -- say so instead
+        # of silently running a CIDR list that does nothing.
+        sys.stderr.write(
+            "ac_server: warning: --trusted-proxy-cidr given without "
+            "--trust-proxy -- the allowlist has no effect unless the "
+            "header is actually trusted\n"
+        )
+
     if args.trust_proxy and args.unix_socket:
         # --trust-proxy makes the handler take X-Forwarded-For at face
         # value for rate limiting and source_addr. Over the unix-socket
@@ -1037,7 +1165,8 @@ def main():
     store = Store(args.db, max_reports_per_client=args.max_reports_per_client)
     rate_limiter = RateLimiter(args.rate_limit, args.rate_window)
     handler = make_handler(
-        store, report_keys, admin_keys, rate_limiter, args.trust_proxy
+        store, report_keys, admin_keys, rate_limiter, args.trust_proxy,
+        tuple(trusted_proxy_cidrs),
     )
     if args.unix_socket:
         httpd = ThreadingUnixHTTPServer(
