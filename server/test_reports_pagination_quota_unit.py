@@ -149,12 +149,14 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     rejected = 0
     for bad in ("limit=abc", "limit=0", "limit=-5", "offset=-1",
-                "offset=1.5", "limit=", "offset=x"):
+                "offset=1.5", "limit=", "offset=x",
+                "limit=5&limit=6", "limit=5&limit=abc", "offset=1&offset=2"):
         try:
             handler_cls._parse_listing_params(bad)
         except ValueError:
             rejected += 1
-    check("non-decimal/negative/zero pagination rejected (7/7)", rejected == 7)
+    check("non-decimal/negative/zero/repeated pagination rejected (10/10)",
+          rejected == 10)
 
 print()
 if FAIL:

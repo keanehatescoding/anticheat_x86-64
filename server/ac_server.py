@@ -936,15 +936,21 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
         def _parse_listing_params(query):
             """Parse `?limit=&offset=` for GET /reports/<id> (#27).
             Returns (limit, offset); raises ValueError on anything that
-            isn't a plain non-negative decimal integer or a limit < 1.
-            A limit above Store.MAX_LIST_LIMIT is clamped, not rejected:
-            a too-large page is still a well-formed request, it just must
-            not page an unbounded result set into one JSON body."""
+            isn't a single plain non-negative decimal integer per key or
+            a limit < 1. A repeated key (?limit=5&limit=abc) is rejected
+            outright: silently honoring one occurrence would let an invalid
+            value hide behind a valid one. A limit above
+            Store.MAX_LIST_LIMIT is clamped, not rejected: a too-large
+            page is still a well-formed request, it just must not page an
+            unbounded result set into one JSON body."""
             qs = urllib.parse.parse_qs(query, keep_blank_values=True)
             limit = Store.DEFAULT_LIST_LIMIT
             offset = 0
             if "limit" in qs:
-                raw = qs["limit"][0]
+                vals = qs["limit"]
+                if len(vals) != 1:
+                    raise ValueError("bad limit")
+                raw = vals[0]
                 if not raw.isdigit():
                     raise ValueError("bad limit")
                 limit = int(raw)
@@ -952,7 +958,10 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                     raise ValueError("bad limit")
                 limit = min(limit, Store.MAX_LIST_LIMIT)
             if "offset" in qs:
-                raw = qs["offset"][0]
+                vals = qs["offset"]
+                if len(vals) != 1:
+                    raise ValueError("bad offset")
+                raw = vals[0]
                 if not raw.isdigit():
                     raise ValueError("bad offset")
                 offset = int(raw)
@@ -1231,8 +1240,6 @@ def main():
             "--unix-socket and only lets a client forge its source_addr "
             "-- drop one of the two flags\n"
         )
-    store = Store(args.db, max_reports_per_client=args.max_reports_per_client,
-                  max_total_reports=args.max_total_reports)
     # Restrictive umask for the daemon's own lifetime, set once here while
     # still single-threaded (before Store() creates any file and before the
     # accept loop spawns handler threads). This is what keeps every file
@@ -1241,7 +1248,8 @@ def main():
     # It lives here, not in Store.__init__, precisely so importing Store as
     # a library never mutates the importer's process-wide umask (#99).
     os.umask(0o077)
-    store = Store(args.db, max_reports_per_client=args.max_reports_per_client)
+    store = Store(args.db, max_reports_per_client=args.max_reports_per_client,
+                  max_total_reports=args.max_total_reports)
     rate_limiter = RateLimiter(args.rate_limit, args.rate_window)
     handler = make_handler(
         store, report_keys, admin_keys, rate_limiter, args.trust_proxy,
