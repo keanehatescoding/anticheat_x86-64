@@ -79,13 +79,28 @@ class RateLimiter:
     the actual deployment this is for. Applied to every endpoint, not just
     /report: unauthenticated attempts against /banned or /ban are exactly
     the kind of thing worth throttling too (ID enumeration, admin-key
-    brute-forcing), not just report flooding."""
+    brute-forcing), not just report flooding.
+    `max_keys` is a hard cap on distinct keys held at once, evicting the
+    least-recently-seen key when exceeded. `_prune()` alone only runs
+    roughly once per `window` seconds, so a burst of distinct source IPs
+    within one window grew `_hits` without bound until the next prune
+    (#25) -- this cap bounds memory independently of that timer."""
 
-    def __init__(self, limit, window):
+    DEFAULT_MAX_KEYS = 4096
+
+    def __init__(self, limit, window, max_keys=DEFAULT_MAX_KEYS):
+        # isinstance(True, int) is True, so bool needs its own carve-out:
+        # True == 1 would otherwise silently cap the table at one bucket.
+        # Floats are rejected outright too -- inf/nan sail past a `< 1`
+        # check and then make `len(...) >= max_keys` permanently False,
+        # reopening the unbounded growth this cap exists to close (#25).
+        if isinstance(max_keys, bool) or not isinstance(max_keys, int) or max_keys < 1:
+            raise ValueError("max_keys must be a positive integer")
         self.limit = limit
         self.window = window
+        self.max_keys = max_keys
         self._lock = threading.Lock()
-        self._hits = {}  # key -> deque[monotonic timestamps]
+        self._hits = {}  # key -> deque[monotonic timestamps], LRU-ordered
         self._buckets = self._hits  # compat alias for older tests inspecting _buckets
         self._last_prune = time.monotonic()
 
@@ -94,8 +109,21 @@ class RateLimiter:
         with self._lock:
             dq = self._hits.get(key)
             if dq is None:
+                if len(self._hits) >= self.max_keys:
+                    # Evict the least-recently-seen key, not the caller:
+                    # a distinct-IP flood then only churns its own buckets
+                    # instead of growing memory, and an evicted legitimate
+                    # key restarts with a fresh (generous, not punitive)
+                    # budget on its next request.
+                    self._hits.pop(next(iter(self._hits)))
                 dq = collections.deque()
                 self._hits[key] = dq
+            else:
+                # Mark recently seen so eviction above drops the
+                # least-recently-seen key (pop + reinsert moves a plain
+                # dict's key to the end; reassigning alone would not).
+                self._hits[key] = self._hits.pop(key)
+                dq = self._hits[key]
             # prune outside window
             while dq and now - dq[0] >= self.window:
                 dq.popleft()

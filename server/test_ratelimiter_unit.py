@@ -88,6 +88,59 @@ check(
     rl._last_prune > last_prune_before,
 )
 
+print("=== RateLimiter unit test: max_keys hard cap (#25) ===")
+print()
+
+# No sleep here on purpose: _prune() only runs ~once per window, so a
+# burst of distinct keys inside a single window is exactly the shape that
+# used to grow _hits without bound. Window is 60s so nothing goes stale
+# mid-test; only the hard cap can keep this bounded.
+CAP = 64
+rl_cap = ac_server.RateLimiter(limit=1_000_000, window=60, max_keys=CAP)
+for i in range(200):
+    rl_cap.allow(f"198.51.100.{i % 256}-{i}")
+
+check(
+    f"distinct-key burst stays bounded without waiting for prune (cap={CAP}, after={len(rl_cap._buckets)})",
+    len(rl_cap._buckets) <= CAP,
+)
+check(
+    "oldest keys evicted first, newest retained",
+    "198.51.100.0-0" not in rl_cap._buckets
+    and "198.51.100.199-199" in rl_cap._buckets,
+)
+
+# Recently-used keys survive eviction (LRU, not FIFO): with cap 3 holding
+# a, b, c, re-touching a then adding d must evict b, not a.
+rl_lru = ac_server.RateLimiter(limit=1_000_000, window=60, max_keys=3)
+for k in ("a", "b", "c"):
+    rl_lru.allow(k)
+rl_lru.allow("a")
+rl_lru.allow("d")
+check(
+    "recently-used key survives eviction (LRU order)",
+    "a" in rl_lru._buckets and "b" not in rl_lru._buckets and "d" in rl_lru._buckets,
+)
+
+# The cap must not break per-key limiting for retained keys, and an
+# evicted key restarts with a fresh (generous) budget on its next request.
+rl_lim = ac_server.RateLimiter(limit=2, window=60, max_keys=2)
+check("within limit allowed", rl_lim.allow("victim") and rl_lim.allow("victim"))
+check("over limit denied", not rl_lim.allow("victim"))
+rl_lim.allow("other")
+rl_lim.allow("evictor")  # exceeds cap, evicts least-recently-seen ("victim")
+check(
+    "evicted key restarts with a fresh budget (fail-open, not stuck denied)",
+    rl_lim.allow("victim"),
+)
+
+for bad in (0, -1, True, False, 1.5, float("inf"), float("nan"), "64", None):
+    try:
+        ac_server.RateLimiter(limit=1, window=1, max_keys=bad)
+        check(f"max_keys={bad!r} rejected", False)
+    except ValueError:
+        check(f"max_keys={bad!r} rejected", True)
+
 print()
 if FAIL:
     print("\033[1;31mSOME RATELIMITER UNIT TESTS FAILED\033[0m")
