@@ -189,6 +189,15 @@ class BoundedThreadingMixIn(socketserver.ThreadingMixIn):
         # so prompt close (not a wait with timeout) is what actually
         # bounds fd/thread pressure under a many-connection burst.
         if not self._conn_semaphore.acquire(blocking=False):
+            # Over-capacity rejections used to be silent server-side: the
+            # client got its 503 below, but stderr showed nothing, so an
+            # operator watching logs couldn't tell a rejection burst apart
+            # from a quiet server (#30). One line per rejected connection,
+            # same destination as the per-request access log.
+            sys.stderr.write(
+                "ac_server: connection from %r rejected: over "
+                "--max-connections (%d)\n" % (client_address, self.max_connections)
+            )
             self._reject_overloaded(request)
             return
         try:
@@ -675,6 +684,15 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 self.connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+
+        def address_string(self):
+            # BaseHTTPRequestHandler.address_string() calls
+            # socket.getfqdn() on every log line -- a reverse-DNS lookup
+            # per request, against attacker-influenced source IPs, plus a
+            # pointless getfqdn("unix") on every unix-socket request (#30).
+            # The IP literal (or the "unix" placeholder) is all this
+            # server's logs need; skip the resolution entirely.
+            return self.client_address[0]
 
         def log_message(self, fmt, *args):
             sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
