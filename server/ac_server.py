@@ -349,7 +349,8 @@ class Store:
     be correct under ThreadingHTTPServer without sharing a connection
     across threads."""
 
-    def __init__(self, db_path, max_reports_per_client=1000):
+    def __init__(self, db_path, max_reports_per_client=1000,
+                 max_total_reports=100000):
         self.db_path = db_path
         # Bounds how many rows a single client_id can hold in `reports`,
         # trimmed on every insert (see add_report). Without this, a single
@@ -358,6 +359,14 @@ class Store:
         # query returns, not what accumulates on disk (#60). 0/None disables
         # the cap.
         self.max_reports_per_client = max_reports_per_client
+        # Bounds how many rows the whole `reports` table can hold across
+        # ALL client_ids, trimmed on every insert right after the
+        # per-client trim above (see add_report). The per-client cap alone
+        # can't do this: anyone able to mint arbitrarily many distinct
+        # client_ids grows the SQLite file without bound (#26). Oldest
+        # rows go first, same as the per-client trim. 0/None disables
+        # the cap.
+        self.max_total_reports = max_total_reports
         # SQLite only ever allows one writer at a time, even in WAL mode --
         # under ThreadingHTTPServer, every write-handling thread opens its
         # own connection and would otherwise all race for that single
@@ -470,6 +479,13 @@ class Store:
                         "ORDER BY id DESC LIMIT ?)",
                         (client_id, client_id, self.max_reports_per_client),
                     )
+                if self.max_total_reports:
+                    conn.execute(
+                        "DELETE FROM reports WHERE id NOT IN ("
+                        "SELECT id FROM reports "
+                        "ORDER BY id DESC LIMIT ?)",
+                        (self.max_total_reports,),
+                    )
                 conn.commit()
                 # SQLite may have (re)created -wal/-shm on this write; lock
                 # them down while the connection is still open (they exist
@@ -480,13 +496,30 @@ class Store:
             finally:
                 conn.close()
 
-    def list_reports(self, client_id, limit=200):
+    # Hard ceiling on one listing response: without it, asking for a huge
+    # ?limit= pages an arbitrarily large result set into one JSON body
+    # (#27). The handler clamps to this; direct Store callers passing more
+    # get clamped here too so the bound holds regardless of entry point.
+    MAX_LIST_LIMIT = 1000
+    DEFAULT_LIST_LIMIT = 200
+
+    def list_reports(self, client_id, limit=200, offset=0):
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_LIST_LIMIT
+        try:
+            offset = int(offset)
+        except (TypeError, ValueError):
+            offset = 0
+        limit = min(max(limit, 0), self.MAX_LIST_LIMIT)
+        offset = max(offset, 0)
         conn = self._connect()
         try:
             cur = conn.execute(
                 "SELECT event_type, detail, client_ts, received_at, source_addr "
-                "FROM reports WHERE client_id = ? ORDER BY id DESC LIMIT ?",
-                (client_id, limit),
+                "FROM reports WHERE client_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (client_id, limit, offset),
             )
             return [
                 {
@@ -839,7 +872,7 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                     self._handle_banned, path[len("/banned/"):])
             if path.startswith("/reports/"):
                 return self._route_guarded(
-                    self._handle_reports, path[len("/reports/"):])
+                    self._handle_reports, path[len("/reports/"):], parsed.query)
             self._send_json(404, {"error": "not found"})
 
         @_requires_auth(report_keys)
@@ -889,10 +922,41 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             self._send_json(200, store.ban_status(client_id))
 
         @_requires_auth(admin_keys)
-        def _handle_reports(self, client_id):
+        def _handle_reports(self, client_id, query=""):
             if not self._require_valid_client_id(client_id):
                 return
-            self._send_json(200, {"reports": store.list_reports(client_id)})
+            try:
+                limit, offset = self._parse_listing_params(query)
+            except ValueError:
+                return self._send_json(400, {"error": "invalid pagination"})
+            self._send_json(200, {"reports": store.list_reports(
+                client_id, limit=limit, offset=offset)})
+
+        @staticmethod
+        def _parse_listing_params(query):
+            """Parse `?limit=&offset=` for GET /reports/<id> (#27).
+            Returns (limit, offset); raises ValueError on anything that
+            isn't a plain non-negative decimal integer or a limit < 1.
+            A limit above Store.MAX_LIST_LIMIT is clamped, not rejected:
+            a too-large page is still a well-formed request, it just must
+            not page an unbounded result set into one JSON body."""
+            qs = urllib.parse.parse_qs(query, keep_blank_values=True)
+            limit = Store.DEFAULT_LIST_LIMIT
+            offset = 0
+            if "limit" in qs:
+                raw = qs["limit"][0]
+                if not raw.isdigit():
+                    raise ValueError("bad limit")
+                limit = int(raw)
+                if limit < 1:
+                    raise ValueError("bad limit")
+                limit = min(limit, Store.MAX_LIST_LIMIT)
+            if "offset" in qs:
+                raw = qs["offset"][0]
+                if not raw.isdigit():
+                    raise ValueError("bad offset")
+                offset = int(raw)
+            return limit, offset
 
     return Handler
 
@@ -921,6 +985,15 @@ def main():
         "trimmed on insert; keeps a single spammy or misbehaving daemon "
         "from growing the SQLite file without bound (default: 1000, "
         "0 disables the cap)",
+    )
+    ap.add_argument(
+        "--max-total-reports",
+        type=int,
+        default=100000,
+        help="cap on stored rows in `reports` across ALL client_ids, "
+        "oldest trimmed on insert; --max-reports-per-client alone can't "
+        "bound the SQLite file since anyone able to mint new client_ids "
+        "grows it without bound (default: 100000, 0 disables the cap)",
     )
     ap.add_argument(
         "--report-key",
@@ -1106,6 +1179,12 @@ def main():
         )
         sys.exit(1)
 
+    if args.max_total_reports < 0:
+        sys.stderr.write(
+            "ac_server: --max-total-reports must be >= 0 (0 disables the cap)\n"
+        )
+        sys.exit(1)
+
     if args.max_connections <= 0:
         sys.stderr.write("ac_server: --max-connections must be positive\n")
         sys.exit(1)
@@ -1152,8 +1231,8 @@ def main():
             "--unix-socket and only lets a client forge its source_addr "
             "-- drop one of the two flags\n"
         )
-        sys.exit(1)
-
+    store = Store(args.db, max_reports_per_client=args.max_reports_per_client,
+                  max_total_reports=args.max_total_reports)
     # Restrictive umask for the daemon's own lifetime, set once here while
     # still single-threaded (before Store() creates any file and before the
     # accept loop spawns handler threads). This is what keeps every file

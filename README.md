@@ -531,6 +531,8 @@ POST /ban               admin-key    -- {client_id, reason}
 POST /unban              admin-key   -- {client_id}
 GET  /banned/<id>        admin-key   -- what a game server would call
 GET  /reports/<id>       admin-key   -- raw reports for a human to review
+                         (`?limit=`/`?offset=` page newest-first, capped
+                         at 1000 rows per response; bad values get 400)
 ```
 
 ```
@@ -589,6 +591,15 @@ enumerate client IDs or brute-force the admin key. It's a simple
 fixed-window counter (allows a brief double-rate burst right at a window
 boundary), not built for distributed scale — enough to bound abuse
 against a single small process, which is the deployment this targets.
+
+**Bounded retention, paged review.** Stored rows are trimmed oldest-first
+on every insert: `--max-reports-per-client` (default 1000) bounds one
+`client_id`, and `--max-total-reports` (default 100000) bounds the whole
+table across all `client_id`s — the per-client cap alone can't stop
+someone minting new IDs from growing the SQLite file without bound
+(either cap is disabled with 0). The listing endpoint pages newest-first
+via `?limit=`/`?offset=` so history past the most recent 200 rows stays
+reachable through the API.
 
 **No TLS.** This is plain HTTP, meant for localhost/LAN or behind a
 reverse proxy that terminates TLS for anything reachable over an

@@ -429,6 +429,37 @@ if printf '%s' "$OUT" | grep -q "syscall hook"; then
 else
     fail "expected 'syscall hook' in reports listing (got: $OUT)"
 fi
+# 13b. ?limit=&offset= pagination on the reports listing (#27): five
+# reports, page through them newest-first, then confirm bad values 400
+# instead of silently returning a default page.
+PAG_CID="test-pagination-$$"
+for i in 1 2 3 4 5; do
+    curl -s -o /dev/null -X POST "$BASE/report" \
+        -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$PAG_CID\",\"event_type\":\"X\",\"detail\":\"page-$i\",\"ts\":$i}"
+done
+PAG_OUT=$(curl -s "$BASE/reports/$PAG_CID?limit=2&offset=1" -H "Authorization: Bearer $ADMIN_KEY")
+if printf '%s' "$PAG_OUT" | grep -q '"detail": "page-4"' \
+    && printf '%s' "$PAG_OUT" | grep -q '"detail": "page-3"' \
+    && ! printf '%s' "$PAG_OUT" | grep -q '"detail": "page-5"'; then
+    pass "reports ?limit=2&offset=1 returns the second page newest-first"
+else
+    fail "expected page-4 and page-3 only in second page (got: $PAG_OUT)"
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/reports/$PAG_CID?limit=abc" \
+    -H "Authorization: Bearer $ADMIN_KEY")
+if [ "$CODE" = "400" ]; then
+    pass "reports ?limit=abc rejected -> 400"
+else
+    fail "non-numeric ?limit= should be 400 (got $CODE)"
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/reports/$PAG_CID?offset=-1" \
+    -H "Authorization: Bearer $ADMIN_KEY")
+if [ "$CODE" = "400" ]; then
+    pass "reports ?offset=-1 rejected -> 400"
+else
+    fail "negative ?offset= should be 400 (got $CODE)"
+fi
 
 # 14. ban, then confirm banned lookup flips to true
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/ban" \
@@ -1299,6 +1330,14 @@ if AC_SERVER_REPORT_KEY="test-report-key-$$" AC_SERVER_ADMIN_KEY="test-admin-key
     fail "server should refuse to start with --max-connections 0"
 else
     pass "server refuses to start with --max-connections 0"
+fi
+if AC_SERVER_REPORT_KEY="test-report-key-$$" AC_SERVER_ADMIN_KEY="test-admin-key-$$" \
+    python3 ./ac_server.py \
+    --port 18815 --db "$TESTDIR/badtotal.db" --max-total-reports -1 \
+    >/dev/null 2>&1; then
+    fail "server should refuse to start with --max-total-reports -1"
+else
+    pass "server refuses to start with --max-total-reports -1"
 fi
 # an -old key that overlaps the other tier's current key is just as much
 # a tier-separation break as report-key == admin-key -- must be rejected
