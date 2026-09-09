@@ -429,6 +429,92 @@ if printf '%s' "$OUT" | grep -q "syscall hook"; then
 else
     fail "expected 'syscall hook' in reports listing (got: $OUT)"
 fi
+# 13b. ?limit=&offset= pagination on the reports listing (#27): five
+# reports, page through them newest-first, then confirm bad values 400
+# instead of silently returning a default page.
+PAG_CID="test-pagination-$$"
+for i in 1 2 3 4 5; do
+    curl -s -o /dev/null -X POST "$BASE/report" \
+        -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$PAG_CID\",\"event_type\":\"X\",\"detail\":\"page-$i\",\"ts\":$i}"
+done
+PAG_OUT=$(curl -s "$BASE/reports/$PAG_CID?limit=2&offset=1" -H "Authorization: Bearer $ADMIN_KEY")
+if printf '%s' "$PAG_OUT" | grep -q '"detail": "page-4"' \
+    && printf '%s' "$PAG_OUT" | grep -q '"detail": "page-3"' \
+    && ! printf '%s' "$PAG_OUT" | grep -q '"detail": "page-5"'; then
+    pass "reports ?limit=2&offset=1 returns the second page newest-first"
+else
+    fail "expected page-4 and page-3 only in second page (got: $PAG_OUT)"
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/reports/$PAG_CID?limit=abc" \
+    -H "Authorization: Bearer $ADMIN_KEY")
+if [ "$CODE" = "400" ]; then
+    pass "reports ?limit=abc rejected -> 400"
+else
+    fail "non-numeric ?limit= should be 400 (got $CODE)"
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/reports/$PAG_CID?offset=-1" \
+    -H "Authorization: Bearer $ADMIN_KEY")
+if [ "$CODE" = "400" ]; then
+    pass "reports ?offset=-1 rejected -> 400"
+else
+    fail "negative ?offset= should be 400 (got $CODE)"
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/reports/$PAG_CID?limit=2&limit=abc" \
+    -H "Authorization: Bearer $ADMIN_KEY")
+if [ "$CODE" = "400" ]; then
+    pass "reports repeated ?limit= rejected -> 400"
+else
+    fail "repeated ?limit= should be 400 (got $CODE)"
+fi
+
+# 13c. --max-total-reports is actually wired into the serving Store
+# (#26): a dedicated instance with a tiny global quota but a generous
+# per-client one. Six reports across two distinct client_ids must land
+# with only the newest five surviving -- a per-client-only trim would
+# keep all six.
+Q_PORT=18816
+Q_TESTDIR="$(mktemp -d /tmp/ac_server_quota_test.XXXXXXXX)"
+Q_DB="$Q_TESTDIR/ac.db"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --host 127.0.0.1 --port "$Q_PORT" --db "$Q_DB" \
+    --max-total-reports 5 --max-reports-per-client 1000 \
+    --rate-limit 500 --rate-window 60 \
+    >"$Q_TESTDIR/server.log" 2>&1 &
+Q_SERVER_PID=$!
+Q_BASE="http://127.0.0.1:$Q_PORT"
+Q_READY=0
+for _ in $(seq 1 50); do
+    if curl -s "$Q_BASE/banned/x" -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        Q_READY=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$Q_READY" -eq 1 ]; then
+    for i in 1 2 3; do
+        curl -s -o /dev/null -X POST "$Q_BASE/report" \
+            -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+            -d "{\"client_id\":\"test-quota-a-$$\",\"event_type\":\"X\",\"detail\":\"qa-$i\",\"ts\":$i}"
+        curl -s -o /dev/null -X POST "$Q_BASE/report" \
+            -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+            -d "{\"client_id\":\"test-quota-b-$$\",\"event_type\":\"X\",\"detail\":\"qb-$i\",\"ts\":$i}"
+    done
+    Q_TOTAL=$(curl -s "$Q_BASE/reports/test-quota-a-$$?limit=1000" -H "Authorization: Bearer $ADMIN_KEY"; curl -s "$Q_BASE/reports/test-quota-b-$$?limit=1000" -H "Authorization: Bearer $ADMIN_KEY")
+    Q_COUNT=$(printf '%s' "$Q_TOTAL" | grep -o '"detail": "q[ab]-[123]"' | wc -l | tr -d ' ')
+    if [ "$Q_COUNT" = "5" ] && ! printf '%s' "$Q_TOTAL" | grep -q '"detail": "qa-1"'; then
+        pass "global quota trims oldest-first across client_ids (6 in, 5 kept)"
+    else
+        fail "expected 5 rows with qa-1 evicted (got $Q_COUNT: $Q_TOTAL)"
+    fi
+else
+    fail "quota test server never became ready on port $Q_PORT"
+fi
+kill "$Q_SERVER_PID" 2>/dev/null
+wait "$Q_SERVER_PID" 2>/dev/null
+Q_SERVER_PID=""
+rm -rf "$Q_TESTDIR"
 
 # 14. ban, then confirm banned lookup flips to true
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/ban" \
@@ -1299,6 +1385,14 @@ if AC_SERVER_REPORT_KEY="test-report-key-$$" AC_SERVER_ADMIN_KEY="test-admin-key
     fail "server should refuse to start with --max-connections 0"
 else
     pass "server refuses to start with --max-connections 0"
+fi
+if AC_SERVER_REPORT_KEY="test-report-key-$$" AC_SERVER_ADMIN_KEY="test-admin-key-$$" \
+    python3 ./ac_server.py \
+    --port 18815 --db "$TESTDIR/badtotal.db" --max-total-reports -1 \
+    >/dev/null 2>&1; then
+    fail "server should refuse to start with --max-total-reports -1"
+else
+    pass "server refuses to start with --max-total-reports -1"
 fi
 # an -old key that overlaps the other tier's current key is just as much
 # a tier-separation break as report-key == admin-key -- must be rejected
