@@ -596,17 +596,19 @@ untrusted network — not a hardened, internet-facing service as shipped.
 That's a real gap for a production deployment, not an oversight papered
 over: this is the minimal version of the pipeline, not the finished one.
 If you do put it behind a reverse proxy, pass `--trust-proxy` plus at
-least one `--trusted-proxy-cidr` covering only your proxies (e.g.
-`--trusted-proxy-cidr 10.0.0.0/8`) so the rate limiter and the
-`source_addr` recorded on every report use the real client IP (the last,
-proxy-authored hop of `X-Forwarded-For`) instead of the proxy's own
-address. `--trust-proxy` without a CIDR refuses to start, and a peer
-outside the CIDRs falls back to the raw TCP peer -- off by default,
-since trusting that header from anything other than a proxy you control
-would let a client spoof both. If the daemon and server are co-located
-on the same host, `--unix-socket` (above) sidesteps this gap entirely
-instead of working around it — see `THREAT_MODEL.md`'s Unix-domain-socket
-note.
+least one `--trusted-proxy-cidr` naming only that proxy (e.g.
+`--trusted-proxy-cidr 10.0.0.5/32` for one proxy host) so the rate
+limiter and the `source_addr` recorded on every report use the real
+client IP (the last, proxy-authored hop of `X-Forwarded-For`) instead of
+the proxy's own address. Keep the range as small as possible: every
+reachable peer inside it can forge `X-Forwarded-For` outright, so a
+broad subnet shared with untrusted clients defeats the allowlist.
+`--trust-proxy` without a CIDR refuses to start, and a peer outside the
+CIDRs falls back to the raw TCP peer -- off by default, since trusting
+that header from anything other than a proxy you control would let a
+client spoof both. If the daemon and server are co-located on the same
+host, `--unix-socket` (above) sidesteps this gap entirely instead of
+working around it — see `THREAT_MODEL.md`'s Unix-domain-socket note.
 
 **Fails closed, not silently.** An uncaught exception in a request
 handler (a real disk-full or locked-database error, not just a bad

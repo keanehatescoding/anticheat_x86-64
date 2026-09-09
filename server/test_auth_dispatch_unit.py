@@ -232,6 +232,26 @@ except ValueError:
     bad_rejected = True
 check("garbage CIDR raises ValueError (startup refuses)", bad_rejected)
 
+def _rejected(values):
+    try:
+        ac_server._parse_proxy_cidrs(values)
+    except ValueError:
+        return True
+    return False
+
+
+check(
+    "host bits rejected, not silently widened "
+    "(10.0.0.1/8 must not become 10.0.0.0/8)",
+    _rejected(["10.0.0.1/8"]),
+)
+check(
+    "single host as /32 and bare IP accepted",
+    [str(n) for n in ac_server._parse_proxy_cidrs(
+        ["10.0.0.5/32", "10.0.0.6"])]
+    == ["10.0.0.5/32", "10.0.0.6/32"],
+)
+
 print()
 if FAIL:
     print("\033[1;31mSOME AUTH DISPATCH UNIT TESTS FAILED\033[0m")

@@ -21,6 +21,29 @@ FAIL=0
 pass() { printf '  \033[1;32mPASS\033[0m  %s\n' "$*"; }
 fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$*"; FAIL=1; }
 
+# Asserts a server invocation refuses to start. Bounded by `timeout` so a
+# regression that actually starts serving stalls this suite for seconds,
+# not until the CI job itself times out: exit 124 means the process was
+# still alive at the deadline (it started -> fail); a clean 0 would mean
+# it started and exited on its own (fail too -- no such path exists, so
+# never silently pass on it); any other non-zero exit is the expected
+# startup refusal (pass). Call with the key env vars set, e.g.
+# AC_SERVER_REPORT_KEY=... AC_SERVER_ADMIN_KEY=... expect_startup_refusal
+# "test name" --port 18817 --db ... --trust-proxy
+expect_startup_refusal() {
+    local _name="$1"
+    shift
+    timeout 10 python3 ./ac_server.py "$@" >/dev/null 2>&1
+    local _code=$?
+    if [ "$_code" = "124" ]; then
+        fail "$_name (server started; had to be timed out)"
+    elif [ "$_code" -ne 0 ]; then
+        pass "$_name"
+    else
+        fail "$_name (server started and exited 0)"
+    fi
+}
+
 SERVER_PID=""
 RL_SERVER_PID=""
 CAP_SERVER_PID=""
@@ -881,23 +904,27 @@ rm -rf "$UTP_TESTDIR"
 
 # --trust-proxy without any --trusted-proxy-cidr would trust the header
 # from any direct connection -- the server must refuse to start (#14),
-# not run open. Exits before binding, so no instance to clean up.
-if AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
-    python3 ./ac_server.py --host 127.0.0.1 --port 18817 --db "$TESTDIR/notrustcidr.db" \
-    --trust-proxy >/dev/null 2>&1; then
-    fail "server should refuse to start with --trust-proxy and no --trusted-proxy-cidr"
-else
-    pass "server refuses to start with --trust-proxy and no --trusted-proxy-cidr"
-fi
+# not run open.
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    expect_startup_refusal \
+    "server refuses to start with --trust-proxy and no --trusted-proxy-cidr" \
+    --host 127.0.0.1 --port 18817 --db "$TESTDIR/notrustcidr.db" \
+    --trust-proxy
 
 # A garbage CIDR is a startup refusal, not a silently-ignored allowlist.
-if AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
-    python3 ./ac_server.py --host 127.0.0.1 --port 18818 --db "$TESTDIR/badcidr.db" \
-    --trust-proxy --trusted-proxy-cidr not-a-cidr >/dev/null 2>&1; then
-    fail "server should refuse to start with an invalid --trusted-proxy-cidr"
-else
-    pass "server refuses to start with an invalid --trusted-proxy-cidr"
-fi
+# Host bits are refused too (10.0.0.1/8 must not silently widen to
+# 10.0.0.0/8) -- the parser is strict, so both spellings exit non-zero
+# here before binding.
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    expect_startup_refusal \
+    "server refuses to start with an invalid --trusted-proxy-cidr" \
+    --host 127.0.0.1 --port 18818 --db "$TESTDIR/badcidr.db" \
+    --trust-proxy --trusted-proxy-cidr not-a-cidr
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    expect_startup_refusal \
+    "server refuses to start with host bits in --trusted-proxy-cidr" \
+    --host 127.0.0.1 --port 18819 --db "$TESTDIR/hostbitscidr.db" \
+    --trust-proxy --trusted-proxy-cidr 10.0.0.1/8
 
 # --trusted-proxy-cidr without --trust-proxy does nothing by itself --
 # the allowlist only matters when the header is trusted -- so the server
@@ -909,8 +936,18 @@ AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     --trusted-proxy-cidr 10.0.0.0/8 \
     >"$WARNTP_TESTDIR/server.log" 2>&1 &
 WARNTP_SERVER_PID=$!
-sleep 0.3
-if grep -q 'trusted-proxy-cidr given without' "$WARNTP_TESTDIR/server.log"; then
+# The warning is written only after interpreter startup, option parsing,
+# and key validation -- poll for it instead of assuming a fixed sleep
+# covers the slowest CI runner, mirroring the readiness loops above.
+WARNTP_FOUND=0
+for _ in $(seq 1 50); do
+    if grep -q 'trusted-proxy-cidr given without' "$WARNTP_TESTDIR/server.log" 2>/dev/null; then
+        WARNTP_FOUND=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$WARNTP_FOUND" -eq 1 ]; then
     pass "--trusted-proxy-cidr without --trust-proxy warns on stderr"
 else
     fail "expected a --trusted-proxy-cidr ineffectual-flag warning"

@@ -545,14 +545,19 @@ class Store:
 def _parse_proxy_cidrs(values):
     """Parse --trusted-proxy-cidr values into ipaddress networks.
     Raises ValueError naming the first bad entry -- main() turns that
-    into a startup refusal, and the unit test asserts on it directly."""
+    into a startup refusal, and the unit test asserts on it directly.
+    Strict: host bits are rejected (10.0.0.1/8 does NOT silently become
+    10.0.0.0/8 and trust 16M peers the operator never named) -- write
+    the network address itself, or a single host as /32."""
     nets = []
     for v in values or []:
         try:
-            nets.append(ipaddress.ip_network(v, strict=False))
+            nets.append(ipaddress.ip_network(v, strict=True))
         except ValueError:
-            raise ValueError("invalid --trusted-proxy-cidr %r: not a valid "
-                             "IPv4/IPv6 CIDR" % (v,))
+            raise ValueError("invalid --trusted-proxy-cidr %r: use a "
+                             "network address (e.g. 10.0.0.0/8) or a "
+                             "single host (e.g. 10.0.0.5/32), with no "
+                             "host bits set" % (v,)) from None
     return nets
 
 
@@ -988,9 +993,13 @@ def main():
         metavar="CIDR",
         help="IPv4/IPv6 CIDR whose TCP peers are trusted reverse proxies "
         "when --trust-proxy is on (repeatable; e.g. --trusted-proxy-cidr "
-        "10.0.0.0/8 --trusted-proxy-cidr fd00::/8). X-Forwarded-For from "
-        "any peer outside these ranges is ignored and the raw TCP peer "
-        "is used instead, exactly as if the header were absent",
+        "10.0.0.5/32 for one proxy host). Name the smallest range "
+        "containing only your proxies -- every reachable peer inside "
+        "these ranges can forge X-Forwarded-For outright, so a broad "
+        "subnet shared with untrusted clients defeats the allowlist. "
+        "X-Forwarded-For from any peer outside these ranges is ignored "
+        "and the raw TCP peer is used instead, exactly as if the header "
+        "were absent",
     )
     args = ap.parse_args()
 
@@ -1115,8 +1124,8 @@ def main():
         # that trusts nothing would just confuse the operator).
         sys.stderr.write(
             "ac_server: --trust-proxy requires at least one "
-            "--trusted-proxy-cidr covering only your reverse proxies "
-            "(e.g. --trusted-proxy-cidr 10.0.0.0/8) -- refusing to "
+            "--trusted-proxy-cidr naming only your reverse proxies "
+            "(e.g. --trusted-proxy-cidr 10.0.0.5/32) -- refusing to "
             "start with X-Forwarded-For trusted from any peer\n"
         )
         sys.exit(1)
