@@ -887,7 +887,6 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 # malformed request.
                 return (413, "payload too large")
             return None
-
         @staticmethod
         def _parse_content_length(raw):
             # Strict ASCII-decimal parse: int() alone also accepts "_",
@@ -898,7 +897,16 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             text = (raw or "").strip(" \t")
             if CONTENT_LENGTH_RE.fullmatch(text) is None:
                 return None
-            return int(text)
+            digits = text.lstrip("0") or "0"
+            if len(digits) > len(str(MAX_BODY_BYTES)):
+                # Far beyond any acceptable body: report it as oversized
+                # without calling int(), which raises ValueError past
+                # Python's sys.get_int_max_str_digits() limit (4300 by
+                # default) and would turn this into a 500 via _dispatch
+                # instead of a 413. Any digit string longer than "4096"
+                # exceeds MAX_BODY_BYTES by magnitude alone.
+                return MAX_BODY_BYTES + 1
+            return int(digits)
 
         def _read_json_body(self):
             length = self._parse_content_length(

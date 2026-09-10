@@ -111,6 +111,15 @@ check("oversized body gets 413 (not generic 400)",
 check("oversized body error names the problem",
       sent.get("obj", {}).get("error") == "payload too large")
 
+# --- 5000-digit Content-Length: beyond int()'s conversion limit, must
+# --- still be a header-only 413, never a 500 via _dispatch (review #58) ---
+h, sent = make_handler(
+    StubHeaders([("Content-Length", "9" * 5000)]),
+    ExplodingReader(),
+)
+check("gigantic Content-Length gets 413, body unread",
+      h._require_body_client_id() is None and sent.get("code") == 413)
+
 # --- exactly MAX_BODY_BYTES still passes framing AND parses: build a
 # --- serialized body of precisely that size and run the full funnel ---
 edge_prefix = b'{"client_id": "desk-01", "pad": "'
