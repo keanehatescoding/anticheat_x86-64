@@ -122,6 +122,31 @@ check(
     "198.51.100.9" in logged and "--max-connections" in logged,
 )
 
+# --- rejection log is throttled: a flood coalesces, accept loop never
+# --- blocks on stderr per connection ---
+def reject_once(peer):
+    f = FakeRequest()
+    mixin.shutdown_request = lambda _request: setattr(f, "shutdown_called", True)
+    out = io.StringIO()
+    with contextlib.redirect_stderr(out):
+        mixin.process_request(f, peer)
+    return f, out.getvalue()
+
+fake2, logged2 = reject_once(("198.51.100.10", 9998))
+check("client still gets its 503 during a burst", b"503 Service Unavailable" in fake2.sent)
+check("burst rejection inside the window logs nothing", logged2 == "")
+
+# Force the window to expire, then the next rejection must flush the
+# suppressed count in a single line.
+mixin._overload_log_last -= (
+    ac_server.BoundedThreadingMixIn.OVERLOAD_LOG_INTERVAL_SEC + 1.0)
+fake3, logged3 = reject_once(("198.51.100.11", 9997))
+check(
+    "post-window rejection logs once with suppressed count",
+    "--max-connections" in logged3 and "+1 similar suppressed" in logged3
+    and logged3.count("rejected: over") == 1,
+)
+
 print()
 if FAIL:
     print("\033[1;31mSOME LOGGING HYGIENE UNIT TESTS FAILED\033[0m")

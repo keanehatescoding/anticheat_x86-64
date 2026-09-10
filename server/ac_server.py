@@ -177,10 +177,19 @@ class BoundedThreadingMixIn(socketserver.ThreadingMixIn):
     __init__, before any accept loop runs), so separate test instances
     in the same process don't share a budget."""
 
+    # Longest the accept loop ever waits between overload log lines: the
+    # rejection log below is rate-limited to at most one synchronous
+    # stderr write per interval so a flood of over-capacity connections
+    # can't park the accept loop behind a backpressured log sink.
+    OVERLOAD_LOG_INTERVAL_SEC = 5.0
+
     def __init__(self, *args, max_connections=DEFAULT_MAX_CONNECTIONS,
                  **kwargs):
         self._conn_semaphore = threading.Semaphore(max_connections)
         self.max_connections = max_connections
+        self._overload_log_lock = threading.Lock()
+        self._overload_log_last = 0.0
+        self._overload_log_suppressed = 0
         super().__init__(*args, **kwargs)
 
     def process_request(self, request, client_address):
@@ -192,12 +201,12 @@ class BoundedThreadingMixIn(socketserver.ThreadingMixIn):
             # Over-capacity rejections used to be silent server-side: the
             # client got its 503 below, but stderr showed nothing, so an
             # operator watching logs couldn't tell a rejection burst apart
-            # from a quiet server (#30). One line per rejected connection,
-            # same destination as the per-request access log.
-            sys.stderr.write(
-                "ac_server: connection from %r rejected: over "
-                "--max-connections (%d)\n" % (client_address, self.max_connections)
-            )
+            # from a quiet server (#30). Throttled to one line per
+            # OVERLOAD_LOG_INTERVAL_SEC (with a suppressed count) so a
+            # rejection flood can't stall the accept loop behind a
+            # backpressured stderr -- the 503 itself is still sent per
+            # connection, only the log line is coalesced.
+            self._log_overload_rejection(client_address)
             self._reject_overloaded(request)
             return
         try:
@@ -221,6 +230,38 @@ class BoundedThreadingMixIn(socketserver.ThreadingMixIn):
             # inside ThreadingMixIn.process_request_thread, but a bug in
             # shutdown_request() itself must still not leak a slot forever.
             self._conn_semaphore.release()
+
+    def _log_overload_rejection(self, client_address):
+        # At most one stderr write per OVERLOAD_LOG_INTERVAL_SEC: the
+        # accept loop runs process_request() inline, so one blocking
+        # write per rejected connection would let a rejection flood (or
+        # a backpressured log sink) stall legitimate accepts. Rejections
+        # inside the window only bump a counter, folded into the next
+        # emitted line. getattr defaults keep __new__-built test
+        # instances (which skip __init__) working.
+        now = time.monotonic()
+        lock = getattr(self, "_overload_log_lock", None)
+        if lock is None:
+            lock = self._overload_log_lock = threading.Lock()
+            self._overload_log_last = 0.0
+            self._overload_log_suppressed = 0
+        with lock:
+            last = self._overload_log_last
+            if now - last < self.OVERLOAD_LOG_INTERVAL_SEC:
+                self._overload_log_suppressed += 1
+                return
+            self._overload_log_last = now
+            suppressed, self._overload_log_suppressed = (
+                self._overload_log_suppressed, 0)
+        suffix = (
+            " (+%d similar suppressed in last %.0fs)"
+            % (suppressed, self.OVERLOAD_LOG_INTERVAL_SEC) if suppressed else ""
+        )
+        sys.stderr.write(
+            "ac_server: connection from %r rejected: over "
+            "--max-connections (%d)%s\n"
+            % (client_address, self.max_connections, suffix)
+        )
 
     def _reject_overloaded(self, request):
         # Best-effort 503 so a legitimate daemon bursting past the cap
