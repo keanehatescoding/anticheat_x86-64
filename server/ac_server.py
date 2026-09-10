@@ -65,6 +65,7 @@ import collections
 import functools
 
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
 MAX_BODY_BYTES = 4096
 
 
@@ -877,9 +878,8 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 # buggy or hostile client, never a legit one worth
                 # accommodating.
                 return (400, "duplicate content-length")
-            try:
-                length = int((lengths[0] if lengths else "0") or "0")
-            except ValueError:
+            length = self._parse_content_length(lengths[0] if lengths else "0")
+            if length is None:
                 return (400, "bad request")
             if length > MAX_BODY_BYTES:
                 # Distinct from 400: 413 tells a legitimate client its
@@ -888,10 +888,22 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 return (413, "payload too large")
             return None
 
+        @staticmethod
+        def _parse_content_length(raw):
+            # Strict ASCII-decimal parse: int() alone also accepts "_",
+            # sign, and surrounding whitespace ("1_6", "+16"), which
+            # would let a non-decimal framing slip past here while
+            # meaning something else to a downstream parser. Only
+            # optional whitespace around plain digits is valid.
+            text = (raw or "").strip(" \t")
+            if CONTENT_LENGTH_RE.fullmatch(text) is None:
+                return None
+            return int(text)
+
         def _read_json_body(self):
-            try:
-                length = int(self.headers.get("Content-Length", "0") or "0")
-            except ValueError:
+            length = self._parse_content_length(
+                self.headers.get("Content-Length", "0"))
+            if length is None:
                 # A client sending a garbage Content-Length (not
                 # necessarily malicious -- could just be buggy) shouldn't
                 # take the request handler down with an uncaught

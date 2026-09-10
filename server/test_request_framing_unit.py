@@ -166,6 +166,25 @@ h, sent = make_handler(
 check("identical duplicate Content-Length still 400s",
       h._require_body_client_id() is None and sent.get("code") == 400)
 
+# --- non-decimal Content-Length syntax rejected: int() alone would accept
+# --- "+16" or "1_6" as 16, letting a framing no downstream parser agrees
+# --- on slip through (review on #58). Only optional whitespace around
+# --- plain ASCII digits is valid. ---
+for weird in ("+16", "1_6", "0x10", "-5", "1.5", "١٦"):
+    h, sent = make_handler(
+        StubHeaders([("Content-Length", weird)]),
+        ExplodingReader(),
+    )
+    check(f"Content-Length {weird!r} gets 400, body unread",
+          h._require_body_client_id() is None and sent.get("code") == 400)
+
+h, sent = make_handler(
+    StubHeaders([("Content-Length", "  %d  " % len(body_bytes(payload)))]),
+    io.BytesIO(body_bytes(payload)),
+)
+check("OWS-padded decimal Content-Length still parses",
+      h._require_body_client_id() == {"client_id": "desk-01"})
+
 # --- regression pins: pre-existing behavior unchanged ---
 h, sent = make_handler(
     StubHeaders([("Content-Length", "garbage")]),
