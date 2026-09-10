@@ -111,16 +111,25 @@ check("oversized body gets 413 (not generic 400)",
 check("oversized body error names the problem",
       sent.get("obj", {}).get("error") == "payload too large")
 
-# --- exactly MAX_BODY_BYTES is still accepted at the framing layer ---
-edge_payload = '{"client_id": "desk-01", "pad": "%s"}' % (
-    "x" * (ac_server.MAX_BODY_BYTES - 100))
-edge_raw = body_bytes(edge_payload)
+# --- exactly MAX_BODY_BYTES still passes framing AND parses: build a
+# --- serialized body of precisely that size and run the full funnel ---
+edge_prefix = b'{"client_id": "desk-01", "pad": "'
+edge_suffix = b'"}'
+edge_raw = (edge_prefix + b"x" * (
+    ac_server.MAX_BODY_BYTES - len(edge_prefix) - len(edge_suffix))
+    + edge_suffix)
+assert len(edge_raw) == ac_server.MAX_BODY_BYTES
 h, sent = make_handler(
     StubHeaders([("Content-Length", str(len(edge_raw)))]),
     io.BytesIO(edge_raw),
 )
-check("body at the limit is not 413'd",
-      sent.get("code") != 413)
+check("body exactly at the limit parses with no error sent",
+      h._require_body_client_id() == {"client_id": "desk-01",
+                                      "pad": "x" * (
+                                          ac_server.MAX_BODY_BYTES
+                                          - len(edge_prefix)
+                                          - len(edge_suffix))}
+      and sent == {})
 
 # --- chunked Transfer-Encoding rejected even with no Content-Length ---
 h, sent = make_handler(
