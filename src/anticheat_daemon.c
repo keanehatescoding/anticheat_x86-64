@@ -3555,19 +3555,27 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
         return 0;
     }
 
-    /* Optional http:// or https:// scheme prefix — accept but ignore for
-     * now. Daemon still speaks plain HTTP over TCP; in a TLS deployment
+    /* Optional http:// or https:// scheme prefix — http:// is stripped
+     * silently; https:// is stripped too but with an explicit warning:
+     * the daemon still speaks plain HTTP over TCP (in a TLS deployment
      * the reverse proxy terminates TLS and this still connects via plain
-     * TCP to localhost (see THREAT_MODEL.md). Stripping the prefix lets
-     * an operator copy a full URL from documentation without getting a
-     * spurious "must be host:port" error, and keeps error messages
-     * referencing the original URL via orig_url. Path after port
-     * (e.g. /report) is also ignored — the request line is always
+     * TCP to localhost — see THREAT_MODEL.md), so an https:// URL must
+     * never be mistaken for an encrypted connection. Stripping the
+     * prefix lets an operator copy a full URL from documentation without
+     * getting a spurious "must be host:port" error, and keeps error
+     * messages referencing the original URL via orig_url. Path after
+     * port (e.g. /report) is also ignored — the request line is always
      * POST /report. */
     if (strncmp(url, "http://", 7) == 0)
         url += 7;
-    else if (strncmp(url, "https://", 8) == 0)
+    else if (strncmp(url, "https://", 8) == 0) {
+        fprintf(stderr,
+                "ac_report: AC_REPORT_URL uses an https:// scheme but the "
+                "daemon sends plain HTTP (no TLS) — connecting without "
+                "encryption; use a TLS-terminating reverse proxy or "
+                "unix:// for privacy (see THREAT_MODEL.md)\n");
         url += 8;
+    }
 
     /* TCP host:port — support both "host:port" and "[ipv6]:port".
      * Bracketed form is unambiguous for IPv6 literals; bare form keeps
