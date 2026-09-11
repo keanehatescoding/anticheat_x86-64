@@ -20,6 +20,11 @@
 #include "../src/anticheat_daemon.c"
 #undef main
 
+/* After the daemon include: it defines _GNU_SOURCE before its own system
+ * headers, and any system header included first would freeze feature
+ * macros without it (hiding secure_getenv/close_range). */
+#include <unistd.h>
+
 static int failures;
 
 #define CHECK(cond, msg) do { \
@@ -128,6 +133,54 @@ int main(void)
                   strlen(dest.sock_path) == cap - 1,
               "a unix socket path at exactly the longest length that "
               "fits is accepted");
+    }
+
+    {
+        /* https:// warns once per distinct URL, not once per report:
+         * ac_report() re-parses AC_REPORT_URL on every send. Capture
+         * stderr across repeated parses and count the warning lines. */
+        int pipefd[2], saved_stderr;
+        char cap[4096];
+        ssize_t n;
+        size_t total = 0;
+        int warnings;
+        const char *p;
+
+        CHECK(pipe(pipefd) == 0, "stderr capture pipe created");
+        saved_stderr = dup(STDERR_FILENO);
+        CHECK(saved_stderr >= 0, "stderr saved before capture");
+        CHECK(dup2(pipefd[1], STDERR_FILENO) >= 0,
+              "stderr redirected to capture pipe");
+
+        CHECK(ac_report_parse_url("https://example.com:8787", &dest) == 0,
+              "https:// URL still parses (first call)");
+        CHECK(ac_report_parse_url("https://example.com:8787", &dest) == 0,
+              "same https:// URL still parses (repeat call)");
+        CHECK(ac_report_parse_url("https://other.example:8787", &dest) == 0,
+              "distinct https:// URL still parses");
+        CHECK(ac_report_parse_url("http://example.com:8787", &dest) == 0 &&
+                  strcmp(dest.host, "example.com") == 0,
+              "http:// URL still parses with no warning");
+
+        fflush(stderr);
+        CHECK(dup2(saved_stderr, STDERR_FILENO) >= 0, "stderr restored");
+        close(saved_stderr);
+        close(pipefd[1]);
+        while ((n = read(pipefd[0], cap + total,
+                         sizeof(cap) - 1 - total)) > 0) {
+            total += (size_t)n;
+            if (total >= sizeof(cap) - 1)
+                break;
+        }
+        close(pipefd[0]);
+        cap[total] = '\0';
+
+        warnings = 0;
+        for (p = cap; (p = strstr(p, "https:// scheme")) != NULL; p++)
+            warnings++;
+        CHECK(warnings == 2,
+              "exactly two https downgrade warnings: one per distinct URL,"
+              " none for the repeat or http://");
     }
 
     if (failures) {

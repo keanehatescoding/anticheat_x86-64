@@ -3569,11 +3569,23 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
     if (strncmp(url, "http://", 7) == 0)
         url += 7;
     else if (strncmp(url, "https://", 8) == 0) {
-        fprintf(stderr,
-                "ac_report: AC_REPORT_URL uses an https:// scheme but the "
-                "daemon sends plain HTTP (no TLS) — connecting without "
-                "encryption; use a TLS-terminating reverse proxy or "
-                "unix:// for privacy (see THREAT_MODEL.md)\n");
+        /* One warning per distinct URL, not per report: ac_report()
+         * re-parses AC_REPORT_URL on every send, so warning
+         * unconditionally here would repeat on the monitoring path.
+         * URLs too long for the dedup slot keep warning every time
+         * (fail loud, same as the malformed-URL errors below). */
+        static char warned_url[1024];
+        static int have_warned = 0;
+        if (!have_warned || strcmp(warned_url, orig_url) != 0) {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL uses an https:// scheme but "
+                    "the daemon sends plain HTTP (no TLS) — connecting "
+                    "without encryption; use a TLS-terminating reverse "
+                    "proxy or unix:// for privacy (see THREAT_MODEL.md)\n");
+            if (snprintf(warned_url, sizeof(warned_url), "%s", orig_url) <
+                (int)sizeof(warned_url))
+                have_warned = 1;
+        }
         url += 8;
     }
 
