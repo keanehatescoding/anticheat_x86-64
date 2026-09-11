@@ -317,15 +317,17 @@ else
     fail "client_id with trailing newline should be 400 (got $CODE)"
 fi
 
-# 5. oversized body (> MAX_BODY_BYTES) -> 400
+# 5. oversized body (> MAX_BODY_BYTES) -> 413 (#30: a too-large report is
+# well-formed but too big, not a malformed request, so it gets its own
+# status instead of blending into generic 400s)
 BIG_DETAIL=$(python3 -c "print('x' * 5000)")
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
     -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
     -d "{\"client_id\":\"$CID\",\"event_type\":\"X\",\"detail\":\"$BIG_DETAIL\",\"ts\":1}")
-if [ "$CODE" = "400" ]; then
-    pass "oversized body rejected -> 400"
+if [ "$CODE" = "413" ]; then
+    pass "oversized body rejected -> 413"
 else
-    fail "oversized body should be 400 (got $CODE)"
+    fail "oversized body should be 413 (got $CODE)"
 fi
 
 # 6. malformed JSON -> 400

@@ -65,6 +65,7 @@ import collections
 import functools
 
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
 MAX_BODY_BYTES = 4096
 
 
@@ -854,16 +855,72 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             # timing side channel between candidates either.
             return any(hmac.compare_digest(got, k) for k in expected_keys)
 
+        def _check_body_framing(self):
+            # Returns None when the request framing is sane, otherwise a
+            # (status, error) pair the caller sends WITHOUT touching rfile.
+            # Three related #30 findings, one place: chunked bodies were
+            # never decoded (only a Content-Length contract is implied),
+            # duplicate Content-Lengths desync .get() from what the sender
+            # meant, and oversized bodies blended into generic 400s.
+            if self.headers.get("Transfer-Encoding") is not None:
+                # Any Transfer-Encoding (only chunked exists in practice)
+                # is unsupported: falling back to Content-Length beside
+                # chunked framing is exactly the request-smuggling shape
+                # RFC 9112 warns about, so reject outright instead of
+                # guessing which framing the sender meant.
+                return (400, "chunked transfer-encoding not supported")
+            lengths = self.headers.get_all("Content-Length") or []
+            if len(lengths) > 1:
+                # .get() below returns only the FIRST occurrence, so two
+                # differing lengths would desync the body read from what
+                # the sender meant. Strict even for identical pairs: the
+                # daemon never sends them, so a duplicate is always a
+                # buggy or hostile client, never a legit one worth
+                # accommodating.
+                return (400, "duplicate content-length")
+            length = self._parse_content_length(lengths[0] if lengths else "0")
+            if length is None:
+                return (400, "bad request")
+            if length > MAX_BODY_BYTES:
+                # Distinct from 400: 413 tells a legitimate client its
+                # report exceeds MAX_BODY_BYTES instead of looking like a
+                # malformed request.
+                return (413, "payload too large")
+            return None
+        @staticmethod
+        def _parse_content_length(raw):
+            # Strict ASCII-decimal parse: int() alone also accepts "_",
+            # sign, and surrounding whitespace ("1_6", "+16"), which
+            # would let a non-decimal framing slip past here while
+            # meaning something else to a downstream parser. Only
+            # optional whitespace around plain digits is valid.
+            text = (raw or "").strip(" \t")
+            if CONTENT_LENGTH_RE.fullmatch(text) is None:
+                return None
+            digits = text.lstrip("0") or "0"
+            if len(digits) > len(str(MAX_BODY_BYTES)):
+                # Far beyond any acceptable body: report it as oversized
+                # without calling int(), which raises ValueError past
+                # Python's sys.get_int_max_str_digits() limit (4300 by
+                # default) and would turn this into a 500 via _dispatch
+                # instead of a 413. Any digit string longer than "4096"
+                # exceeds MAX_BODY_BYTES by magnitude alone.
+                return MAX_BODY_BYTES + 1
+            return int(digits)
+
         def _read_json_body(self):
-            try:
-                length = int(self.headers.get("Content-Length", "0") or "0")
-            except ValueError:
+            length = self._parse_content_length(
+                self.headers.get("Content-Length", "0"))
+            if length is None:
                 # A client sending a garbage Content-Length (not
                 # necessarily malicious -- could just be buggy) shouldn't
                 # take the request handler down with an uncaught
                 # exception; treat it the same as any other bad request.
                 return None
             if length <= 0 or length > MAX_BODY_BYTES:
+                # >MAX is normally answered with 413 upstream in
+                # _check_body_framing; this stays as an invariant guard
+                # for any future direct caller.
                 return None
             raw = self.rfile.read(length)
             # event_type/detail ultimately derive from process comm names
@@ -890,11 +947,16 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 self._send_json(400, {"error": "invalid client_id"})
                 return False
             return True
-
         def _require_body_client_id(self):
             """Shared by every POST handler below: read+parse the JSON
             body and pull out a valid client_id, sending the appropriate
-            400 response and returning None if either step fails."""
+            4xx response (400, or 413 for an oversized body) and returning
+            None if any step fails."""
+            framing = self._check_body_framing()
+            if framing is not None:
+                status, error = framing
+                self._send_json(status, {"error": error})
+                return None
             body = self._read_json_body()
             if not isinstance(body, dict) or not body:
                 self._send_json(400, {"error": "bad request"})
