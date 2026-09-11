@@ -158,6 +158,8 @@ int main(void)
               "same https:// URL still parses (repeat call)");
         CHECK(ac_report_parse_url("https://other.example:8787", &dest) == 0,
               "distinct https:// URL still parses");
+        CHECK(ac_report_parse_url("https://example.com:8787", &dest) == 0,
+              "first https:// URL still parses after an intervening URL");
         CHECK(ac_report_parse_url("http://example.com:8787", &dest) == 0 &&
                   strcmp(dest.host, "example.com") == 0,
               "http:// URL still parses with no warning");
@@ -180,7 +182,7 @@ int main(void)
             warnings++;
         CHECK(warnings == 2,
               "exactly two https downgrade warnings: one per distinct URL,"
-              " none for the repeat or http://");
+              " none for repeats, A -> B -> A, or http://");
     }
 
     if (failures) {

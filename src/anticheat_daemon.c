@@ -3572,19 +3572,37 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
         /* One warning per distinct URL, not per report: ac_report()
          * re-parses AC_REPORT_URL on every send, so warning
          * unconditionally here would repeat on the monitoring path.
-         * URLs too long for the dedup slot keep warning every time
-         * (fail loud, same as the malformed-URL errors below). */
-        static char warned_url[1024];
-        static int have_warned = 0;
-        if (!have_warned || strcmp(warned_url, orig_url) != 0) {
+         * Remembers a bounded set of already-warned URLs, so an
+         * A -> B -> A sequence warns for A only the first time. The
+         * set freezes once full — further distinct URLs keep warning
+         * every time (fail loud, same as the malformed-URL errors
+         * below). Keys are truncated to the slot width; URLs sharing
+         * a long prefix may alias, which only costs a repeated UX
+         * hint, never a missed send. */
+        enum { HTTPS_WARN_URLS = 8, HTTPS_WARN_KEY = 256 };
+        static char warned[HTTPS_WARN_URLS][HTTPS_WARN_KEY];
+        static unsigned warned_n = 0;
+        char key[HTTPS_WARN_KEY];
+        unsigned i;
+        int seen = 0;
+
+        snprintf(key, sizeof(key), "%s", orig_url);
+        for (i = 0; i < warned_n; i++) {
+            if (strcmp(warned[i], key) == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
             fprintf(stderr,
                     "ac_report: AC_REPORT_URL uses an https:// scheme but "
                     "the daemon sends plain HTTP (no TLS) — connecting "
                     "without encryption; use a TLS-terminating reverse "
                     "proxy or unix:// for privacy (see THREAT_MODEL.md)\n");
-            if (snprintf(warned_url, sizeof(warned_url), "%s", orig_url) <
-                (int)sizeof(warned_url))
-                have_warned = 1;
+            if (warned_n < HTTPS_WARN_URLS) {
+                memcpy(warned[warned_n], key, sizeof(key));
+                warned_n++;
+            }
         }
         url += 8;
     }
