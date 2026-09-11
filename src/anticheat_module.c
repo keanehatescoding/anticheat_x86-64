@@ -2584,6 +2584,7 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     unsigned int n = 0;
+    unsigned int i;
     char *pathbuf;
 
     kvfree(st->vmas);
@@ -2654,14 +2655,13 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
                     strscpy(vi->path, p, sizeof(vi->path));
             }
         }
-        if ((vma->vm_flags & (VM_EXEC | VM_WRITE)) == (VM_EXEC | VM_WRITE)) {
+        /* Count only here: the AC_EV_RWX/AC_EV_ANON_EXEC emits are deferred
+         * until after mmap_read_unlock() below (#18) -- ac_emit() takes a
+         * spinlock, wakes waiters, and formats text, none of which belongs
+         * under the target's mmap lock. The stored vi fields
+         * (flags/is_file/path) carry everything the deferred loop needs. */
+        if ((vma->vm_flags & (VM_EXEC | VM_WRITE)) == (VM_EXEC | VM_WRITE))
             st->rwx_count++;
-            if (emit_events)
-                ac_emit(AC_EV_RWX, pid, "?",
-                        "RWX mapping [0x%llx-0x%llx] %s",
-                        vi->start, vi->end,
-                        vi->path[0] ? vi->path : "(anonymous)");
-        }
         if (!vi->is_file && (vma->vm_flags & VM_EXEC)) {
             /* No backing file at all -- legitimate executable code is always
              * backed by a file (the binary or a shared library) via mmap.
@@ -2673,10 +2673,6 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
              * on new entries appearing after a process is first observed,
              * not on the raw count. */
             st->anon_exec_count++;
-            if (emit_events)
-                ac_emit(AC_EV_ANON_EXEC, pid, "?",
-                        "anonymous executable mapping [0x%llx-0x%llx]",
-                        vi->start, vi->end);
         }
         if (vma->vm_flags & VM_EXEC)
             st->exec_count++;
@@ -2687,6 +2683,24 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
     mmput(mm);
     kfree(pathbuf);
     st->n_vmas = n;
+    /* Deferred emits (#18): same conditions as the counting loop above,
+     * re-derived from the snapshot (no vma/mm access -- the target's
+     * mmap_read_lock is already released). */
+    if (emit_events) {
+        for (i = 0; i < n; i++) {
+            struct ac_vma_info *e = &st->vmas[i];
+
+            if ((e->flags & (VM_EXEC | VM_WRITE)) == (VM_EXEC | VM_WRITE))
+                ac_emit(AC_EV_RWX, pid, "?",
+                        "RWX mapping [0x%llx-0x%llx] %s",
+                        e->start, e->end,
+                        e->path[0] ? e->path : "(anonymous)");
+            if (!e->is_file && (e->flags & VM_EXEC))
+                ac_emit(AC_EV_ANON_EXEC, pid, "?",
+                        "anonymous executable mapping [0x%llx-0x%llx]",
+                        e->start, e->end);
+        }
+    }
     return 0;
 }
 
