@@ -234,6 +234,8 @@ static unsigned long ac_stext;
 static unsigned long ac_etext;
 static unsigned long ac_text_end;   /* upper bound for "core kernel text" */
 
+static bool ac_entry_bad(unsigned long e);   /* fwd decl */
+static unsigned long ac_anchor;   /* fwd decl (tentative; defined below) */
 static bool ac_module_sane(const struct module *m);   /* fwd decl */
 
 static void ac_resolve_text_bounds(void)
@@ -285,6 +287,121 @@ static bool ac_addr_in_module(unsigned long addr)
     }
     rcu_read_unlock();
     return found;
+}
+
+/* ------------------------------------------------------------------ */
+/* module-core range snapshot for the syscall check below (#16).       */
+/*                                                                      */
+/* ac_check_syscalls() classifies up to __NR_syscalls (512) table      */
+/* entries, and each classification used to walk the whole module list  */
+/* via ac_addr_in_module() above -- up to 512 RCU walks per check,     */
+/* serialized behind ac_syscall_check_lock, with no cond_resched().    */
+/* Instead, snapshot every live module's core-text [start, end) once   */
+/* per check and classify entries against that. The snapshot holds     */
+/* only address bounds (no struct module pointers), so unlike the      */
+/* live walk it can't go stale in a way that risks a UAF -- the worst  */
+/* a racing load/unload can do is misclassify one entry for one poll,  */
+/* the same staleness the per-entry walk already had. When the         */
+/* snapshot can't be taken (allocation failure, or more live modules   */
+/* than the AC_MAX_MODS cap so the snapshot would be incomplete), the  */
+/* caller falls back to the live per-entry walk, i.e. pre-#16          */
+/* behavior.                                                            */
+/* ------------------------------------------------------------------ */
+struct ac_mod_range {
+    unsigned long start;
+    unsigned long end;   /* exclusive */
+};
+
+/* Returns the number of ranges stored in *out (kvmalloc'd, caller      */
+/* kvfree()s; *out is NULL with a 0 return when no snapshot could be   */
+/* taken).                                                              */
+static unsigned int ac_snapshot_mod_ranges(struct ac_mod_range **out)
+{
+    struct ac_mod_range *ranges;
+    struct module *m;
+    unsigned int n = 0;
+
+    *out = NULL;
+    ranges = kvmalloc_array(AC_MAX_MODS, sizeof(*ranges), GFP_KERNEL);
+    if (!ranges)
+        return 0;
+    rcu_read_lock();
+    list_for_each_entry_rcu(m, &THIS_MODULE->list, list) {
+        unsigned long base, size;
+
+        if (!ac_module_sane(m))
+            continue;
+        if (n >= AC_MAX_MODS)
+            break;
+        base = (unsigned long)m->mem[MOD_TEXT].base;
+        size = m->mem[MOD_TEXT].size;
+        ranges[n].start = base;
+        ranges[n].end = base + size;
+        n++;
+    }
+    rcu_read_unlock();
+    if (n >= AC_MAX_MODS) {
+        /* Hit the cap: the list may hold more modules than were stored, */
+        /* so this snapshot is potentially incomplete. Discard it and    */
+        /* let the caller fall back to the live walk rather than risk    */
+        /* treating an address inside an unlisted module as core text.   */
+        kvfree(ranges);
+        return 0;
+    }
+    *out = ranges;
+    return n;
+}
+
+static bool ac_addr_in_ranges(unsigned long addr,
+                              const struct ac_mod_range *ranges,
+                              unsigned int n)
+{
+    unsigned int i;
+
+    for (i = 0; i < n; i++) {
+        if (addr >= ranges[i].start && addr < ranges[i].end)
+            return true;
+    }
+    return false;
+}
+
+static bool ac_in_core_text_snapshot(unsigned long addr,
+                                     const struct ac_mod_range *ranges,
+                                     unsigned int n)
+{
+    if (!ac_stext || !ac_text_end)
+        return false;
+    if (addr < ac_stext || addr >= ac_text_end)
+        return false;
+    if (ac_addr_in_ranges(addr, ranges, n))
+        return false;
+    return true;
+}
+
+static bool ac_plausible_handler_snapshot(unsigned long e,
+                                          unsigned long anchor,
+                                          const struct ac_mod_range *ranges,
+                                          unsigned int n)
+{
+    if (!e)
+        return false;
+    if (ac_addr_in_ranges(e, ranges, n))
+        return false;
+    return e > anchor - 0x4000000UL && e < anchor + 0x4000000UL;
+}
+
+/* Snapshot-aware entry classification for ac_check_syscalls(). A NULL   */
+/* ranges (snapshot unavailable) falls back to the live per-entry walk  */
+/* in ac_entry_bad().                                                    */
+static bool ac_entry_bad_snapshot(unsigned long e,
+                                  const struct ac_mod_range *ranges,
+                                  unsigned int n)
+{
+    if (!ranges)
+        return ac_entry_bad(e);
+    if (ac_stext && ac_text_end)
+        return !ac_in_core_text_snapshot(e, ranges, n);
+    return !ac_plausible_handler_snapshot(e, ac_anchor, ranges, n);
 }
 
 static bool ac_in_core_text(unsigned long addr)
@@ -531,7 +648,8 @@ static void ac_capture_syscall_baseline(void)
 static int ac_check_syscalls(struct ac_syscall_check *out)
 {
     unsigned long base = ac_syscall_table;
-    unsigned int i;
+    unsigned int i, n_ranges = 0;
+    struct ac_mod_range *ranges = NULL;
     ac_sha256_ctx hash;
     uint8_t digest[32];
 
@@ -543,12 +661,20 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
     out->nr_syscalls = __NR_syscalls;
     out->baseline_ready = ac_syscall_baseline_ready;
 
+    /* #16: one module-list walk per check, not one per slot. Taken before
+     * the lock (GFP_KERNEL may sleep; the mutex is sleepable so this would
+     * be legal under it too, but there is no reason to hold the lock for
+     * the walk). A NULL snapshot falls back to the live per-entry walk
+     * inside ac_entry_bad_snapshot(). */
+    n_ranges = ac_snapshot_mod_ranges(&ranges);
+
     mutex_lock(&ac_syscall_check_lock);
     ac_sha256_init(&hash);
     for (i = 0; i < __NR_syscalls; i++) {
         unsigned long e = 0;
         bool bad, read_ok, have_baseline;
 
+        cond_resched();   /* #16: up to 512 slots under one mutex */
         read_ok = !ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e));
         have_baseline = ac_syscall_baseline_ready &&
                         test_bit(i, ac_baseline_captured);
@@ -594,8 +720,7 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
                 ac_sha256_hex(ac_syscall_baseline, sizeof(ac_syscall_baseline),
                               ac_syscall_baseline_hex);
                 clear_bit(i, ac_redirect_bitmap);
-            } else if (e != ac_syscall_baseline[i]) {
-                if (!ac_entry_bad(e)) {
+                if (!ac_entry_bad_snapshot(e, ranges, n_ranges)) {
                     /* still inside core text but a different handler than
                      * what was there at boot -- the in-text-redirect case. */
                     out->redirected++;
@@ -613,8 +738,7 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
 
         if (!e)
             continue;
-        out->total++;
-        bad = ac_entry_bad(e);
+        bad = ac_entry_bad_snapshot(e, ranges, n_ranges);
         if (bad) {
             out->non_text++;
             out->hooked++;
@@ -630,6 +754,7 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
                 sizeof(out->baseline_sha256));   /* after the loop: reflects
                                                     * any backfill above */
     mutex_unlock(&ac_syscall_check_lock);
+    kvfree(ranges);   /* NULL-safe; snapshot unused past the loop */
     ac_sha256_final(&hash, digest);
     ac_sha256_hex_digest(digest, out->current_sha256);
     out->checksum_mismatch = ac_syscall_baseline_ready &&
