@@ -320,6 +320,7 @@ static unsigned int ac_snapshot_mod_ranges(struct ac_mod_range **out)
     struct ac_mod_range *ranges;
     struct module *m;
     unsigned int n = 0;
+    bool truncated = false;
 
     *out = NULL;
     ranges = kvmalloc_array(AC_MAX_MODS, sizeof(*ranges), GFP_KERNEL);
@@ -331,8 +332,15 @@ static unsigned int ac_snapshot_mod_ranges(struct ac_mod_range **out)
 
         if (!ac_module_sane(m))
             continue;
-        if (n >= AC_MAX_MODS)
+        if (n >= AC_MAX_MODS) {
+            /* Array is full and another sane module exists: the snapshot
+             * would be incomplete. Flag it and stop; the caller falls
+             * back to the live walk. Testing the flag (not n == cap)
+             * keeps a snapshot with exactly AC_MAX_MODS entries, which
+             * is complete. */
+            truncated = true;
             break;
+        }
         base = (unsigned long)m->mem[MOD_TEXT].base;
         size = m->mem[MOD_TEXT].size;
         ranges[n].start = base;
@@ -340,11 +348,9 @@ static unsigned int ac_snapshot_mod_ranges(struct ac_mod_range **out)
         n++;
     }
     rcu_read_unlock();
-    if (n >= AC_MAX_MODS) {
-        /* Hit the cap: the list may hold more modules than were stored, */
-        /* so this snapshot is potentially incomplete. Discard it and    */
-        /* let the caller fall back to the live walk rather than risk    */
-        /* treating an address inside an unlisted module as core text.   */
+    if (truncated) {
+        /* Potentially incomplete: discard rather than risk treating an
+         * address inside an unlisted module as core text. */
         kvfree(ranges);
         return 0;
     }
@@ -738,6 +744,7 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
 
         if (!e)
             continue;
+        out->total++;
         bad = ac_entry_bad_snapshot(e, ranges, n_ranges);
         if (bad) {
             out->non_text++;
