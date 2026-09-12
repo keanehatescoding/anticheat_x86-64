@@ -3555,57 +3555,22 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
         return 0;
     }
 
-    /* Optional http:// or https:// scheme prefix — http:// is stripped
-     * silently; https:// is stripped too but with an explicit warning:
-     * the daemon still speaks plain HTTP over TCP (in a TLS deployment
-     * the reverse proxy terminates TLS and this still connects via plain
-     * TCP to localhost — see THREAT_MODEL.md), so an https:// URL must
-     * never be mistaken for an encrypted connection. Stripping the
-     * prefix lets an operator copy a full URL from documentation without
-     * getting a spurious "must be host:port" error, and keeps error
-     * messages referencing the original URL via orig_url. Path after
-     * port (e.g. /report) is also ignored — the request line is always
-     * POST /report. */
+    /* Optional http:// or https:// scheme prefix — stripped so an
+     * operator can copy a full URL from documentation without getting a
+     * spurious "must be host:port" error; error messages keep referencing
+     * the original URL via orig_url. The daemon still speaks plain HTTP
+     * over TCP even for https:// (in a TLS deployment the reverse proxy
+     * terminates TLS and this still connects via plain TCP to localhost
+     * — see THREAT_MODEL.md), so an https:// URL must never be mistaken
+     * for an encrypted connection: a successful parse below emits an
+     * explicit warning for it. Path after port (e.g. /report) is also
+     * ignored — the request line is always POST /report. */
+    int is_https = strncmp(url, "https://", 8) == 0;
+
     if (strncmp(url, "http://", 7) == 0)
         url += 7;
-    else if (strncmp(url, "https://", 8) == 0) {
-        /* One warning per distinct URL, not per report: ac_report()
-         * re-parses AC_REPORT_URL on every send, so warning
-         * unconditionally here would repeat on the monitoring path.
-         * Remembers a bounded set of already-warned URLs, so an
-         * A -> B -> A sequence warns for A only the first time. The
-         * set freezes once full — further distinct URLs keep warning
-         * every time (fail loud, same as the malformed-URL errors
-         * below). Keys are truncated to the slot width; URLs sharing
-         * a long prefix may alias, which only costs a repeated UX
-         * hint, never a missed send. */
-        enum { HTTPS_WARN_URLS = 8, HTTPS_WARN_KEY = 256 };
-        static char warned[HTTPS_WARN_URLS][HTTPS_WARN_KEY];
-        static unsigned warned_n = 0;
-        char key[HTTPS_WARN_KEY];
-        unsigned i;
-        int seen = 0;
-
-        snprintf(key, sizeof(key), "%s", orig_url);
-        for (i = 0; i < warned_n; i++) {
-            if (strcmp(warned[i], key) == 0) {
-                seen = 1;
-                break;
-            }
-        }
-        if (!seen) {
-            fprintf(stderr,
-                    "ac_report: AC_REPORT_URL uses an https:// scheme but "
-                    "the daemon sends plain HTTP (no TLS) — connecting "
-                    "without encryption; use a TLS-terminating reverse "
-                    "proxy or unix:// for privacy (see THREAT_MODEL.md)\n");
-            if (warned_n < HTTPS_WARN_URLS) {
-                memcpy(warned[warned_n], key, sizeof(key));
-                warned_n++;
-            }
-        }
+    else if (is_https)
         url += 8;
-    }
 
     /* TCP host:port — support both "host:port" and "[ipv6]:port".
      * Bracketed form is unambiguous for IPv6 literals; bare form keeps
@@ -3710,6 +3675,46 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
     }
     memcpy(out->host, host_start, host_len);
     out->host[host_len] = '\0';
+
+    /* https:// downgrade warning, emitted here at the success path rather
+     * than at the prefix strip so the key can be the parsed destination.
+     * The connection about to be made is plain HTTP (see the prefix-strip
+     * comment above) — warn once per distinct destination, not per
+     * report, since ac_report() re-parses AC_REPORT_URL on every send.
+     * Keyed on host:port, exact by construction: overlong hosts/ports
+     * are rejected above so the key always fits, an A -> B -> A sequence
+     * warns for A only the first time, and same-destination URLs
+     * differing only in the ignored path warn once. The set freezes once
+     * full — further distinct destinations keep warning every time (fail
+     * loud). Only reached for accepted URLs, so a rejected URL never
+     * warns (nothing is sent in plaintext). */
+    if (is_https) {
+        enum { HTTPS_WARN_DSTS = 8, HTTPS_WARN_KEY = 288 };
+        static char warned[HTTPS_WARN_DSTS][HTTPS_WARN_KEY];
+        static unsigned warned_n = 0;
+        char key[HTTPS_WARN_KEY];
+        unsigned i;
+        int seen = 0;
+
+        snprintf(key, sizeof(key), "%s:%s", out->host, out->port);
+        for (i = 0; i < warned_n; i++) {
+            if (strcmp(warned[i], key) == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL uses an https:// scheme but "
+                    "the daemon sends plain HTTP (no TLS) — connecting "
+                    "without encryption; use a TLS-terminating reverse "
+                    "proxy or unix:// for privacy (see THREAT_MODEL.md)\n");
+            if (warned_n < HTTPS_WARN_DSTS) {
+                memcpy(warned[warned_n], key, sizeof(key));
+                warned_n++;
+            }
+        }
+    }
     return 0;
 }
 

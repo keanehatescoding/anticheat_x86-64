@@ -164,6 +164,28 @@ int main(void)
                   strcmp(dest.host, "example.com") == 0,
               "http:// URL still parses with no warning");
 
+        /* Two distinct destinations sharing a 250-byte prefix must each
+         * warn: a raw-string key truncated to 255 bytes would alias them
+         * (the difference sits past any such truncation point). */
+        {
+            char ha[300], hb[300], ua[320], ub[320];
+
+            memset(ha, 'a', 250);
+            strcpy(ha + 250, "1x");
+            memset(hb, 'a', 250);
+            strcpy(hb + 250, "2x");
+            snprintf(ua, sizeof(ua), "https://%s:8787", ha);
+            snprintf(ub, sizeof(ub), "https://%s:8787", hb);
+            CHECK(ac_report_parse_url(ua, &dest) == 0,
+                  "long https:// URL still parses (first destination)");
+            CHECK(ac_report_parse_url(ub, &dest) == 0,
+                  "long https:// URL still parses (distinct destination "
+                  "sharing a 250-byte prefix)");
+        }
+        CHECK(ac_report_parse_url("https://example.com:8787/ignored/path",
+                                  &dest) == 0,
+              "same-destination URL with an ignored path still parses");
+
         fflush(stderr);
         CHECK(dup2(saved_stderr, STDERR_FILENO) >= 0, "stderr restored");
         close(saved_stderr);
@@ -180,9 +202,10 @@ int main(void)
         warnings = 0;
         for (p = cap; (p = strstr(p, "https:// scheme")) != NULL; p++)
             warnings++;
-        CHECK(warnings == 2,
-              "exactly two https downgrade warnings: one per distinct URL,"
-              " none for repeats, A -> B -> A, or http://");
+        CHECK(warnings == 4,
+              "exactly four https downgrade warnings: one per distinct "
+              "destination, none for repeats, A -> B -> A, the ignored "
+              "path, or http://");
     }
 
     if (failures) {
