@@ -20,6 +20,11 @@
 #include "../src/anticheat_daemon.c"
 #undef main
 
+/* After the daemon include: it defines _GNU_SOURCE before its own system
+ * headers, and any system header included first would freeze feature
+ * macros without it (hiding secure_getenv/close_range). */
+#include <unistd.h>
+
 static int failures;
 
 #define CHECK(cond, msg) do { \
@@ -128,6 +133,79 @@ int main(void)
                   strlen(dest.sock_path) == cap - 1,
               "a unix socket path at exactly the longest length that "
               "fits is accepted");
+    }
+
+    {
+        /* https:// warns once per distinct URL, not once per report:
+         * ac_report() re-parses AC_REPORT_URL on every send. Capture
+         * stderr across repeated parses and count the warning lines. */
+        int pipefd[2], saved_stderr;
+        char cap[4096];
+        ssize_t n;
+        size_t total = 0;
+        int warnings;
+        const char *p;
+
+        CHECK(pipe(pipefd) == 0, "stderr capture pipe created");
+        saved_stderr = dup(STDERR_FILENO);
+        CHECK(saved_stderr >= 0, "stderr saved before capture");
+        CHECK(dup2(pipefd[1], STDERR_FILENO) >= 0,
+              "stderr redirected to capture pipe");
+
+        CHECK(ac_report_parse_url("https://example.com:8787", &dest) == 0,
+              "https:// URL still parses (first call)");
+        CHECK(ac_report_parse_url("https://example.com:8787", &dest) == 0,
+              "same https:// URL still parses (repeat call)");
+        CHECK(ac_report_parse_url("https://other.example:8787", &dest) == 0,
+              "distinct https:// URL still parses");
+        CHECK(ac_report_parse_url("https://example.com:8787", &dest) == 0,
+              "first https:// URL still parses after an intervening URL");
+        CHECK(ac_report_parse_url("http://example.com:8787", &dest) == 0 &&
+                  strcmp(dest.host, "example.com") == 0,
+              "http:// URL still parses with no warning");
+
+        /* Two distinct destinations sharing a 250-byte prefix must each
+         * warn: a raw-string key truncated to 255 bytes would alias them
+         * (the difference sits past any such truncation point). */
+        {
+            char ha[300], hb[300], ua[320], ub[320];
+
+            memset(ha, 'a', 250);
+            strcpy(ha + 250, "1x");
+            memset(hb, 'a', 250);
+            strcpy(hb + 250, "2x");
+            snprintf(ua, sizeof(ua), "https://%s:8787", ha);
+            snprintf(ub, sizeof(ub), "https://%s:8787", hb);
+            CHECK(ac_report_parse_url(ua, &dest) == 0,
+                  "long https:// URL still parses (first destination)");
+            CHECK(ac_report_parse_url(ub, &dest) == 0,
+                  "long https:// URL still parses (distinct destination "
+                  "sharing a 250-byte prefix)");
+        }
+        CHECK(ac_report_parse_url("https://example.com:8787/ignored/path",
+                                  &dest) == 0,
+              "same-destination URL with an ignored path still parses");
+
+        fflush(stderr);
+        CHECK(dup2(saved_stderr, STDERR_FILENO) >= 0, "stderr restored");
+        close(saved_stderr);
+        close(pipefd[1]);
+        while ((n = read(pipefd[0], cap + total,
+                         sizeof(cap) - 1 - total)) > 0) {
+            total += (size_t)n;
+            if (total >= sizeof(cap) - 1)
+                break;
+        }
+        close(pipefd[0]);
+        cap[total] = '\0';
+
+        warnings = 0;
+        for (p = cap; (p = strstr(p, "https:// scheme")) != NULL; p++)
+            warnings++;
+        CHECK(warnings == 4,
+              "exactly four https downgrade warnings: one per distinct "
+              "destination, none for repeats, A -> B -> A, the ignored "
+              "path, or http://");
     }
 
     if (failures) {
