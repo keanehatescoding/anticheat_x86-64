@@ -296,16 +296,18 @@ static bool ac_addr_in_module(unsigned long addr)
 /* entries, and each classification used to walk the whole module list  */
 /* via ac_addr_in_module() above -- up to 512 RCU walks per check,     */
 /* serialized behind ac_syscall_check_lock, with no cond_resched().    */
-/* Instead, snapshot every live module's core-text [start, end) once   */
-/* per check and classify entries against that. The snapshot holds     */
-/* only address bounds (no struct module pointers), so unlike the      */
-/* live walk it can't go stale in a way that risks a UAF -- the worst  */
-/* a racing load/unload can do is misclassify one entry for one poll,  */
-/* the same staleness the per-entry walk already had. When the         */
-/* snapshot can't be taken (allocation failure, or more live modules   */
-/* than the AC_MAX_MODS cap so the snapshot would be incomplete), the  */
-/* caller falls back to the live per-entry walk, i.e. pre-#16          */
-/* behavior.                                                            */
+/* Instead, snapshot every live module's core ranges once per check    */
+/* and classify entries against that. Every core mem type is stored    */
+/* (TEXT/DATA/RODATA/RO_AFTER_INIT, the same set within_module_core()  */
+/* checks in the walk this replaces) -- a TEXT-only snapshot would     */
+/* miss handlers pointing into a module's core data/rodata. The        */
+/* snapshot holds only address bounds (no struct module pointers), so  */
+/* unlike the live walk it can't go stale in a way that risks a UAF -- */
+/* the worst a racing load/unload can do is misclassify one entry for  */
+/* one poll, the same staleness the per-entry walk already had. When   */
+/* the snapshot can't be taken (allocation failure, or more ranges     */
+/* than the cap so the snapshot would be incomplete), the caller falls */
+/* back to the live per-entry walk, i.e. pre-#16 behavior.             */
 /* ------------------------------------------------------------------ */
 struct ac_mod_range {
     unsigned long start;
@@ -319,38 +321,47 @@ static unsigned int ac_snapshot_mod_ranges(struct ac_mod_range **out)
 {
     struct ac_mod_range *ranges;
     struct module *m;
-    unsigned int n = 0;
+    unsigned int n = 0, cap = AC_MAX_MODS * MOD_MEM_NUM_TYPES;
     bool truncated = false;
 
     *out = NULL;
-    ranges = kvmalloc_array(AC_MAX_MODS, sizeof(*ranges), GFP_KERNEL);
+    ranges = kvmalloc_array(cap, sizeof(*ranges), GFP_KERNEL);
     if (!ranges)
         return 0;
     rcu_read_lock();
     list_for_each_entry_rcu(m, &THIS_MODULE->list, list) {
-        unsigned long base, size;
-
         if (!ac_module_sane(m))
             continue;
-        if (n >= AC_MAX_MODS) {
-            /* Array is full and another sane module exists: the snapshot
-             * would be incomplete. Flag it and stop; the caller falls
-             * back to the live walk. Testing the flag (not n == cap)
-             * keeps a snapshot with exactly AC_MAX_MODS entries, which
-             * is complete. */
-            truncated = true;
-            break;
+        for_class_mod_mem_type(type, core) {
+            unsigned long base = (unsigned long)m->mem[type].base;
+            unsigned long size = m->mem[type].size;
+
+            /* Per-range bogus-entry guard, same 1 GiB bound as
+             * ac_module_sane()'s TEXT check: within_module_mem_type()
+             * uses addr - base < size, so a torn base/size pair here
+             * would make one range claim every address. */
+            if (!base || !size || size > 0x40000000UL)
+                continue;
+            if (n >= cap) {
+                /* Array is full and another live range exists: the
+                 * snapshot would be incomplete. Flag it and stop; the
+                 * caller falls back to the live walk. Testing the flag
+                 * (not n == cap) keeps a snapshot that exactly fills
+                 * the array, which is complete. */
+                truncated = true;
+                break;
+            }
+            ranges[n].start = base;
+            ranges[n].end = base + size;
+            n++;
         }
-        base = (unsigned long)m->mem[MOD_TEXT].base;
-        size = m->mem[MOD_TEXT].size;
-        ranges[n].start = base;
-        ranges[n].end = base + size;
-        n++;
+        if (truncated)
+            break;
     }
     rcu_read_unlock();
     if (truncated) {
         /* Potentially incomplete: discard rather than risk treating an
-         * address inside an unlisted module as core text. */
+         * address inside an unlisted module range as core text. */
         kvfree(ranges);
         return 0;
     }
@@ -726,6 +737,7 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
                 ac_sha256_hex(ac_syscall_baseline, sizeof(ac_syscall_baseline),
                               ac_syscall_baseline_hex);
                 clear_bit(i, ac_redirect_bitmap);
+            } else if (e != ac_syscall_baseline[i]) {
                 if (!ac_entry_bad_snapshot(e, ranges, n_ranges)) {
                     /* still inside core text but a different handler than
                      * what was there at boot -- the in-text-redirect case. */
