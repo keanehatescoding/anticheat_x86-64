@@ -3396,6 +3396,7 @@ static void ac_clear_protected(void)
 static int __init ac_init(void)
 {
     int ret;
+    bool degraded;
 
     /*
      * ac_schedule_kill() (see below) queues a tiny, non-blocking work item
@@ -3483,6 +3484,14 @@ static int __init ac_init(void)
         return ret;
     }
 
+    /* Any reason the module is running with less than its full set of
+     * defenses. Both sources have to feed the load line below, or the two
+     * channels contradict each other: a missing syscall table emits a
+     * "loaded DEGRADED" event to the daemon, so an untagged load line in
+     * dmesg would tell an operator the opposite of what the daemon was
+     * being told. */
+    degraded = ac_degraded[0] || !ac_syscall_table;
+
     if (ac_degraded[0]) {
         /* Loud on both channels: the kernel log for an operator reading
          * dmesg, and the event ring so the daemon reports degraded
@@ -3503,7 +3512,7 @@ static int __init ac_init(void)
 
     pr_info("loaded (policy=0x%x, %u kprobes, %u kretprobes, %u protected slots)%s\n",
             ac_policy, ac_kprobes_registered, ac_kretprobes_registered,
-            AC_PROT_MAX, ac_degraded[0] ? " [DEGRADED]" : "");
+            AC_PROT_MAX, degraded ? " [DEGRADED]" : "");
     return 0;
 }
 
