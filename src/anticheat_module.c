@@ -534,17 +534,36 @@ static void ac_derive_bounds(unsigned long base, unsigned long anchor)
             ac_stext = lo & ~0x1FFFFFUL;                 /* 2 MB round down */
         if (!ac_text_end) {
             ac_text_end = derived_end;
-        } else if (ac_text_end_guessed && derived_end < ac_text_end) {
+        } else if (ac_text_end_guessed && derived_end != ac_text_end) {
             /* Only _stext resolved, so ac_text_end is the 512 MB
-             * placeholder rather than a real section address. Every
-             * legitimate entry in the table just scanned is <= hi by
-             * construction, so narrowing to the derived bound can't
-             * reclassify a genuine handler as hooked -- it only stops the
-             * placeholder from vouching for hundreds of megabytes of
+             * placeholder rather than a real section address. It is a
+             * guess, so the table-derived bound supersedes it in both
+             * directions -- keeping the guess in either direction is
+             * strictly worse than trusting what the scan just observed.
+             *
+             * Narrowing is the case that matters in practice: it stops
+             * the placeholder from vouching for hundreds of megabytes of
              * non-text image that a redirected entry could be pointed at.
-             * Strictly narrowing (never widening) keeps this a
-             * no-worse-than-before change in every other layout. */
-            pr_info("narrowing guessed text end 0x%lx -> 0x%lx (table-derived)\n",
+             * Every legitimate entry in the table just scanned is <= hi
+             * by construction, so it cannot reclassify a genuine handler
+             * as hooked.
+             *
+             * Widening is about correctness rather than strength. If a
+             * handler we just accepted sits at or past the placeholder,
+             * the placeholder is demonstrably too small, and keeping it
+             * would make ac_in_core_text() report that genuine handler as
+             * hooked on every subsequent check. The widened bound still
+             * only covers addresses up to the highest handler actually
+             * observed, which ac_plausible_handler() already clamps to
+             * anchor +/- 64 MB -- it cannot run away.
+             *
+             * That second case is currently unreachable: the anchor is a
+             * syscall handler inside text, so reaching the 512 MB
+             * placeholder would need a kernel text section larger than
+             * 448 MB. It is handled anyway rather than left to depend on
+             * an undocumented relationship between two unrelated
+             * constants, either of which a later change could move. */
+            pr_info("replacing guessed text end 0x%lx -> 0x%lx (table-derived)\n",
                     ac_text_end, derived_end);
             ac_text_end = derived_end;
         }
@@ -2713,16 +2732,25 @@ static const bool ac_kretp_essential[ARRAY_SIZE(ac_kretprobes)] = {
     false, false,   /* execve, execveat (compat) */
 };
 
-/* Names of the essential probes that failed to register, for the degraded
- * -mode report in ac_init(). Empty when everything expected is in place. */
-static char ac_degraded[256];
+/* Essential probes that failed to register, for the degraded-mode report
+ * in ac_init(). Empty when everything expected is in place.
+ *
+ * Kept as a list of names rather than one pre-joined string: the joined
+ * form runs to ~200 bytes with every essential probe missing, and an
+ * ac_emit() payload is AC_EVENT_DATA (128) bytes, so reporting it as a
+ * single event would silently hand the daemon a truncated list. The
+ * entries point at the .symbol_name string literals in the probe
+ * definitions above, which have static storage duration, so nothing is
+ * copied and nothing dangles. */
+static const char *ac_degraded_names[ARRAY_SIZE(ac_kprobes) +
+                                     ARRAY_SIZE(ac_kretprobes)];
+static unsigned int ac_degraded_n;
 
 static void ac_register_kprobes(void)
 {
     unsigned int i;
-    size_t used = 0;
 
-    ac_degraded[0] = '\0';
+    ac_degraded_n = 0;
     for (i = 0; i < ARRAY_SIZE(ac_kprobes); i++) {
         int ret = register_kprobe(ac_kprobes[i]);
         const char *name = ac_kprobes[i]->symbol_name;
@@ -2739,8 +2767,7 @@ static void ac_register_kprobes(void)
         }
         pr_err("kprobe %s FAILED to register: %d -- the defense it provides is NOT active\n",
                name, ret);
-        used += scnprintf(ac_degraded + used, sizeof(ac_degraded) - used,
-                          "%s%s", used ? ", " : "", name);
+        ac_degraded_names[ac_degraded_n++] = name;
     }
     for (i = 0; i < ARRAY_SIZE(ac_kretprobes); i++) {
         int ret = register_kretprobe(ac_kretprobes[i]);
@@ -2758,8 +2785,7 @@ static void ac_register_kprobes(void)
         }
         pr_err("kretprobe %s FAILED to register: %d -- the defense it provides is NOT active\n",
                name, ret);
-        used += scnprintf(ac_degraded + used, sizeof(ac_degraded) - used,
-                          "%s%s", used ? ", " : "", name);
+        ac_degraded_names[ac_degraded_n++] = name;
     }
 }
 
@@ -3562,9 +3588,12 @@ static int __init ac_init(void)
      * "loaded DEGRADED" event to the daemon, so an untagged load line in
      * dmesg would tell an operator the opposite of what the daemon was
      * being told. */
-    degraded = ac_degraded[0] || !ac_syscall_table;
+    degraded = ac_degraded_n || !ac_syscall_table;
 
-    if (ac_degraded[0]) {
+    if (ac_degraded_n) {
+        char list[256];
+        unsigned int used = 0, i;
+
         /* Loud on both channels: the kernel log for an operator reading
          * dmesg, and the event ring so the daemon reports degraded
          * coverage in-band instead of assuming a module that loaded is a
@@ -3572,11 +3601,23 @@ static int __init ac_init(void)
          * remaining defenses are still worth having, and refusing to load
          * outright would leave a kernel with one renamed symbol with no
          * protection at all rather than most of it. */
+        for (i = 0; i < ac_degraded_n; i++)
+            used += scnprintf(list + used, sizeof(list) - used,
+                              "%s%s", used ? ", " : "", ac_degraded_names[i]);
         pr_err("DEGRADED: probes unavailable (%s) -- the corresponding defenses are NOT active on this kernel\n",
-               ac_degraded);
-        ac_emit(AC_EV_INFO, 0, "?",
-                "module loaded DEGRADED: probes unavailable (%s); corresponding defenses inactive",
-                ac_degraded);
+               list);
+
+        /* One event per probe, not one event carrying the joined list: an
+         * ac_emit() payload is AC_EVENT_DATA (128) bytes and the joined
+         * list reaches ~200, so a single event would truncate and tell the
+         * daemon about only the first few probes -- the rest would look
+         * healthy. Each name is carried with its position so a consumer
+         * can tell a complete report from a dropped one (the ring drops
+         * oldest-first under pressure). */
+        for (i = 0; i < ac_degraded_n; i++)
+            ac_emit(AC_EV_INFO, 0, "?",
+                    "module loaded DEGRADED (%u/%u): probe %s unavailable; corresponding defense inactive",
+                    i + 1, ac_degraded_n, ac_degraded_names[i]);
     }
     if (!ac_syscall_table)
         ac_emit(AC_EV_INFO, 0, "?",
