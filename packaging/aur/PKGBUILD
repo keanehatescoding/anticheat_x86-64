@@ -12,7 +12,7 @@ pkgver=1.0.0
 pkgrel=1
 pkgdesc="Kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection"
 arch=('x86_64')
-url="https://github.com/keanehatescoding/hypranticheat"
+url="https://github.com/keanehatescoding/anticheat_x86-64"
 license=('GPL-2.0-only')
 makedepends=('dkms')
 # A git+#tag= VCS source is always sha256sums=('SKIP') by design (there's
@@ -21,11 +21,24 @@ makedepends=('dkms')
 # An immutable release tarball avoids that: the checksum below is real
 # and `updpkgsums` (see RELEASING.md step 7) actually computes it,
 # instead of being a no-op against a VCS source.
-source=("$pkgbase-$pkgver.tar.gz::https://github.com/keanehatescoding/hypranticheat/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('SKIP') # placeholder until v${pkgver} is tagged upstream and `updpkgsums` can fetch it for real -- see RELEASING.md
+source=("$pkgbase-$pkgver.tar.gz::https://github.com/keanehatescoding/anticheat_x86-64/archive/refs/tags/v${pkgver}.tar.gz")
+# The directory that tarball actually extracts to. GitHub names it
+# <repo>-<tag minus the leading v>, and the repo is not $pkgbase -- the
+# AUR package is `hypranticheat`, the repository is `anticheat_x86-64`.
+# The `::` above renames only the downloaded file, never its contents,
+# so every cd below has to use this and not $pkgbase. (Named
+# _srcname rather than _srcdir to keep it clearly distinct from
+# makepkg's own $srcdir.)
+_srcname=anticheat_x86-64
+# Placeholder until v${pkgver} is tagged upstream and `updpkgsums` can
+# fetch a real tarball to hash -- see RELEASING.md step 7.  It is not
+# left to memory: scripts/check-aur-checksum.sh (run by ci.yml on
+# every push) accepts 'SKIP' only while that tag is genuinely absent,
+# and fails as soon as it exists.
+sha256sums=('SKIP')
 
 build() {
-    cd "$pkgbase-$pkgver"
+    cd "$_srcname-$pkgver"
     # The Makefile's own CFLAGS default (-O2 -Wall -Wextra) has no
     # hardening flags of its own; makepkg's environment already carries
     # them (see /etc/makepkg.conf), so pass both through explicitly
@@ -39,7 +52,7 @@ package_hypranticheat() {
     depends=('glibc')
     optdepends=('hypranticheat-dkms: kernel-level detection -- required for real use; the daemon alone can only run against its userspace mock')
 
-    cd "$pkgbase-$pkgver"
+    cd "$_srcname-$pkgver"
     install -Dm755 anticheat "$pkgdir/usr/bin/anticheat"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 THREAT_MODEL.md "$pkgdir/usr/share/doc/$pkgname/THREAT_MODEL.md"
@@ -66,7 +79,7 @@ package_hypranticheat-dkms() {
     # same protection every other /etc config file on the system gets.
     backup=('etc/dkms/framework.conf.d/anticheat.conf')
 
-    cd "$pkgbase-$pkgver"
+    cd "$_srcname-$pkgver"
     local _dkmsdir="$pkgdir/usr/src/anticheat-${pkgver}"
     install -Dm644 Makefile "$_dkmsdir/Makefile"
     install -Dm644 dkms.conf "$_dkmsdir/dkms.conf"

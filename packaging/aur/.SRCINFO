@@ -2,11 +2,11 @@ pkgbase = hypranticheat
 	pkgdesc = Kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection
 	pkgver = 1.0.0
 	pkgrel = 1
-	url = https://github.com/keanehatescoding/hypranticheat
+	url = https://github.com/keanehatescoding/anticheat_x86-64
 	arch = x86_64
 	license = GPL-2.0-only
 	makedepends = dkms
-	source = hypranticheat-1.0.0.tar.gz::https://github.com/keanehatescoding/hypranticheat/archive/refs/tags/v1.0.0.tar.gz
+	source = hypranticheat-1.0.0.tar.gz::https://github.com/keanehatescoding/anticheat_x86-64/archive/refs/tags/v1.0.0.tar.gz
 	sha256sums = SKIP
 
 pkgname = hypranticheat

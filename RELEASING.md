@@ -83,13 +83,31 @@ the same protocol" case this guards against), independent of whatever
    need root). This is **not** a substitute for real load-time testing of
    the kernel module on a live kernel — see point 5 above — just a check
    that the one asset actually shipped isn't obviously broken.
-7. Update the AUR package (`PKGBUILD`) to match:
+7. Update the AUR package (`PKGBUILD`) to match — **in this repo's
+   `packaging/aur/` working copy first, then in the AUR package's own
+   git checkout.** Both, not just one: the copy here is what CI checks,
+   and the copy there is what actually publishes.
+
+   ```sh
+   cd packaging/aur
+   sed -i "s/^pkgver=.*/pkgver=<VERSION>/; s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+   updpkgsums                        # real digest replaces the SKIP
+   makepkg --printsrcinfo > .SRCINFO   # AUR enforces *this* file's digest
+   cd - && ./scripts/check-aur-checksum.sh
+   ```
+
+   `updpkgsums` is not optional bookkeeping here. Until the tag from step
+   4 exists there is no tarball to hash, so `sha256sums` sits at the
+   `SKIP` placeholder — which, once the tarball does exist, means the
+   package installs whatever bytes that URL happens to serve, unchecked.
+   `scripts/check-aur-checksum.sh` is the backstop: it tolerates `SKIP`
+   only while `v<pkgver>` is untagged, and `ci.yml` runs it on every
+   push, so forgetting this step turns `master` red rather than shipping
+   quietly (see keanehatescoding/anticheat-arm64#46). Commit the updated
+   `packaging/aur/` copy like any other change, then mirror it:
 
    ```sh
    # in the AUR package's own git checkout, not this repo:
-   sed -i "s/^pkgver=.*/pkgver=<VERSION>/; s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-   updpkgsums
-   makepkg --printsrcinfo > .SRCINFO
    git commit -am "Update to v<VERSION>" && git push
    ```
 

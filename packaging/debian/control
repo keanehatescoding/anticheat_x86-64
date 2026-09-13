@@ -5,7 +5,7 @@ Maintainer: keanehatescoding <noreply@users.noreply.github.com>
 Build-Depends: debhelper-compat (= 13)
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
-Homepage: https://github.com/keanehatescoding/hypranticheat
+Homepage: https://github.com/keanehatescoding/anticheat_x86-64
 
 Package: hypranticheat
 Architecture: amd64

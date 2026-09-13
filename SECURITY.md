@@ -14,7 +14,7 @@ Please **do not** open a public issue for a security vulnerability.
 
 Instead, use GitHub's private vulnerability reporting:
 
-**[Report a vulnerability](https://github.com/keanehatescoding/anticheat/security/advisories/new)**
+**[Report a vulnerability](https://github.com/keanehatescoding/anticheat_x86-64/security/advisories/new)**
 
 This opens a private advisory visible only to you and the maintainer until a fix ships.
 

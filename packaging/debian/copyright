@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: hypranticheat
-Source: https://github.com/keanehatescoding/hypranticheat
+Source: https://github.com/keanehatescoding/anticheat_x86-64
 
 Files: *
 Copyright: keanehatescoding and contributors
