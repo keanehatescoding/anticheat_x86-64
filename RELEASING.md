@@ -104,12 +104,25 @@ the same protocol" case this guards against), independent of whatever
    only while `v<pkgver>` is untagged, and `ci.yml` runs it on every
    push, so forgetting this step turns `master` red rather than shipping
    quietly (see keanehatescoding/anticheat-arm64#46). Commit the updated
-   `packaging/aur/` copy like any other change, then mirror it:
+   `packaging/aur/` copy like any other change, then mirror it across —
+   every edit above happened *here*, so the AUR checkout is still holding
+   the old `pkgver` and the old `SKIP` until the files are copied into
+   it:
 
    ```sh
-   # in the AUR package's own git checkout, not this repo:
-   git commit -am "Update to v<VERSION>" && git push
+   # from this repo's root; `git -C` so there is no doubt which checkout
+   # each command acts on:
+   AUR=<path-to-aur-checkout>
+   cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO "$AUR/"
+   git -C "$AUR" diff --stat   # expect both files listed as changed
+   git -C "$AUR" commit -am "Update to v<VERSION>" && git -C "$AUR" push
    ```
+
+   If that `commit` reports *nothing to commit*, the `cp` did not land:
+   the `&&` then swallows the `push` and the release has **not** reached
+   AUR, however clean the output looks. `check-aur-checksum.sh` will not
+   catch this either — it reads this repo's copy, which by then is
+   correct.
 
    (`pkgrel` only bumps on its own, without a `pkgver` change, if the
    *packaging* changes but upstream didn't — e.g. a PKGBUILD fix.)
