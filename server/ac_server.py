@@ -49,6 +49,7 @@ import hmac
 import http.server
 import ipaddress
 import json
+import math
 import os
 import re
 import signal
@@ -1032,12 +1033,24 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             client_id = body["client_id"]
             event_type = body.get("event_type")
             detail = body.get("detail")
-            client_ts = body.get("ts")
             if not isinstance(event_type, str) or len(event_type) > 64:
                 return self._send_json(400, {"error": "invalid event_type"})
             if not isinstance(detail, str) or len(detail) > 2000:
                 return self._send_json(400, {"error": "invalid detail"})
-            if not isinstance(client_ts, (int, float)):
+            client_ts = body.get("ts")
+            if "ts" in body:
+                # isinstance(True, int) is True, so bool needs its own
+                # carve-out: True == 1 would otherwise store a real report
+                # timestamp as 1 (verified: {"ts": true} -> 201, stored 1).
+                # Non-finite floats (NaN/Infinity, which json parses by
+                # default) would land in an INTEGER column as REAL junk.
+                if isinstance(client_ts, bool) or not isinstance(
+                    client_ts, (int, float)
+                ):
+                    return self._send_json(400, {"error": "invalid ts"})
+                if isinstance(client_ts, float) and not math.isfinite(client_ts):
+                    return self._send_json(400, {"error": "invalid ts"})
+            else:
                 client_ts = None
             store.add_report(
                 client_id, event_type, detail, client_ts, self._client_ip()
