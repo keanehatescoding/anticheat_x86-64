@@ -87,23 +87,24 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
  * too, for the same reason ac_schedule_kill() does. */
 static struct workqueue_struct *ac_wq;
 
-/* Backing pools for the two deferred-work request structs allocated from
- * kprobe/kretprobe (atomic) context: struct ac_prot_add_req (fork-inherit/
- * exec-rekey registration, further down) and struct ac_prot_release_req
- * (mmu_notifier cleanup for an organically-exited mm, in the registry
- * section below). A plain kmalloc(GFP_ATOMIC) there can fail under memory
- * pressure -- silently dropping either request isn't just a missed event:
- * dropping an add/rekey leaves a should-be-protected mm unregistered
- * (ptrace/process_vm defenses would let an attacker through), and dropping
- * a release leaks the slot's mmu_notifier registration and its mm_count
- * reference permanently. mempool_alloc() falls back to a small pre-reserved
- * pool instead of returning NULL there, the standard kernel pattern for
- * atomic-context allocations that must not fail. Sized to AC_PROT_MAX: that
- * many concurrent in-flight requests already implies as many address
- * spaces are mid-transition, which is the same order of magnitude the
- * registry itself is bounded to. */
+/* Backing pool for struct ac_prot_add_req (fork-inherit/exec-rekey
+ * registration, further down), which is allocated from kprobe/kretprobe
+ * (atomic) context. A plain kmalloc(GFP_ATOMIC) there can fail under
+ * memory pressure, and silently dropping such a request isn't just a
+ * missed event -- it leaves a should-be-protected mm unregistered, so the
+ * ptrace/process_vm defenses would let an attacker through.
+ * mempool_alloc() falls back to a small pre-reserved pool instead of
+ * returning NULL there, the standard kernel pattern for atomic-context
+ * allocations that must not fail. Sized to AC_PROT_MAX: that many
+ * concurrent in-flight requests already implies as many address spaces
+ * are mid-transition, which is the same order of magnitude the registry
+ * itself is bounded to.
+ *
+ * The registry's other deferred-work item -- the mmu_notifier cleanup for
+ * an organically-exited mm -- deliberately has no pool of its own: its
+ * work_struct is embedded directly in the registry slot it cleans up, so
+ * it cannot fail to be queued at all. See ac_prot_entry.release_work. */
 static mempool_t *ac_prot_add_pool;
-static mempool_t *ac_prot_release_pool;
 static mempool_t *ac_kill_pool;
 static atomic_t ac_kill_dropped = ATOMIC_INIT(0);
 
@@ -991,6 +992,32 @@ struct ac_prot_entry {
      * double-listing the pid, and leaving one still registered after
      * ac_del_prot_mm() stops at its first (and only known) match. */
     struct mm_struct *claiming;
+    /* Meaningful only while .mm == AC_PROT_RESERVED: an
+     * ac_del_prot_mm()/ac_clear_protected() call arrived for .claiming
+     * while this slot's mmu_notifier_register() was still in flight, and
+     * could not act on it -- the notifier isn't registered yet, so there
+     * is nothing to unregister, and the slot doesn't match by .mm. Without
+     * this flag that removal is simply lost: ac_add_prot_mm() goes on to
+     * publish the entry moments later and the mm stays protected despite
+     * an explicit, successful-looking AC_IOCTL_DEL_PROC. The claiming side
+     * honours it right after register() returns (see ac_add_prot_mm()),
+     * which is the only point at which the removal is actually
+     * performable. */
+    bool cancel;
+    /* mmu_notifier cleanup for an organically-exited mm, deferred to
+     * ac_wq -- embedded in the slot rather than allocated per request
+     * (which is what this used to do, from GFP_ATOMIC, via a mempool).
+     * An allocation failure there was unrecoverable: nothing else ever
+     * calls mmu_notifier_unregister() for such a slot, so the mm_count
+     * reference leaked permanently and .removing stayed set, pinning the
+     * slot against reuse forever -- repeated failures could retire the
+     * whole AC_PROT_MAX-entry registry. A slot has at most one release in
+     * flight by construction (.removing, set before queueing and cleared
+     * only by the worker, blocks every path that could start another), so
+     * one embedded work_struct per slot is sufficient and cannot fail to
+     * be queued. */
+    struct work_struct release_work;
+    struct mm_struct *release_mm;   /* mm for the in-flight release_work */
     char comm[AC_MAX_COMM];
 };
 
@@ -1057,34 +1084,31 @@ static struct task_struct *ac_find_task_in_ns_of(pid_t nr, pid_t ref_pid)
  * provide that call for the explicit-removal case, but nothing else ever
  * will for a slot whose mm exited organically: once ac_mmu_release() below
  * clears e->mm to NULL, no future scan can ever match this slot by mm
- * pointer again to unregister it. Deferred here via ac_wq, same GFP_ATOMIC/
- * queue_work() shape as ac_schedule_kill() -- this callback must not call
- * mmu_notifier_unregister() reentrantly on itself (see ac_mmu_release()'s
- * own comment), and its calling context isn't guaranteed sleepable. The mm
- * can't be freed before the worker runs: the very mmgrab() reference this
- * is balancing is what's keeping mm_count elevated until then. */
-struct ac_prot_release_req {
-    struct work_struct work;
-    struct ac_prot_entry *e;
-    struct mm_struct *mm;
-};
-
+ * pointer again to unregister it. Deferred here via ac_wq -- this callback
+ * must not call mmu_notifier_unregister() reentrantly on itself (see
+ * ac_mmu_release()'s own comment), and its calling context isn't
+ * guaranteed sleepable. The mm can't be freed before the worker runs: the
+ * very mmgrab() reference this is balancing is what's keeping mm_count
+ * elevated until then. The work_struct lives in the slot itself (see
+ * ac_prot_entry.release_work), so queueing it needs no allocation and
+ * therefore has no failure path. */
 static void ac_prot_release_worker(struct work_struct *w)
 {
-    struct ac_prot_release_req *r =
-        container_of(w, struct ac_prot_release_req, work);
+    struct ac_prot_entry *e = container_of(w, struct ac_prot_entry,
+                                            release_work);
+    struct mm_struct *mm = e->release_mm;
     unsigned long flags;
 
     /* ->release() already ran synchronously before this worker was even
      * queued (that's how we got here), so this call's hlist_unhashed()
      * check will find it already unhashed and won't re-invoke release() --
      * it only performs the mdrop() this slot still owes. */
-    mmu_notifier_unregister(&r->e->notifier, r->mm);
+    mmu_notifier_unregister(&e->notifier, mm);
 
     spin_lock_irqsave(&ac_prot_lock, flags);
-    r->e->removing = false;
+    e->release_mm = NULL;
+    e->removing = false;
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    mempool_free(r, ac_prot_release_pool);
 }
 
 /* ->release() is invoked either by exit_mmap() when mm_users hits zero
@@ -1117,7 +1141,6 @@ static void ac_mmu_release(struct mmu_notifier *subscription,
     char comm[AC_MAX_COMM];
     bool removed = false;
     bool caller_initiated = false;
-    struct ac_prot_release_req *r;
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     if (e->mm == mm) {
@@ -1146,23 +1169,16 @@ static void ac_mmu_release(struct mmu_notifier *subscription,
 
     ac_emit(AC_EV_EXIT, pid, comm, "protected process exited");
 
-    /* mempool-backed, same reasoning as ac_schedule_prot_add_req() -- a
-     * plain kmalloc(GFP_ATOMIC) failure here would leak this slot's
-     * mm_count reference *permanently* (nothing else will ever call
-     * mmu_notifier_unregister() for it, see the comment above
-     * ac_prot_release_worker()) and pin the slot against reuse forever,
-     * so repeated failures could eventually exhaust AC_PROT_MAX. The NULL
-     * check below is defense in depth, not the expected path. */
-    r = mempool_alloc(ac_prot_release_pool, GFP_ATOMIC);
-    if (!r) {
-        pr_err("anticheat: OOM deferring mmu_notifier cleanup for exited pid %d (%s); mm and slot leaked\n",
-               pid, comm);
-        return;
-    }
-    r->e = e;
-    r->mm = mm;
-    INIT_WORK(&r->work, ac_prot_release_worker);
-    queue_work(ac_wq, &r->work);
+    /* Allocation-free by construction: release_work is embedded in this
+     * very slot and .removing (set above) guarantees no second release
+     * for it can be in flight, so there is no failure path here that
+     * could leak the slot's mm_count reference or pin the slot against
+     * reuse -- which is exactly what the previous mempool_alloc() shape
+     * did whenever the pool ran dry. queue_work() itself orders the
+     * release_mm store below against the worker's read of it. */
+    e->release_mm = mm;
+    INIT_WORK(&e->release_work, ac_prot_release_worker);
+    queue_work(ac_wq, &e->release_work);
 }
 
 static const struct mmu_notifier_ops ac_mmu_notifier_ops = {
@@ -1207,10 +1223,15 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
             spin_unlock_irqrestore(&ac_prot_lock, flags);
             return 0;                                /* already protected */
         }
-        if (ac_prots[i].mm == AC_PROT_RESERVED && ac_prots[i].claiming == mm) {
+        if (ac_prots[i].mm == AC_PROT_RESERVED && ac_prots[i].claiming == mm &&
+            !ac_prots[i].cancel) {
             /* Another caller is already mid-register for this exact mm;
              * its registration will cover it once it lands, so don't also
-             * claim a second slot for it. */
+             * claim a second slot for it. Unless it has been cancelled by
+             * a racing ac_del_prot_mm() (.cancel): that claim is about to
+             * be torn down again rather than published, so treating it as
+             * a dedupe match would silently drop this registration, the
+             * mirror image of the lost-delete .cancel exists to fix. */
             spin_unlock_irqrestore(&ac_prot_lock, flags);
             return 0;
         }
@@ -1223,6 +1244,7 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
     }
     ac_prots[slot].mm = AC_PROT_RESERVED;
     ac_prots[slot].claiming = mm;
+    ac_prots[slot].cancel = false;
     spin_unlock_irqrestore(&ac_prot_lock, flags);
 
     /* struct mmu_notifier has no ops parameter of its own -- the caller
@@ -1231,10 +1253,41 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
     ret = mmu_notifier_register(&ac_prots[slot].notifier, mm);
 
     spin_lock_irqsave(&ac_prot_lock, flags);
+    /* .claiming/.cancel are defined only for the duration of the
+     * AC_PROT_RESERVED window that ends here, so clear both on every exit
+     * path rather than leaving whichever mm this was for visible in a
+     * slot that no longer means it. */
+    ac_prots[slot].claiming = NULL;
     if (ret) {
         ac_prots[slot].mm = NULL;
+        ac_prots[slot].cancel = false;
         spin_unlock_irqrestore(&ac_prot_lock, flags);
         return ret;
+    }
+    if (ac_prots[slot].cancel) {
+        /* An ac_del_prot_mm()/ac_clear_protected() call for this exact mm
+         * arrived while register() was in flight and could not act on it
+         * then (see .cancel). Honour it now, before the entry is ever
+         * published: undo the registration instead of leaving the mm
+         * protected despite an explicit removal. .removing pins the slot
+         * across the unregister, exactly as ac_del_prot_mm() does for an
+         * already-published entry; .mm is cleared first so the
+         * ac_mmu_release() this triggers finds no match and neither emits
+         * a spurious AC_EV_EXIT nor decrements ac_prot_count, which was
+         * never incremented for this slot. The caller's own reference on
+         * `mm` (held for the duration of this call by contract) is what
+         * keeps it alive across the unregister. */
+        ac_prots[slot].cancel = false;
+        ac_prots[slot].mm = NULL;
+        ac_prots[slot].removing = true;
+        spin_unlock_irqrestore(&ac_prot_lock, flags);
+
+        mmu_notifier_unregister(&ac_prots[slot].notifier, mm);
+
+        spin_lock_irqsave(&ac_prot_lock, flags);
+        ac_prots[slot].removing = false;
+        spin_unlock_irqrestore(&ac_prot_lock, flags);
+        return 0;
     }
     ac_prots[slot].mm = mm;
     ac_prots[slot].pid = pid;
@@ -1287,7 +1340,20 @@ static int ac_add_prot_pid(pid_t pid, pid_t ref_pid, bool jit_allowed,
  * under the same lock that finds the match closes that window: it stops
  * ac_add_prot_mm() from reusing the slot (see its free-slot scan) for as
  * long as this call is in flight, regardless of whether ac_mmu_release()
- * also fires concurrently and clears .mm out from under it. */
+ * also fires concurrently and clears .mm out from under it.
+ *
+ * "No registry entry" is genuinely not the same as "no match", though: a
+ * slot that is mid-registration for this exact mm (.mm ==
+ * AC_PROT_RESERVED, .claiming == mm) holds no notifier registration yet,
+ * so there is nothing this call can unregister -- but ac_add_prot_mm() is
+ * about to publish it as a live entry moments from now. Returning here as
+ * if nothing matched loses the removal outright: AC_IOCTL_DEL_PROC reports
+ * success while the process stays protected, and nothing ever retries. So
+ * flag the claim instead (.cancel) and let ac_add_prot_mm() undo it at the
+ * one point where undoing it is actually possible -- right after its
+ * register() call returns. Every matching claim is flagged, not just the
+ * first: ac_add_prot_mm()'s .removing dedupe exception can transiently
+ * leave more than one claim in flight for a single mm. */
 static void ac_del_prot_mm(struct mm_struct *mm)
 {
     unsigned long flags;
@@ -1300,6 +1366,15 @@ static void ac_del_prot_mm(struct mm_struct *mm)
             ac_prots[i].removing = true;
             found = true;
             break;
+        }
+    }
+    if (!found) {
+        int j;
+
+        for (j = 0; j < AC_PROT_MAX; j++) {
+            if (ac_prots[j].mm == AC_PROT_RESERVED &&
+                ac_prots[j].claiming == mm)
+                ac_prots[j].cancel = true;
         }
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
@@ -3330,16 +3405,8 @@ static int __init ac_init(void)
         destroy_workqueue(ac_wq);
         return -ENOMEM;
     }
-    ac_prot_release_pool = mempool_create_kmalloc_pool(AC_PROT_MAX,
-                                                        sizeof(struct ac_prot_release_req));
-    if (!ac_prot_release_pool) {
-        mempool_destroy(ac_prot_add_pool);
-        destroy_workqueue(ac_wq);
-        return -ENOMEM;
-    }
     ac_kill_pool = mempool_create_kmalloc_pool(16, sizeof(struct ac_kill_req));
     if (!ac_kill_pool) {
-        mempool_destroy(ac_prot_release_pool);
         mempool_destroy(ac_prot_add_pool);
         destroy_workqueue(ac_wq);
         return -ENOMEM;
@@ -3379,7 +3446,6 @@ static int __init ac_init(void)
          * reasoning in ac_exit() below). */
         flush_workqueue(ac_wq);
         mempool_destroy(ac_kill_pool);
-        mempool_destroy(ac_prot_release_pool);
         mempool_destroy(ac_prot_add_pool);
         destroy_workqueue(ac_wq);
         return ret;
@@ -3416,11 +3482,13 @@ static void __exit ac_exit(void)
     destroy_workqueue(ac_wq);
     /* Safe only now: mempool_destroy() requires every element already
      * returned, and the two flush_workqueue() calls above guarantee every
-     * ac_prot_add_worker()/ac_prot_release_worker() that could still be
-     * holding one has already run to completion and freed it back. */
+     * ac_prot_add_worker() that could still be holding one has already run
+     * to completion and freed it back. (ac_prot_release_worker() holds no
+     * pool element at all any more -- its work_struct is embedded in the
+     * registry slot -- but the same flushes are what guarantee it has
+     * finished touching ac_prots[] before this point.) */
     mempool_destroy(ac_kill_pool);
     mempool_destroy(ac_prot_add_pool);
-    mempool_destroy(ac_prot_release_pool);
     pr_info("unloaded\n");
 }
 
