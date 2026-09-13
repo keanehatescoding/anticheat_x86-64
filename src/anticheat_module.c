@@ -522,7 +522,13 @@ static void ac_derive_bounds(unsigned long base, unsigned long anchor)
             hi = e;
     }
     if (lo && hi) {
-        unsigned long derived_end = (hi + 0x1FFFFFUL) & ~0x1FFFFFUL; /* 2 MB up */
+        /* hi is the highest handler actually accepted above, and every
+         * consumer of ac_text_end treats it as exclusive (addr >=
+         * ac_text_end is out of range). Round up from hi + 1, not hi: a
+         * 2 MB-aligned hi would otherwise round to itself, putting the very
+         * handler that established the bound outside the text range and
+         * making it a candidate to be reported as hooked. */
+        unsigned long derived_end = (hi + 1 + 0x1FFFFFUL) & ~0x1FFFFFUL; /* 2 MB up */
 
         if (!ac_stext)
             ac_stext = lo & ~0x1FFFFFUL;                 /* 2 MB round down */
