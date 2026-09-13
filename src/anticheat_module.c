@@ -183,6 +183,22 @@ static void ac_probe_post(struct kprobe *p, struct pt_regs *regs,
 /* ------------------------------------------------------------------ */
 /* policy / parameters                                                 */
 /* ------------------------------------------------------------------ */
+/* Both parameters are mode 0600 -- writable at runtime through
+ * /sys/module/anticheat/parameters/. The sysfs store side is a plain
+ * write inside the param machinery, which this module doesn't control
+ * and can't lock against, so every read here goes through READ_ONCE():
+ * it makes the load a single, non-repeated access instead of something
+ * the compiler is free to refetch or split.
+ *
+ * That matters most for ac_policy, which gates a security decision. A
+ * plain read lets the compiler reload it between uses, so a single
+ * logical "should this offender be killed" answer could be computed from
+ * two different values of the parameter within one probe invocation --
+ * e.g. reported as killed while no kill was queued. READ_ONCE() pins one
+ * value per decision. Which side of a concurrent sysfs write a given
+ * probe lands on is still unordered, and deliberately so: an operator
+ * flipping policy mid-attack has no expectation about the exact call it
+ * takes effect on, only that every call uses one coherent value. */
 static unsigned int ac_policy = 0x1;   /* bit0: SIGKILL a process that attacks a
                                          * protected proc via ptrace or
                                          * process_vm_readv/writev */
@@ -496,7 +512,7 @@ static bool ac_table_plausible(unsigned long base, unsigned long anchor)
         if (ac_plausible_handler(e, anchor) && ++valid >= 400)
             return true;
     }
-    if (ac_verbose)
+    if (READ_ONCE(ac_verbose))
         pr_info("plausibility for base=0x%lx: valid=%u\n", base, valid);
     return valid >= 400;
 }
@@ -582,7 +598,7 @@ static unsigned long ac_find_syscall_table(void)
 
     rh = ac_normalize_func(ac_lookup("__x64_sys_read"));
     wh = ac_normalize_func(ac_lookup("__x64_sys_write"));
-    if (ac_verbose)
+    if (READ_ONCE(ac_verbose))
         pr_info("lookup __x64_sys_read=0x%lx __x64_sys_write=0x%lx\n",
                 rh, wh);
     if (!rh || !wh)
@@ -596,7 +612,7 @@ static unsigned long ac_find_syscall_table(void)
      * lives in .rodata right after .text. */
     lo = ac_etext ? ac_etext : (ac_stext ? ac_stext : rh);
     hi = lo + 0x2000000UL;      /* 32 MB window */
-    if (ac_verbose)
+    if (READ_ONCE(ac_verbose))
         pr_info("table scan window [0x%lx, 0x%lx)\n", lo, hi);
     for (addr = lo; addr < hi; addr += sizeof(unsigned long)) {
         /* 32 MB / 8 = 4M iterations, each an ac_kread(), plus a 512-entry
@@ -617,7 +633,7 @@ static unsigned long ac_find_syscall_table(void)
         if (ac_kread(&v2, (void *)(base + __NR_write * sizeof(unsigned long)),
                      sizeof(v2)))
             continue;
-        if (ac_verbose)
+        if (READ_ONCE(ac_verbose))
             pr_info("candidate addr=0x%lx base=0x%lx v2=0x%lx\n",
                     addr, base, v2);
         if (v2 == wh && ac_table_plausible(base, rh)) {
@@ -642,7 +658,7 @@ static unsigned long ac_find_syscall_table(void)
         if (ac_kread(&v2, (void *)(base + __NR_write * sizeof(unsigned long)),
                      sizeof(v2)))
             continue;
-        if (ac_verbose)
+        if (READ_ONCE(ac_verbose))
             pr_info("fallback candidate addr=0x%lx base=0x%lx v2=0x%lx\n",
                     addr, base, v2);
         if (v2 == wh && ac_table_plausible(base, rh)) {
@@ -729,7 +745,7 @@ static void ac_capture_syscall_baseline(void)
     ac_sha256_hex(ac_syscall_baseline, sizeof(ac_syscall_baseline),
                   ac_syscall_baseline_hex);
     ac_syscall_baseline_ready = true;
-    if (ac_verbose)
+    if (READ_ONCE(ac_verbose))
         pr_info("syscall handler baseline captured: sha256=%s\n",
                 ac_syscall_baseline_hex);
 }
@@ -876,7 +892,19 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
 #define AC_RING_SIZE 256
 
 static struct ac_event ac_ring[AC_RING_SIZE];
-static unsigned int ac_ring_head, ac_ring_tail, ac_ring_count;
+static unsigned int ac_ring_head, ac_ring_tail;
+/* ac_ring_count and ac_dropped are written only under ac_ring_lock, but
+ * both have one legitimate reader that deliberately runs without it:
+ * GET_EVENTS' wait_event_interruptible_timeout() condition polls
+ * ac_ring_count as a racy hint (the authoritative peek happens under the
+ * lock afterwards), and AC_IOCTL_STATUS reports ac_dropped without taking
+ * the lock for a single counter. Both readers already use READ_ONCE(); the
+ * writes below use WRITE_ONCE() so the pairing is complete rather than
+ * half-annotated -- an unmarked write against a marked read is exactly the
+ * shape KCSAN flags, and it leaves the compiler free to split or
+ * speculatively store the update. Readers that do hold ac_ring_lock stay
+ * plain: the lock already orders them. */
+static unsigned int ac_ring_count;
 static DEFINE_SPINLOCK(ac_ring_lock);
 static unsigned int ac_dropped;
 static unsigned int ac_last_hook_count;
@@ -911,8 +939,8 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
     spin_lock_irqsave(&ac_ring_lock, flags);
     if (ac_ring_count >= AC_RING_SIZE) {
         ac_ring_tail = (ac_ring_tail + 1) % AC_RING_SIZE;
-        ac_ring_count--;
-        ac_dropped++;
+        WRITE_ONCE(ac_ring_count, ac_ring_count - 1);
+        WRITE_ONCE(ac_dropped, ac_dropped + 1);
         ac_ring_removed++;
     }
     ev = &ac_ring[ac_ring_head];
@@ -925,7 +953,7 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
     vsnprintf(ev->data, sizeof(ev->data), fmt, args);
     va_end(args);
     ac_ring_head = (ac_ring_head + 1) % AC_RING_SIZE;
-    ac_ring_count++;
+    WRITE_ONCE(ac_ring_count, ac_ring_count + 1);
     spin_unlock_irqrestore(&ac_ring_lock, flags);
     /* Outside the spinlock: wake_up_interruptible() takes its own lock
      * (the waitqueue's) and there is no ordering requirement that
@@ -949,7 +977,7 @@ static int ac_drain_events(struct ac_event_list *out)
         if (out)
             out->events[out->count++] = ac_ring[ac_ring_tail];
         ac_ring_tail = (ac_ring_tail + 1) % AC_RING_SIZE;
-        ac_ring_count--;
+        WRITE_ONCE(ac_ring_count, ac_ring_count - 1);
         ac_ring_removed++;
     }
     spin_unlock_irqrestore(&ac_ring_lock, flags);
@@ -1004,7 +1032,7 @@ static void ac_commit_events(unsigned int n, u64 removed_before)
     if (to_remove > ac_ring_count)
         to_remove = ac_ring_count;
     ac_ring_tail = (ac_ring_tail + to_remove) % AC_RING_SIZE;
-    ac_ring_count -= to_remove;
+    WRITE_ONCE(ac_ring_count, ac_ring_count - to_remove);
     ac_ring_removed += to_remove;
     spin_unlock_irqrestore(&ac_ring_lock, flags);
 }
@@ -1945,6 +1973,15 @@ static bool ac_schedule_prot_rekey(struct mm_struct *old_mm,
 /* lock state: pinned by AC_IOCTL_LOCK (try_module_get) */
 static atomic_t ac_lock_count = ATOMIC_INIT(0);
 
+/* Ceiling on the LOCK nesting depth.  The intended use is one LOCK held by
+ * the daemon, so anything past a handful is a caller bug or a deliberate
+ * attempt to grow the module refcount without bound (each LOCK takes a
+ * try_module_get() that only a matching UNLOCK releases).  Refusing past
+ * the ceiling keeps a misbehaving privileged caller from making the module
+ * permanently unloadable -- the count and the reference stay in balance,
+ * so the existing UNLOCKs still unwind it. */
+#define AC_LOCK_MAX 16
+
 static unsigned int ac_protected_count(void)
 {
     unsigned long flags;
@@ -2086,7 +2123,7 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
             "ptrace req %ld by pid %d (%s) DENIED",
             request, current->pid, current->comm);
 
-    killed = kill && (ac_policy & 0x1);
+    killed = kill && (READ_ONCE(ac_policy) & 0x1);
     if (killed)
         ac_schedule_kill(current);
 
@@ -2204,7 +2241,7 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
              p == &ac_kp_process_vm_readv) ? "readv" : "writev",
             current->pid, current->comm);
 
-    killed = ac_policy & 0x1;
+    killed = READ_ONCE(ac_policy) & 0x1;
     if (killed)
         ac_schedule_kill(current);
 
@@ -2761,7 +2798,7 @@ static void ac_register_kprobes(void)
             continue;
         }
         if (!ac_kp_essential[i]) {
-            if (ac_verbose)
+            if (READ_ONCE(ac_verbose))
                 pr_info("kprobe %s unavailable: %d (optional)\n", name, ret);
             continue;
         }
@@ -2779,7 +2816,7 @@ static void ac_register_kprobes(void)
             continue;
         }
         if (!ac_kretp_essential[i]) {
-            if (ac_verbose)
+            if (READ_ONCE(ac_verbose))
                 pr_info("kretprobe %s unavailable: %d (optional)\n", name, ret);
             continue;
         }
@@ -3151,7 +3188,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (copy_from_user(&a, uarg, sizeof(a)))
             return -EFAULT;
         ret = ac_add_prot_pid(a.pid, a.ref_pid, a.jit_allowed != 0, a.comm);
-        if (ret == 0 && ac_verbose)
+        if (ret == 0 && READ_ONCE(ac_verbose))
             pr_info("protected pid %d (%s)\n", a.pid, a.comm);
         return ret;
     }
@@ -3237,7 +3274,20 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             mutex_lock(&st->lock);
             kvfree(st->vmas);
             st->vmas = NULL;
-            st->n_vmas = 0;
+            /* Clear the whole snapshot, not just the array.  Dropping
+             * ->vmas while leaving ->rwx_count and friends at the previous
+             * scan's values leaves the fd state self-inconsistent: the
+             * summary counters describe a snapshot that no longer exists,
+             * and ->resolved_pid still names a process this fd is no longer
+             * scanning (one that may since have exited and had its pid
+             * recycled).  Nothing reads them outside SCAN_BEGIN today --
+             * ac_build_vma_snapshot() resets them itself before refilling --
+             * so this is not a live bug, but "END means ended" is the
+             * invariant worth being able to rely on when a later reader
+             * appears. */
+            st->n_vmas = st->rwx_count = st->exec_count =
+                st->anon_exec_count = st->truncated = 0;
+            st->resolved_pid = 0;
             mutex_unlock(&st->lock);
         }
         return 0;
@@ -3391,22 +3441,44 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -EFAULT;
         return 0;
     }
-    case AC_IOCTL_LOCK:
+    case AC_IOCTL_LOCK: {
+        int prev;
+
         /* Pin the module until a matching UNLOCK.  The reference is taken
          * globally (not per-fd), so the pin intentionally outlives the
          * locking process (crash, kill, or a CLI that opens/closes the
          * device).  Recovery is always possible: any CAP_SYS_ADMIN caller
          * can issue UNLOCK, which balances the count and releases the
-         * reference. */
-        if (try_module_get(THIS_MODULE)) {
-            atomic_inc(&ac_lock_count);
-            return 0;
-        }
-        return -EBUSY;
+         * reference.
+         *
+         * The reference is taken before the count is raised so the two can
+         * never disagree in the direction that matters: UNLOCK's
+         * atomic_dec_if_positive() must never module_put() a reference that
+         * was not taken.  If the bound is hit we hand the reference straight
+         * back. */
+        if (!try_module_get(THIS_MODULE))
+            return -EBUSY;
+        prev = atomic_read(&ac_lock_count);
+        do {
+            if (prev >= AC_LOCK_MAX) {
+                module_put(THIS_MODULE);
+                return -EBUSY;
+            }
+        } while (!atomic_try_cmpxchg(&ac_lock_count, &prev, prev + 1));
+        return 0;
+    }
     case AC_IOCTL_UNLOCK:
         /* atomic_dec_if_positive() makes the check-and-decrement a single
          * atomic step, so two concurrent UNLOCKs racing a single LOCK can't
-         * both observe a positive count and both call module_put(). */
+         * both observe a positive count and both call module_put().
+         *
+         * Unlocking an already-unlocked module returns success on purpose:
+         * UNLOCK states a desired end state ("not pinned"), and the CLI's
+         * `anticheat unlock` would otherwise fail whenever the module is
+         * already unpinned -- including the common case of re-running it
+         * after a crash that left no lock behind.  There is no per-fd
+         * ownership to report a mismatch against, so there is nothing an
+         * -EINVAL here would let a caller do differently. */
         if (atomic_dec_if_positive(&ac_lock_count) >= 0)
             module_put(THIS_MODULE);
         return 0;
@@ -3544,7 +3616,7 @@ static int __init ac_init(void)
     }
 
     ac_resolve_text_bounds();
-    if (ac_verbose)
+    if (READ_ONCE(ac_verbose))
         pr_info("text bounds: stext=0x%lx etext=0x%lx\n", ac_stext, ac_etext);
 
     ac_syscall_table = ac_find_syscall_table();
