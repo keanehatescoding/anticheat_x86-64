@@ -233,6 +233,11 @@ static unsigned long ac_normalize_func(unsigned long addr)
 static unsigned long ac_stext;
 static unsigned long ac_etext;
 static unsigned long ac_text_end;   /* upper bound for "core kernel text" */
+/* True while ac_text_end holds the generous fixed-size guess below rather
+ * than a real _etext/_sinittext address. Only the guess may be replaced by
+ * ac_derive_bounds()' tighter, table-derived bound -- a resolved symbol is
+ * authoritative and is never overridden. */
+static bool ac_text_end_guessed;
 
 static bool ac_entry_bad(unsigned long e);   /* fwd decl */
 static unsigned long ac_anchor;   /* fwd decl (tentative; defined below) */
@@ -247,10 +252,19 @@ static void ac_resolve_text_bounds(void)
     if (!ac_etext)
         ac_etext = ac_lookup("_sinittext");
 
-    if (ac_etext)
+    if (ac_etext) {
         ac_text_end = ac_etext;
-    else if (ac_stext)
+    } else if (ac_stext) {
+        /* _etext/_sinittext weren't kprobe-able but _stext was. 512 MB is
+         * far wider than any real kernel image, so this bound alone
+         * classifies a good deal of .rodata/.data/.bss as "core kernel
+         * text" -- a syscall entry repointed into kernel *data* (a
+         * writable trampoline, say) would pass the range check. It is
+         * only a placeholder until ac_derive_bounds() can replace it with
+         * something derived from the located table; see ac_text_end_guessed. */
         ac_text_end = ac_stext + 0x20000000UL;   /* generous image bound */
+        ac_text_end_guessed = true;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -507,14 +521,34 @@ static void ac_derive_bounds(unsigned long base, unsigned long anchor)
             hi = e;
     }
     if (lo && hi) {
+        unsigned long derived_end = (hi + 0x1FFFFFUL) & ~0x1FFFFFUL; /* 2 MB up */
+
         if (!ac_stext)
             ac_stext = lo & ~0x1FFFFFUL;                 /* 2 MB round down */
-        if (!ac_text_end)
-            ac_text_end = (hi + 0x1FFFFFUL) & ~0x1FFFFFUL; /* 2 MB round up */
+        if (!ac_text_end) {
+            ac_text_end = derived_end;
+        } else if (ac_text_end_guessed && derived_end < ac_text_end) {
+            /* Only _stext resolved, so ac_text_end is the 512 MB
+             * placeholder rather than a real section address. Every
+             * legitimate entry in the table just scanned is <= hi by
+             * construction, so narrowing to the derived bound can't
+             * reclassify a genuine handler as hooked -- it only stops the
+             * placeholder from vouching for hundreds of megabytes of
+             * non-text image that a redirected entry could be pointed at.
+             * Strictly narrowing (never widening) keeps this a
+             * no-worse-than-before change in every other layout. */
+            pr_info("narrowing guessed text end 0x%lx -> 0x%lx (table-derived)\n",
+                    ac_text_end, derived_end);
+            ac_text_end = derived_end;
+        }
+        ac_text_end_guessed = false;
         pr_info("derived text bounds: stext=0x%lx end=0x%lx\n",
                 ac_stext, ac_text_end);
     }
 }
+
+/* Yield every this many bytes of scanned image (power of two). */
+#define AC_SCAN_RESCHED_BYTES 0x8000UL
 
 static unsigned long ac_find_syscall_table(void)
 {
@@ -539,6 +573,16 @@ static unsigned long ac_find_syscall_table(void)
     if (ac_verbose)
         pr_info("table scan window [0x%lx, 0x%lx)\n", lo, hi);
     for (addr = lo; addr < hi; addr += sizeof(unsigned long)) {
+        /* 32 MB / 8 = 4M iterations, each an ac_kread(), plus a 512-entry
+         * plausibility scan per candidate. ac_init() is process context
+         * with nothing held, so yield periodically rather than sitting in
+         * one uninterruptible burst on a CONFIG_PREEMPT_NONE kernel --
+         * same reasoning as the cond_resched() already in
+         * ac_check_syscalls(), for a loop three orders of magnitude
+         * longer. Every 4096 words keeps the check itself off the hot
+         * path. */
+        if ((addr & (AC_SCAN_RESCHED_BYTES - 1)) == 0)
+            cond_resched();
         if (ac_kread(&v1, (void *)addr, sizeof(v1)))
             continue;
         if (v1 != rh)
@@ -562,6 +606,8 @@ static unsigned long ac_find_syscall_table(void)
      * rather than skimping on it: some layouts place the table below the
      * first handler. */
     for (addr = rh; addr > rh - 0x2000000UL; addr -= sizeof(unsigned long)) {
+        if ((addr & (AC_SCAN_RESCHED_BYTES - 1)) == 0)
+            cond_resched();   /* see the forward scan above */
         if (ac_kread(&v1, (void *)addr, sizeof(v1)))
             continue;
         if (v1 != rh)
@@ -2556,31 +2602,83 @@ static struct kprobe *ac_kprobes[] = {
 static bool ac_kp_ok[ARRAY_SIZE(ac_kprobes)];  /* per-slot registration state */
 static unsigned int ac_kprobes_registered;     /* count, for the log line */
 
+/* Which probes carry a defense this module is actually claiming to
+ * provide, as opposed to extending an existing one to a secondary ABI.
+ *
+ * Every probe here is attached by symbol name (__x64_sys_ptrace,
+ * kernel_clone, ...), and register_kprobe() simply fails when the name
+ * doesn't resolve -- a kernel that renames, inlines or drops one of these
+ * (an ordinary thing to happen across versions, or under a different
+ * config) leaves the corresponding defense silently absent while the
+ * module still loads and reports itself healthy. The counts in the load
+ * line don't help: an operator would have to know what the *expected*
+ * counts are for their kernel to notice one is missing.
+ *
+ * The compat (__ia32_*) entries are deliberately non-essential: they are
+ * genuinely absent on a kernel built without CONFIG_IA32_EMULATION, which
+ * is a normal configuration and not a degradation. Their failure stays a
+ * pr_info. Everything else failing means a documented capability isn't
+ * there, and is reported as such -- loudly in the kernel log, and as an
+ * AC_EV_INFO event so the daemon sees it in-band rather than having to
+ * scrape dmesg. */
+static const bool ac_kp_essential[ARRAY_SIZE(ac_kprobes)] = {
+    true, false,    /* ptrace, ptrace (compat) */
+    true, false,    /* process_vm_readv, process_vm_readv (compat) */
+    true, false,    /* process_vm_writev, process_vm_writev (compat) */
+};
+static const bool ac_kretp_essential[ARRAY_SIZE(ac_kretprobes)] = {
+    true,           /* kernel_clone -- fork inheritance */
+    true, true,     /* execve, execveat -- exec rekey */
+    false, false,   /* execve, execveat (compat) */
+};
+
+/* Names of the essential probes that failed to register, for the degraded
+ * -mode report in ac_init(). Empty when everything expected is in place. */
+static char ac_degraded[256];
+
 static void ac_register_kprobes(void)
 {
     unsigned int i;
+    size_t used = 0;
 
+    ac_degraded[0] = '\0';
     for (i = 0; i < ARRAY_SIZE(ac_kprobes); i++) {
         int ret = register_kprobe(ac_kprobes[i]);
+        const char *name = ac_kprobes[i]->symbol_name;
 
         ac_kp_ok[i] = (ret == 0);
         if (ret == 0) {
             ac_kprobes_registered++;
-        } else if (ac_verbose) {
-            pr_info("kprobe %s unavailable: %d\n",
-                    ac_kprobes[i]->symbol_name, ret);
+            continue;
         }
+        if (!ac_kp_essential[i]) {
+            if (ac_verbose)
+                pr_info("kprobe %s unavailable: %d (optional)\n", name, ret);
+            continue;
+        }
+        pr_err("kprobe %s FAILED to register: %d -- the defense it provides is NOT active\n",
+               name, ret);
+        used += scnprintf(ac_degraded + used, sizeof(ac_degraded) - used,
+                          "%s%s", used ? ", " : "", name);
     }
     for (i = 0; i < ARRAY_SIZE(ac_kretprobes); i++) {
         int ret = register_kretprobe(ac_kretprobes[i]);
+        const char *name = ac_kretprobes[i]->kp.symbol_name;
 
         ac_kretp_ok[i] = (ret == 0);
         if (ret == 0) {
             ac_kretprobes_registered++;
-        } else if (ac_verbose) {
-            pr_info("kretprobe %s unavailable: %d\n",
-                    ac_kretprobes[i]->kp.symbol_name, ret);
+            continue;
         }
+        if (!ac_kretp_essential[i]) {
+            if (ac_verbose)
+                pr_info("kretprobe %s unavailable: %d (optional)\n", name, ret);
+            continue;
+        }
+        pr_err("kretprobe %s FAILED to register: %d -- the defense it provides is NOT active\n",
+               name, ret);
+        used += scnprintf(ac_degraded + used, sizeof(ac_degraded) - used,
+                          "%s%s", used ? ", " : "", name);
     }
 }
 
@@ -3385,9 +3483,27 @@ static int __init ac_init(void)
         return ret;
     }
 
-    pr_info("loaded (policy=0x%x, %u kprobes, %u kretprobes, %u protected slots)\n",
+    if (ac_degraded[0]) {
+        /* Loud on both channels: the kernel log for an operator reading
+         * dmesg, and the event ring so the daemon reports degraded
+         * coverage in-band instead of assuming a module that loaded is a
+         * module that works. Deliberately not a load failure -- the
+         * remaining defenses are still worth having, and refusing to load
+         * outright would leave a kernel with one renamed symbol with no
+         * protection at all rather than most of it. */
+        pr_err("DEGRADED: probes unavailable (%s) -- the corresponding defenses are NOT active on this kernel\n",
+               ac_degraded);
+        ac_emit(AC_EV_INFO, 0, "?",
+                "module loaded DEGRADED: probes unavailable (%s); corresponding defenses inactive",
+                ac_degraded);
+    }
+    if (!ac_syscall_table)
+        ac_emit(AC_EV_INFO, 0, "?",
+                "module loaded DEGRADED: syscall table not located; syscall integrity checks inactive");
+
+    pr_info("loaded (policy=0x%x, %u kprobes, %u kretprobes, %u protected slots)%s\n",
             ac_policy, ac_kprobes_registered, ac_kretprobes_registered,
-            AC_PROT_MAX);
+            AC_PROT_MAX, ac_degraded[0] ? " [DEGRADED]" : "");
     return 0;
 }
 
