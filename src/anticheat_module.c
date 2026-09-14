@@ -87,23 +87,24 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
  * too, for the same reason ac_schedule_kill() does. */
 static struct workqueue_struct *ac_wq;
 
-/* Backing pools for the two deferred-work request structs allocated from
- * kprobe/kretprobe (atomic) context: struct ac_prot_add_req (fork-inherit/
- * exec-rekey registration, further down) and struct ac_prot_release_req
- * (mmu_notifier cleanup for an organically-exited mm, in the registry
- * section below). A plain kmalloc(GFP_ATOMIC) there can fail under memory
- * pressure -- silently dropping either request isn't just a missed event:
- * dropping an add/rekey leaves a should-be-protected mm unregistered
- * (ptrace/process_vm defenses would let an attacker through), and dropping
- * a release leaks the slot's mmu_notifier registration and its mm_count
- * reference permanently. mempool_alloc() falls back to a small pre-reserved
- * pool instead of returning NULL there, the standard kernel pattern for
- * atomic-context allocations that must not fail. Sized to AC_PROT_MAX: that
- * many concurrent in-flight requests already implies as many address
- * spaces are mid-transition, which is the same order of magnitude the
- * registry itself is bounded to. */
+/* Backing pool for struct ac_prot_add_req (fork-inherit/exec-rekey
+ * registration, further down), which is allocated from kprobe/kretprobe
+ * (atomic) context. A plain kmalloc(GFP_ATOMIC) there can fail under
+ * memory pressure, and silently dropping such a request isn't just a
+ * missed event -- it leaves a should-be-protected mm unregistered, so the
+ * ptrace/process_vm defenses would let an attacker through.
+ * mempool_alloc() falls back to a small pre-reserved pool instead of
+ * returning NULL there, the standard kernel pattern for atomic-context
+ * allocations that must not fail. Sized to AC_PROT_MAX: that many
+ * concurrent in-flight requests already implies as many address spaces
+ * are mid-transition, which is the same order of magnitude the registry
+ * itself is bounded to.
+ *
+ * The registry's other deferred-work item -- the mmu_notifier cleanup for
+ * an organically-exited mm -- deliberately has no pool of its own: its
+ * work_struct is embedded directly in the registry slot it cleans up, so
+ * it cannot fail to be queued at all. See ac_prot_entry.release_work. */
 static mempool_t *ac_prot_add_pool;
-static mempool_t *ac_prot_release_pool;
 static mempool_t *ac_kill_pool;
 static atomic_t ac_kill_dropped = ATOMIC_INIT(0);
 
@@ -182,6 +183,22 @@ static void ac_probe_post(struct kprobe *p, struct pt_regs *regs,
 /* ------------------------------------------------------------------ */
 /* policy / parameters                                                 */
 /* ------------------------------------------------------------------ */
+/* Both parameters are mode 0600 -- writable at runtime through
+ * /sys/module/anticheat/parameters/. The sysfs store side is a plain
+ * write inside the param machinery, which this module doesn't control
+ * and can't lock against, so every read here goes through READ_ONCE():
+ * it makes the load a single, non-repeated access instead of something
+ * the compiler is free to refetch or split.
+ *
+ * That matters most for ac_policy, which gates a security decision. A
+ * plain read lets the compiler reload it between uses, so a single
+ * logical "should this offender be killed" answer could be computed from
+ * two different values of the parameter within one probe invocation --
+ * e.g. reported as killed while no kill was queued. READ_ONCE() pins one
+ * value per decision. Which side of a concurrent sysfs write a given
+ * probe lands on is still unordered, and deliberately so: an operator
+ * flipping policy mid-attack has no expectation about the exact call it
+ * takes effect on, only that every call uses one coherent value. */
 static unsigned int ac_policy = 0x1;   /* bit0: SIGKILL a process that attacks a
                                          * protected proc via ptrace or
                                          * process_vm_readv/writev */
@@ -233,6 +250,11 @@ static unsigned long ac_normalize_func(unsigned long addr)
 static unsigned long ac_stext;
 static unsigned long ac_etext;
 static unsigned long ac_text_end;   /* upper bound for "core kernel text" */
+/* True while ac_text_end holds the generous fixed-size guess below rather
+ * than a real _etext/_sinittext address. Only the guess may be replaced by
+ * ac_derive_bounds()' tighter, table-derived bound -- a resolved symbol is
+ * authoritative and is never overridden. */
+static bool ac_text_end_guessed;
 
 static bool ac_entry_bad(unsigned long e);   /* fwd decl */
 static unsigned long ac_anchor;   /* fwd decl (tentative; defined below) */
@@ -247,10 +269,19 @@ static void ac_resolve_text_bounds(void)
     if (!ac_etext)
         ac_etext = ac_lookup("_sinittext");
 
-    if (ac_etext)
+    if (ac_etext) {
         ac_text_end = ac_etext;
-    else if (ac_stext)
+    } else if (ac_stext) {
+        /* _etext/_sinittext weren't kprobe-able but _stext was. 512 MB is
+         * far wider than any real kernel image, so this bound alone
+         * classifies a good deal of .rodata/.data/.bss as "core kernel
+         * text" -- a syscall entry repointed into kernel *data* (a
+         * writable trampoline, say) would pass the range check. It is
+         * only a placeholder until ac_derive_bounds() can replace it with
+         * something derived from the located table; see ac_text_end_guessed. */
         ac_text_end = ac_stext + 0x20000000UL;   /* generous image bound */
+        ac_text_end_guessed = true;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -481,7 +512,7 @@ static bool ac_table_plausible(unsigned long base, unsigned long anchor)
         if (ac_plausible_handler(e, anchor) && ++valid >= 400)
             return true;
     }
-    if (ac_verbose)
+    if (READ_ONCE(ac_verbose))
         pr_info("plausibility for base=0x%lx: valid=%u\n", base, valid);
     return valid >= 400;
 }
@@ -507,14 +538,59 @@ static void ac_derive_bounds(unsigned long base, unsigned long anchor)
             hi = e;
     }
     if (lo && hi) {
+        /* hi is the highest handler actually accepted above, and every
+         * consumer of ac_text_end treats it as exclusive (addr >=
+         * ac_text_end is out of range). Round up from hi + 1, not hi: a
+         * 2 MB-aligned hi would otherwise round to itself, putting the very
+         * handler that established the bound outside the text range and
+         * making it a candidate to be reported as hooked. */
+        unsigned long derived_end = (hi + 1 + 0x1FFFFFUL) & ~0x1FFFFFUL; /* 2 MB up */
+
         if (!ac_stext)
             ac_stext = lo & ~0x1FFFFFUL;                 /* 2 MB round down */
-        if (!ac_text_end)
-            ac_text_end = (hi + 0x1FFFFFUL) & ~0x1FFFFFUL; /* 2 MB round up */
+        if (!ac_text_end) {
+            ac_text_end = derived_end;
+        } else if (ac_text_end_guessed && derived_end != ac_text_end) {
+            /* Only _stext resolved, so ac_text_end is the 512 MB
+             * placeholder rather than a real section address. It is a
+             * guess, so the table-derived bound supersedes it in both
+             * directions -- keeping the guess in either direction is
+             * strictly worse than trusting what the scan just observed.
+             *
+             * Narrowing is the case that matters in practice: it stops
+             * the placeholder from vouching for hundreds of megabytes of
+             * non-text image that a redirected entry could be pointed at.
+             * Every legitimate entry in the table just scanned is <= hi
+             * by construction, so it cannot reclassify a genuine handler
+             * as hooked.
+             *
+             * Widening is about correctness rather than strength. If a
+             * handler we just accepted sits at or past the placeholder,
+             * the placeholder is demonstrably too small, and keeping it
+             * would make ac_in_core_text() report that genuine handler as
+             * hooked on every subsequent check. The widened bound still
+             * only covers addresses up to the highest handler actually
+             * observed, which ac_plausible_handler() already clamps to
+             * anchor +/- 64 MB -- it cannot run away.
+             *
+             * That second case is currently unreachable: the anchor is a
+             * syscall handler inside text, so reaching the 512 MB
+             * placeholder would need a kernel text section larger than
+             * 448 MB. It is handled anyway rather than left to depend on
+             * an undocumented relationship between two unrelated
+             * constants, either of which a later change could move. */
+            pr_info("replacing guessed text end 0x%lx -> 0x%lx (table-derived)\n",
+                    ac_text_end, derived_end);
+            ac_text_end = derived_end;
+        }
+        ac_text_end_guessed = false;
         pr_info("derived text bounds: stext=0x%lx end=0x%lx\n",
                 ac_stext, ac_text_end);
     }
 }
+
+/* Yield every this many bytes of scanned image (power of two). */
+#define AC_SCAN_RESCHED_BYTES 0x8000UL
 
 static unsigned long ac_find_syscall_table(void)
 {
@@ -522,7 +598,7 @@ static unsigned long ac_find_syscall_table(void)
 
     rh = ac_normalize_func(ac_lookup("__x64_sys_read"));
     wh = ac_normalize_func(ac_lookup("__x64_sys_write"));
-    if (ac_verbose)
+    if (READ_ONCE(ac_verbose))
         pr_info("lookup __x64_sys_read=0x%lx __x64_sys_write=0x%lx\n",
                 rh, wh);
     if (!rh || !wh)
@@ -536,9 +612,19 @@ static unsigned long ac_find_syscall_table(void)
      * lives in .rodata right after .text. */
     lo = ac_etext ? ac_etext : (ac_stext ? ac_stext : rh);
     hi = lo + 0x2000000UL;      /* 32 MB window */
-    if (ac_verbose)
+    if (READ_ONCE(ac_verbose))
         pr_info("table scan window [0x%lx, 0x%lx)\n", lo, hi);
     for (addr = lo; addr < hi; addr += sizeof(unsigned long)) {
+        /* 32 MB / 8 = 4M iterations, each an ac_kread(), plus a 512-entry
+         * plausibility scan per candidate. ac_init() is process context
+         * with nothing held, so yield periodically rather than sitting in
+         * one uninterruptible burst on a CONFIG_PREEMPT_NONE kernel --
+         * same reasoning as the cond_resched() already in
+         * ac_check_syscalls(), for a loop three orders of magnitude
+         * longer. Every 4096 words keeps the check itself off the hot
+         * path. */
+        if ((addr & (AC_SCAN_RESCHED_BYTES - 1)) == 0)
+            cond_resched();
         if (ac_kread(&v1, (void *)addr, sizeof(v1)))
             continue;
         if (v1 != rh)
@@ -547,7 +633,7 @@ static unsigned long ac_find_syscall_table(void)
         if (ac_kread(&v2, (void *)(base + __NR_write * sizeof(unsigned long)),
                      sizeof(v2)))
             continue;
-        if (ac_verbose)
+        if (READ_ONCE(ac_verbose))
             pr_info("candidate addr=0x%lx base=0x%lx v2=0x%lx\n",
                     addr, base, v2);
         if (v2 == wh && ac_table_plausible(base, rh)) {
@@ -562,6 +648,8 @@ static unsigned long ac_find_syscall_table(void)
      * rather than skimping on it: some layouts place the table below the
      * first handler. */
     for (addr = rh; addr > rh - 0x2000000UL; addr -= sizeof(unsigned long)) {
+        if ((addr & (AC_SCAN_RESCHED_BYTES - 1)) == 0)
+            cond_resched();   /* see the forward scan above */
         if (ac_kread(&v1, (void *)addr, sizeof(v1)))
             continue;
         if (v1 != rh)
@@ -570,7 +658,7 @@ static unsigned long ac_find_syscall_table(void)
         if (ac_kread(&v2, (void *)(base + __NR_write * sizeof(unsigned long)),
                      sizeof(v2)))
             continue;
-        if (ac_verbose)
+        if (READ_ONCE(ac_verbose))
             pr_info("fallback candidate addr=0x%lx base=0x%lx v2=0x%lx\n",
                     addr, base, v2);
         if (v2 == wh && ac_table_plausible(base, rh)) {
@@ -657,7 +745,7 @@ static void ac_capture_syscall_baseline(void)
     ac_sha256_hex(ac_syscall_baseline, sizeof(ac_syscall_baseline),
                   ac_syscall_baseline_hex);
     ac_syscall_baseline_ready = true;
-    if (ac_verbose)
+    if (READ_ONCE(ac_verbose))
         pr_info("syscall handler baseline captured: sha256=%s\n",
                 ac_syscall_baseline_hex);
 }
@@ -804,7 +892,19 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
 #define AC_RING_SIZE 256
 
 static struct ac_event ac_ring[AC_RING_SIZE];
-static unsigned int ac_ring_head, ac_ring_tail, ac_ring_count;
+static unsigned int ac_ring_head, ac_ring_tail;
+/* ac_ring_count and ac_dropped are written only under ac_ring_lock, but
+ * both have one legitimate reader that deliberately runs without it:
+ * GET_EVENTS' wait_event_interruptible_timeout() condition polls
+ * ac_ring_count as a racy hint (the authoritative peek happens under the
+ * lock afterwards), and AC_IOCTL_STATUS reports ac_dropped without taking
+ * the lock for a single counter. Both readers already use READ_ONCE(); the
+ * writes below use WRITE_ONCE() so the pairing is complete rather than
+ * half-annotated -- an unmarked write against a marked read is exactly the
+ * shape KCSAN flags, and it leaves the compiler free to split or
+ * speculatively store the update. Readers that do hold ac_ring_lock stay
+ * plain: the lock already orders them. */
+static unsigned int ac_ring_count;
 static DEFINE_SPINLOCK(ac_ring_lock);
 static unsigned int ac_dropped;
 static unsigned int ac_last_hook_count;
@@ -839,8 +939,8 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
     spin_lock_irqsave(&ac_ring_lock, flags);
     if (ac_ring_count >= AC_RING_SIZE) {
         ac_ring_tail = (ac_ring_tail + 1) % AC_RING_SIZE;
-        ac_ring_count--;
-        ac_dropped++;
+        WRITE_ONCE(ac_ring_count, ac_ring_count - 1);
+        WRITE_ONCE(ac_dropped, ac_dropped + 1);
         ac_ring_removed++;
     }
     ev = &ac_ring[ac_ring_head];
@@ -853,7 +953,7 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
     vsnprintf(ev->data, sizeof(ev->data), fmt, args);
     va_end(args);
     ac_ring_head = (ac_ring_head + 1) % AC_RING_SIZE;
-    ac_ring_count++;
+    WRITE_ONCE(ac_ring_count, ac_ring_count + 1);
     spin_unlock_irqrestore(&ac_ring_lock, flags);
     /* Outside the spinlock: wake_up_interruptible() takes its own lock
      * (the waitqueue's) and there is no ordering requirement that
@@ -877,7 +977,7 @@ static int ac_drain_events(struct ac_event_list *out)
         if (out)
             out->events[out->count++] = ac_ring[ac_ring_tail];
         ac_ring_tail = (ac_ring_tail + 1) % AC_RING_SIZE;
-        ac_ring_count--;
+        WRITE_ONCE(ac_ring_count, ac_ring_count - 1);
         ac_ring_removed++;
     }
     spin_unlock_irqrestore(&ac_ring_lock, flags);
@@ -932,7 +1032,7 @@ static void ac_commit_events(unsigned int n, u64 removed_before)
     if (to_remove > ac_ring_count)
         to_remove = ac_ring_count;
     ac_ring_tail = (ac_ring_tail + to_remove) % AC_RING_SIZE;
-    ac_ring_count -= to_remove;
+    WRITE_ONCE(ac_ring_count, ac_ring_count - to_remove);
     ac_ring_removed += to_remove;
     spin_unlock_irqrestore(&ac_ring_lock, flags);
 }
@@ -991,6 +1091,32 @@ struct ac_prot_entry {
      * double-listing the pid, and leaving one still registered after
      * ac_del_prot_mm() stops at its first (and only known) match. */
     struct mm_struct *claiming;
+    /* Meaningful only while .mm == AC_PROT_RESERVED: an
+     * ac_del_prot_mm()/ac_clear_protected() call arrived for .claiming
+     * while this slot's mmu_notifier_register() was still in flight, and
+     * could not act on it -- the notifier isn't registered yet, so there
+     * is nothing to unregister, and the slot doesn't match by .mm. Without
+     * this flag that removal is simply lost: ac_add_prot_mm() goes on to
+     * publish the entry moments later and the mm stays protected despite
+     * an explicit, successful-looking AC_IOCTL_DEL_PROC. The claiming side
+     * honours it right after register() returns (see ac_add_prot_mm()),
+     * which is the only point at which the removal is actually
+     * performable. */
+    bool cancel;
+    /* mmu_notifier cleanup for an organically-exited mm, deferred to
+     * ac_wq -- embedded in the slot rather than allocated per request
+     * (which is what this used to do, from GFP_ATOMIC, via a mempool).
+     * An allocation failure there was unrecoverable: nothing else ever
+     * calls mmu_notifier_unregister() for such a slot, so the mm_count
+     * reference leaked permanently and .removing stayed set, pinning the
+     * slot against reuse forever -- repeated failures could retire the
+     * whole AC_PROT_MAX-entry registry. A slot has at most one release in
+     * flight by construction (.removing, set before queueing and cleared
+     * only by the worker, blocks every path that could start another), so
+     * one embedded work_struct per slot is sufficient and cannot fail to
+     * be queued. */
+    struct work_struct release_work;
+    struct mm_struct *release_mm;   /* mm for the in-flight release_work */
     char comm[AC_MAX_COMM];
 };
 
@@ -1057,34 +1183,31 @@ static struct task_struct *ac_find_task_in_ns_of(pid_t nr, pid_t ref_pid)
  * provide that call for the explicit-removal case, but nothing else ever
  * will for a slot whose mm exited organically: once ac_mmu_release() below
  * clears e->mm to NULL, no future scan can ever match this slot by mm
- * pointer again to unregister it. Deferred here via ac_wq, same GFP_ATOMIC/
- * queue_work() shape as ac_schedule_kill() -- this callback must not call
- * mmu_notifier_unregister() reentrantly on itself (see ac_mmu_release()'s
- * own comment), and its calling context isn't guaranteed sleepable. The mm
- * can't be freed before the worker runs: the very mmgrab() reference this
- * is balancing is what's keeping mm_count elevated until then. */
-struct ac_prot_release_req {
-    struct work_struct work;
-    struct ac_prot_entry *e;
-    struct mm_struct *mm;
-};
-
+ * pointer again to unregister it. Deferred here via ac_wq -- this callback
+ * must not call mmu_notifier_unregister() reentrantly on itself (see
+ * ac_mmu_release()'s own comment), and its calling context isn't
+ * guaranteed sleepable. The mm can't be freed before the worker runs: the
+ * very mmgrab() reference this is balancing is what's keeping mm_count
+ * elevated until then. The work_struct lives in the slot itself (see
+ * ac_prot_entry.release_work), so queueing it needs no allocation and
+ * therefore has no failure path. */
 static void ac_prot_release_worker(struct work_struct *w)
 {
-    struct ac_prot_release_req *r =
-        container_of(w, struct ac_prot_release_req, work);
+    struct ac_prot_entry *e = container_of(w, struct ac_prot_entry,
+                                            release_work);
+    struct mm_struct *mm = e->release_mm;
     unsigned long flags;
 
     /* ->release() already ran synchronously before this worker was even
      * queued (that's how we got here), so this call's hlist_unhashed()
      * check will find it already unhashed and won't re-invoke release() --
      * it only performs the mdrop() this slot still owes. */
-    mmu_notifier_unregister(&r->e->notifier, r->mm);
+    mmu_notifier_unregister(&e->notifier, mm);
 
     spin_lock_irqsave(&ac_prot_lock, flags);
-    r->e->removing = false;
+    e->release_mm = NULL;
+    e->removing = false;
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    mempool_free(r, ac_prot_release_pool);
 }
 
 /* ->release() is invoked either by exit_mmap() when mm_users hits zero
@@ -1117,7 +1240,6 @@ static void ac_mmu_release(struct mmu_notifier *subscription,
     char comm[AC_MAX_COMM];
     bool removed = false;
     bool caller_initiated = false;
-    struct ac_prot_release_req *r;
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     if (e->mm == mm) {
@@ -1146,23 +1268,16 @@ static void ac_mmu_release(struct mmu_notifier *subscription,
 
     ac_emit(AC_EV_EXIT, pid, comm, "protected process exited");
 
-    /* mempool-backed, same reasoning as ac_schedule_prot_add_req() -- a
-     * plain kmalloc(GFP_ATOMIC) failure here would leak this slot's
-     * mm_count reference *permanently* (nothing else will ever call
-     * mmu_notifier_unregister() for it, see the comment above
-     * ac_prot_release_worker()) and pin the slot against reuse forever,
-     * so repeated failures could eventually exhaust AC_PROT_MAX. The NULL
-     * check below is defense in depth, not the expected path. */
-    r = mempool_alloc(ac_prot_release_pool, GFP_ATOMIC);
-    if (!r) {
-        pr_err("anticheat: OOM deferring mmu_notifier cleanup for exited pid %d (%s); mm and slot leaked\n",
-               pid, comm);
-        return;
-    }
-    r->e = e;
-    r->mm = mm;
-    INIT_WORK(&r->work, ac_prot_release_worker);
-    queue_work(ac_wq, &r->work);
+    /* Allocation-free by construction: release_work is embedded in this
+     * very slot and .removing (set above) guarantees no second release
+     * for it can be in flight, so there is no failure path here that
+     * could leak the slot's mm_count reference or pin the slot against
+     * reuse -- which is exactly what the previous mempool_alloc() shape
+     * did whenever the pool ran dry. queue_work() itself orders the
+     * release_mm store below against the worker's read of it. */
+    e->release_mm = mm;
+    INIT_WORK(&e->release_work, ac_prot_release_worker);
+    queue_work(ac_wq, &e->release_work);
 }
 
 static const struct mmu_notifier_ops ac_mmu_notifier_ops = {
@@ -1207,10 +1322,15 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
             spin_unlock_irqrestore(&ac_prot_lock, flags);
             return 0;                                /* already protected */
         }
-        if (ac_prots[i].mm == AC_PROT_RESERVED && ac_prots[i].claiming == mm) {
+        if (ac_prots[i].mm == AC_PROT_RESERVED && ac_prots[i].claiming == mm &&
+            !ac_prots[i].cancel) {
             /* Another caller is already mid-register for this exact mm;
              * its registration will cover it once it lands, so don't also
-             * claim a second slot for it. */
+             * claim a second slot for it. Unless it has been cancelled by
+             * a racing ac_del_prot_mm() (.cancel): that claim is about to
+             * be torn down again rather than published, so treating it as
+             * a dedupe match would silently drop this registration, the
+             * mirror image of the lost-delete .cancel exists to fix. */
             spin_unlock_irqrestore(&ac_prot_lock, flags);
             return 0;
         }
@@ -1223,6 +1343,7 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
     }
     ac_prots[slot].mm = AC_PROT_RESERVED;
     ac_prots[slot].claiming = mm;
+    ac_prots[slot].cancel = false;
     spin_unlock_irqrestore(&ac_prot_lock, flags);
 
     /* struct mmu_notifier has no ops parameter of its own -- the caller
@@ -1231,10 +1352,41 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
     ret = mmu_notifier_register(&ac_prots[slot].notifier, mm);
 
     spin_lock_irqsave(&ac_prot_lock, flags);
+    /* .claiming/.cancel are defined only for the duration of the
+     * AC_PROT_RESERVED window that ends here, so clear both on every exit
+     * path rather than leaving whichever mm this was for visible in a
+     * slot that no longer means it. */
+    ac_prots[slot].claiming = NULL;
     if (ret) {
         ac_prots[slot].mm = NULL;
+        ac_prots[slot].cancel = false;
         spin_unlock_irqrestore(&ac_prot_lock, flags);
         return ret;
+    }
+    if (ac_prots[slot].cancel) {
+        /* An ac_del_prot_mm()/ac_clear_protected() call for this exact mm
+         * arrived while register() was in flight and could not act on it
+         * then (see .cancel). Honour it now, before the entry is ever
+         * published: undo the registration instead of leaving the mm
+         * protected despite an explicit removal. .removing pins the slot
+         * across the unregister, exactly as ac_del_prot_mm() does for an
+         * already-published entry; .mm is cleared first so the
+         * ac_mmu_release() this triggers finds no match and neither emits
+         * a spurious AC_EV_EXIT nor decrements ac_prot_count, which was
+         * never incremented for this slot. The caller's own reference on
+         * `mm` (held for the duration of this call by contract) is what
+         * keeps it alive across the unregister. */
+        ac_prots[slot].cancel = false;
+        ac_prots[slot].mm = NULL;
+        ac_prots[slot].removing = true;
+        spin_unlock_irqrestore(&ac_prot_lock, flags);
+
+        mmu_notifier_unregister(&ac_prots[slot].notifier, mm);
+
+        spin_lock_irqsave(&ac_prot_lock, flags);
+        ac_prots[slot].removing = false;
+        spin_unlock_irqrestore(&ac_prot_lock, flags);
+        return 0;
     }
     ac_prots[slot].mm = mm;
     ac_prots[slot].pid = pid;
@@ -1287,7 +1439,20 @@ static int ac_add_prot_pid(pid_t pid, pid_t ref_pid, bool jit_allowed,
  * under the same lock that finds the match closes that window: it stops
  * ac_add_prot_mm() from reusing the slot (see its free-slot scan) for as
  * long as this call is in flight, regardless of whether ac_mmu_release()
- * also fires concurrently and clears .mm out from under it. */
+ * also fires concurrently and clears .mm out from under it.
+ *
+ * "No registry entry" is genuinely not the same as "no match", though: a
+ * slot that is mid-registration for this exact mm (.mm ==
+ * AC_PROT_RESERVED, .claiming == mm) holds no notifier registration yet,
+ * so there is nothing this call can unregister -- but ac_add_prot_mm() is
+ * about to publish it as a live entry moments from now. Returning here as
+ * if nothing matched loses the removal outright: AC_IOCTL_DEL_PROC reports
+ * success while the process stays protected, and nothing ever retries. So
+ * flag the claim instead (.cancel) and let ac_add_prot_mm() undo it at the
+ * one point where undoing it is actually possible -- right after its
+ * register() call returns. Every matching claim is flagged, not just the
+ * first: ac_add_prot_mm()'s .removing dedupe exception can transiently
+ * leave more than one claim in flight for a single mm. */
 static void ac_del_prot_mm(struct mm_struct *mm)
 {
     unsigned long flags;
@@ -1300,6 +1465,15 @@ static void ac_del_prot_mm(struct mm_struct *mm)
             ac_prots[i].removing = true;
             found = true;
             break;
+        }
+    }
+    if (!found) {
+        int j;
+
+        for (j = 0; j < AC_PROT_MAX; j++) {
+            if (ac_prots[j].mm == AC_PROT_RESERVED &&
+                ac_prots[j].claiming == mm)
+                ac_prots[j].cancel = true;
         }
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
@@ -1799,6 +1973,15 @@ static bool ac_schedule_prot_rekey(struct mm_struct *old_mm,
 /* lock state: pinned by AC_IOCTL_LOCK (try_module_get) */
 static atomic_t ac_lock_count = ATOMIC_INIT(0);
 
+/* Ceiling on the LOCK nesting depth.  The intended use is one LOCK held by
+ * the daemon, so anything past a handful is a caller bug or a deliberate
+ * attempt to grow the module refcount without bound (each LOCK takes a
+ * try_module_get() that only a matching UNLOCK releases).  Refusing past
+ * the ceiling keeps a misbehaving privileged caller from making the module
+ * permanently unloadable -- the count and the reference stay in balance,
+ * so the existing UNLOCKs still unwind it. */
+#define AC_LOCK_MAX 16
+
 static unsigned int ac_protected_count(void)
 {
     unsigned long flags;
@@ -1940,7 +2123,7 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
             "ptrace req %ld by pid %d (%s) DENIED",
             request, current->pid, current->comm);
 
-    killed = kill && (ac_policy & 0x1);
+    killed = kill && (READ_ONCE(ac_policy) & 0x1);
     if (killed)
         ac_schedule_kill(current);
 
@@ -2058,7 +2241,7 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
              p == &ac_kp_process_vm_readv) ? "readv" : "writev",
             current->pid, current->comm);
 
-    killed = ac_policy & 0x1;
+    killed = READ_ONCE(ac_policy) & 0x1;
     if (killed)
         ac_schedule_kill(current);
 
@@ -2556,31 +2739,90 @@ static struct kprobe *ac_kprobes[] = {
 static bool ac_kp_ok[ARRAY_SIZE(ac_kprobes)];  /* per-slot registration state */
 static unsigned int ac_kprobes_registered;     /* count, for the log line */
 
+/* Which probes carry a defense this module is actually claiming to
+ * provide, as opposed to extending an existing one to a secondary ABI.
+ *
+ * Every probe here is attached by symbol name (__x64_sys_ptrace,
+ * kernel_clone, ...), and register_kprobe() simply fails when the name
+ * doesn't resolve -- a kernel that renames, inlines or drops one of these
+ * (an ordinary thing to happen across versions, or under a different
+ * config) leaves the corresponding defense silently absent while the
+ * module still loads and reports itself healthy. The counts in the load
+ * line don't help: an operator would have to know what the *expected*
+ * counts are for their kernel to notice one is missing.
+ *
+ * The compat (__ia32_*) entries are deliberately non-essential: they are
+ * genuinely absent on a kernel built without CONFIG_IA32_EMULATION, which
+ * is a normal configuration and not a degradation. Their failure stays a
+ * pr_info. Everything else failing means a documented capability isn't
+ * there, and is reported as such -- loudly in the kernel log, and as an
+ * AC_EV_INFO event so the daemon sees it in-band rather than having to
+ * scrape dmesg. */
+static const bool ac_kp_essential[ARRAY_SIZE(ac_kprobes)] = {
+    true, false,    /* ptrace, ptrace (compat) */
+    true, false,    /* process_vm_readv, process_vm_readv (compat) */
+    true, false,    /* process_vm_writev, process_vm_writev (compat) */
+};
+static const bool ac_kretp_essential[ARRAY_SIZE(ac_kretprobes)] = {
+    true,           /* kernel_clone -- fork inheritance */
+    true, true,     /* execve, execveat -- exec rekey */
+    false, false,   /* execve, execveat (compat) */
+};
+
+/* Essential probes that failed to register, for the degraded-mode report
+ * in ac_init(). Empty when everything expected is in place.
+ *
+ * Kept as a list of names rather than one pre-joined string: the joined
+ * form runs to ~200 bytes with every essential probe missing, and an
+ * ac_emit() payload is AC_EVENT_DATA (128) bytes, so reporting it as a
+ * single event would silently hand the daemon a truncated list. The
+ * entries point at the .symbol_name string literals in the probe
+ * definitions above, which have static storage duration, so nothing is
+ * copied and nothing dangles. */
+static const char *ac_degraded_names[ARRAY_SIZE(ac_kprobes) +
+                                     ARRAY_SIZE(ac_kretprobes)];
+static unsigned int ac_degraded_n;
+
 static void ac_register_kprobes(void)
 {
     unsigned int i;
 
+    ac_degraded_n = 0;
     for (i = 0; i < ARRAY_SIZE(ac_kprobes); i++) {
         int ret = register_kprobe(ac_kprobes[i]);
+        const char *name = ac_kprobes[i]->symbol_name;
 
         ac_kp_ok[i] = (ret == 0);
         if (ret == 0) {
             ac_kprobes_registered++;
-        } else if (ac_verbose) {
-            pr_info("kprobe %s unavailable: %d\n",
-                    ac_kprobes[i]->symbol_name, ret);
+            continue;
         }
+        if (!ac_kp_essential[i]) {
+            if (READ_ONCE(ac_verbose))
+                pr_info("kprobe %s unavailable: %d (optional)\n", name, ret);
+            continue;
+        }
+        pr_err("kprobe %s FAILED to register: %d -- the defense it provides is NOT active\n",
+               name, ret);
+        ac_degraded_names[ac_degraded_n++] = name;
     }
     for (i = 0; i < ARRAY_SIZE(ac_kretprobes); i++) {
         int ret = register_kretprobe(ac_kretprobes[i]);
+        const char *name = ac_kretprobes[i]->kp.symbol_name;
 
         ac_kretp_ok[i] = (ret == 0);
         if (ret == 0) {
             ac_kretprobes_registered++;
-        } else if (ac_verbose) {
-            pr_info("kretprobe %s unavailable: %d\n",
-                    ac_kretprobes[i]->kp.symbol_name, ret);
+            continue;
         }
+        if (!ac_kretp_essential[i]) {
+            if (READ_ONCE(ac_verbose))
+                pr_info("kretprobe %s unavailable: %d (optional)\n", name, ret);
+            continue;
+        }
+        pr_err("kretprobe %s FAILED to register: %d -- the defense it provides is NOT active\n",
+               name, ret);
+        ac_degraded_names[ac_degraded_n++] = name;
     }
 }
 
@@ -2946,7 +3188,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (copy_from_user(&a, uarg, sizeof(a)))
             return -EFAULT;
         ret = ac_add_prot_pid(a.pid, a.ref_pid, a.jit_allowed != 0, a.comm);
-        if (ret == 0 && ac_verbose)
+        if (ret == 0 && READ_ONCE(ac_verbose))
             pr_info("protected pid %d (%s)\n", a.pid, a.comm);
         return ret;
     }
@@ -3032,7 +3274,20 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             mutex_lock(&st->lock);
             kvfree(st->vmas);
             st->vmas = NULL;
-            st->n_vmas = 0;
+            /* Clear the whole snapshot, not just the array.  Dropping
+             * ->vmas while leaving ->rwx_count and friends at the previous
+             * scan's values leaves the fd state self-inconsistent: the
+             * summary counters describe a snapshot that no longer exists,
+             * and ->resolved_pid still names a process this fd is no longer
+             * scanning (one that may since have exited and had its pid
+             * recycled).  Nothing reads them outside SCAN_BEGIN today --
+             * ac_build_vma_snapshot() resets them itself before refilling --
+             * so this is not a live bug, but "END means ended" is the
+             * invariant worth being able to rely on when a later reader
+             * appears. */
+            st->n_vmas = st->rwx_count = st->exec_count =
+                st->anon_exec_count = st->truncated = 0;
+            st->resolved_pid = 0;
             mutex_unlock(&st->lock);
         }
         return 0;
@@ -3186,22 +3441,44 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -EFAULT;
         return 0;
     }
-    case AC_IOCTL_LOCK:
+    case AC_IOCTL_LOCK: {
+        int prev;
+
         /* Pin the module until a matching UNLOCK.  The reference is taken
          * globally (not per-fd), so the pin intentionally outlives the
          * locking process (crash, kill, or a CLI that opens/closes the
          * device).  Recovery is always possible: any CAP_SYS_ADMIN caller
          * can issue UNLOCK, which balances the count and releases the
-         * reference. */
-        if (try_module_get(THIS_MODULE)) {
-            atomic_inc(&ac_lock_count);
-            return 0;
-        }
-        return -EBUSY;
+         * reference.
+         *
+         * The reference is taken before the count is raised so the two can
+         * never disagree in the direction that matters: UNLOCK's
+         * atomic_dec_if_positive() must never module_put() a reference that
+         * was not taken.  If the bound is hit we hand the reference straight
+         * back. */
+        if (!try_module_get(THIS_MODULE))
+            return -EBUSY;
+        prev = atomic_read(&ac_lock_count);
+        do {
+            if (prev >= AC_LOCK_MAX) {
+                module_put(THIS_MODULE);
+                return -EBUSY;
+            }
+        } while (!atomic_try_cmpxchg(&ac_lock_count, &prev, prev + 1));
+        return 0;
+    }
     case AC_IOCTL_UNLOCK:
         /* atomic_dec_if_positive() makes the check-and-decrement a single
          * atomic step, so two concurrent UNLOCKs racing a single LOCK can't
-         * both observe a positive count and both call module_put(). */
+         * both observe a positive count and both call module_put().
+         *
+         * Unlocking an already-unlocked module returns success on purpose:
+         * UNLOCK states a desired end state ("not pinned"), and the CLI's
+         * `anticheat unlock` would otherwise fail whenever the module is
+         * already unpinned -- including the common case of re-running it
+         * after a crash that left no lock behind.  There is no per-fd
+         * ownership to report a mismatch against, so there is nothing an
+         * -EINVAL here would let a caller do differently. */
         if (atomic_dec_if_positive(&ac_lock_count) >= 0)
             module_put(THIS_MODULE);
         return 0;
@@ -3298,6 +3575,7 @@ static void ac_clear_protected(void)
 static int __init ac_init(void)
 {
     int ret;
+    bool degraded;
 
     /*
      * ac_schedule_kill() (see below) queues a tiny, non-blocking work item
@@ -3330,23 +3608,15 @@ static int __init ac_init(void)
         destroy_workqueue(ac_wq);
         return -ENOMEM;
     }
-    ac_prot_release_pool = mempool_create_kmalloc_pool(AC_PROT_MAX,
-                                                        sizeof(struct ac_prot_release_req));
-    if (!ac_prot_release_pool) {
-        mempool_destroy(ac_prot_add_pool);
-        destroy_workqueue(ac_wq);
-        return -ENOMEM;
-    }
     ac_kill_pool = mempool_create_kmalloc_pool(16, sizeof(struct ac_kill_req));
     if (!ac_kill_pool) {
-        mempool_destroy(ac_prot_release_pool);
         mempool_destroy(ac_prot_add_pool);
         destroy_workqueue(ac_wq);
         return -ENOMEM;
     }
 
     ac_resolve_text_bounds();
-    if (ac_verbose)
+    if (READ_ONCE(ac_verbose))
         pr_info("text bounds: stext=0x%lx etext=0x%lx\n", ac_stext, ac_etext);
 
     ac_syscall_table = ac_find_syscall_table();
@@ -3379,15 +3649,55 @@ static int __init ac_init(void)
          * reasoning in ac_exit() below). */
         flush_workqueue(ac_wq);
         mempool_destroy(ac_kill_pool);
-        mempool_destroy(ac_prot_release_pool);
         mempool_destroy(ac_prot_add_pool);
         destroy_workqueue(ac_wq);
         return ret;
     }
 
-    pr_info("loaded (policy=0x%x, %u kprobes, %u kretprobes, %u protected slots)\n",
+    /* Any reason the module is running with less than its full set of
+     * defenses. Both sources have to feed the load line below, or the two
+     * channels contradict each other: a missing syscall table emits a
+     * "loaded DEGRADED" event to the daemon, so an untagged load line in
+     * dmesg would tell an operator the opposite of what the daemon was
+     * being told. */
+    degraded = ac_degraded_n || !ac_syscall_table;
+
+    if (ac_degraded_n) {
+        char list[256];
+        unsigned int used = 0, i;
+
+        /* Loud on both channels: the kernel log for an operator reading
+         * dmesg, and the event ring so the daemon reports degraded
+         * coverage in-band instead of assuming a module that loaded is a
+         * module that works. Deliberately not a load failure -- the
+         * remaining defenses are still worth having, and refusing to load
+         * outright would leave a kernel with one renamed symbol with no
+         * protection at all rather than most of it. */
+        for (i = 0; i < ac_degraded_n; i++)
+            used += scnprintf(list + used, sizeof(list) - used,
+                              "%s%s", used ? ", " : "", ac_degraded_names[i]);
+        pr_err("DEGRADED: probes unavailable (%s) -- the corresponding defenses are NOT active on this kernel\n",
+               list);
+
+        /* One event per probe, not one event carrying the joined list: an
+         * ac_emit() payload is AC_EVENT_DATA (128) bytes and the joined
+         * list reaches ~200, so a single event would truncate and tell the
+         * daemon about only the first few probes -- the rest would look
+         * healthy. Each name is carried with its position so a consumer
+         * can tell a complete report from a dropped one (the ring drops
+         * oldest-first under pressure). */
+        for (i = 0; i < ac_degraded_n; i++)
+            ac_emit(AC_EV_INFO, 0, "?",
+                    "module loaded DEGRADED (%u/%u): probe %s unavailable; corresponding defense inactive",
+                    i + 1, ac_degraded_n, ac_degraded_names[i]);
+    }
+    if (!ac_syscall_table)
+        ac_emit(AC_EV_INFO, 0, "?",
+                "module loaded DEGRADED: syscall table not located; syscall integrity checks inactive");
+
+    pr_info("loaded (policy=0x%x, %u kprobes, %u kretprobes, %u protected slots)%s\n",
             ac_policy, ac_kprobes_registered, ac_kretprobes_registered,
-            AC_PROT_MAX);
+            AC_PROT_MAX, degraded ? " [DEGRADED]" : "");
     return 0;
 }
 
@@ -3416,11 +3726,13 @@ static void __exit ac_exit(void)
     destroy_workqueue(ac_wq);
     /* Safe only now: mempool_destroy() requires every element already
      * returned, and the two flush_workqueue() calls above guarantee every
-     * ac_prot_add_worker()/ac_prot_release_worker() that could still be
-     * holding one has already run to completion and freed it back. */
+     * ac_prot_add_worker() that could still be holding one has already run
+     * to completion and freed it back. (ac_prot_release_worker() holds no
+     * pool element at all any more -- its work_struct is embedded in the
+     * registry slot -- but the same flushes are what guarantee it has
+     * finished touching ac_prots[] before this point.) */
     mempool_destroy(ac_kill_pool);
     mempool_destroy(ac_prot_add_pool);
-    mempool_destroy(ac_prot_release_pool);
     pr_info("unloaded\n");
 }
 
