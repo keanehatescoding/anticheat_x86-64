@@ -254,14 +254,16 @@ it: there is no network segment for the `Authorization: Bearer` key to
 traverse in the first place. This changes what the relevant trust
 boundary *is*, not just narrows it — for the Unix-socket transport it's
 filesystem permissions on the socket path, not network reachability.
-`ac_server.py` creates the socket file `0600` (owner-only, mirroring the
-report DB's own permissions — see `Store.__init__`) and reapplies that
-mode on every start, so anyone able to open that socket has already
-cleared the same bar as reading the SQLite DB directly. That mode isn't
-durably widenable: a daemon running as a different user than the server
-cannot be accommodated by loosening the socket's group/ACL after the
-fact, since the next (re)start resets it to `0600` again -- the daemon
-and server must run as the same user (or the daemon as root). `0600` on
+`ac_server.py` creates the socket file `0600` by default (owner-only,
+mirroring the report DB's own permissions — see `Store.__init__`) and
+reapplies that mode on every start, so anyone able to open that socket
+has already cleared the same bar as reading the SQLite DB directly. That
+default is durably widenable via `--unix-socket-mode`/`--unix-socket-group`
+(#33): e.g. mode `0660` plus a group containing only the daemon user lets
+a different-user daemon connect without a post-hoc chmod/chown the next
+(re)start would undo. Widening extends the trust boundary to every member
+of that group — name the smallest group containing only your daemons, and
+prefer group bits over other bits. `0600` on
 the socket file is also not the whole boundary: it only gates *opening*
 the bound socket, not deleting or replacing the path before the server
 binds to it, so the containing directory (e.g. `/run/anticheat/`) must

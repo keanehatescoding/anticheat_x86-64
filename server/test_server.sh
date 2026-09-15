@@ -1242,6 +1242,107 @@ else
     fail "regular file at --unix-socket's path was removed"
 fi
 
+# --unix-socket-mode/group (#33): an explicit mode and group are applied
+# durably at bind time, so a different-user/group daemon can reach the
+# socket without a post-hoc chmod/chown the next restart would undo.
+MODE_SOCK="$UNIX_TESTDIR/mode.sock"
+MODE_DB="$UNIX_TESTDIR/mode.db"
+MODE_GROUP="$(id -gn)"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --unix-socket "$MODE_SOCK" --db "$MODE_DB" \
+    --rate-limit 500 --rate-window 60 \
+    --unix-socket-mode 0660 --unix-socket-group "$MODE_GROUP" \
+    >"$UNIX_TESTDIR/mode.log" 2>&1 &
+MODE_SERVER_PID=$!
+MODE_READY=0
+for _ in $(seq 1 50); do
+    if curl -s --unix-socket "$MODE_SOCK" http://localhost/banned/x \
+        -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        MODE_READY=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$MODE_READY" -ne 1 ]; then
+    fail "--unix-socket-mode/group server never became ready at $MODE_SOCK"
+else
+    if [ "$(stat -c '%a' "$MODE_SOCK")" = "660" ]; then
+        pass "unix socket with --unix-socket-mode 0660 bound as 0660"
+    else
+        fail "unix socket should be 0660 (got $(stat -c '%a' "$MODE_SOCK"))"
+    fi
+    if [ "$(stat -c '%G' "$MODE_SOCK")" = "$MODE_GROUP" ]; then
+        pass "unix socket with --unix-socket-group owned by that group"
+    else
+        fail "unix socket group should be $MODE_GROUP (got $(stat -c '%G' "$MODE_SOCK"))"
+    fi
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$MODE_SOCK" \
+        -X POST http://localhost/report \
+        -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+        -d '{"client_id":"test-mode-sock","event_type":"CRITICAL","detail":"hook","ts":1}')
+    if [ "$CODE" = "201" ]; then
+        pass "POST /report over --unix-socket-mode/group socket -> 201"
+    else
+        fail "POST /report over --unix-socket-mode/group socket (got $CODE)"
+    fi
+fi
+kill "$MODE_SERVER_PID" 2>/dev/null
+wait "$MODE_SERVER_PID" 2>/dev/null
+
+# A non-octal mode and an unknown group must both fail at startup instead
+# of binding a socket with unintended permissions or ownership.
+if AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --unix-socket "$UNIX_TESTDIR/bad.sock" \
+    --db "$UNIX_TESTDIR/bad.db" --unix-socket-mode 999 \
+    >"$UNIX_TESTDIR/bad-mode.log" 2>&1; then
+    fail "server should refuse to start with --unix-socket-mode 999"
+else
+    pass "server refuses to start with --unix-socket-mode 999"
+fi
+if AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --unix-socket "$UNIX_TESTDIR/bad2.sock" \
+    --db "$UNIX_TESTDIR/bad2.db" --unix-socket-group "no-such-group-xyz" \
+    >"$UNIX_TESTDIR/bad-group.log" 2>&1; then
+    fail "server should refuse to start with an unknown --unix-socket-group"
+else
+    pass "server refuses to start with an unknown --unix-socket-group"
+fi
+
+# Socket-only options are ignored (not fatal) without --unix-socket: a
+# TCP listener must still start even with an invalid mode and group.
+IGN_PORT=18817
+IGN_TESTDIR="$(mktemp -d /tmp/ac_server_ign_test.XXXXXXXX)"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --host 127.0.0.1 --port "$IGN_PORT" \
+    --db "$IGN_TESTDIR/ac.db" --rate-limit 500 --rate-window 60 \
+    --unix-socket-mode 999 --unix-socket-group "no-such-group-xyz" \
+    >"$IGN_TESTDIR/server.log" 2>&1 &
+IGN_SERVER_PID=$!
+IGN_READY=0
+for _ in $(seq 1 50); do
+    if curl -s "http://127.0.0.1:$IGN_PORT/banned/x" \
+        -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        IGN_READY=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$IGN_READY" -ne 1 ]; then
+    fail "TCP server with inapplicable socket-only options failed to start"
+else
+    pass "TCP server ignores inapplicable socket-only options and still serves"
+fi
+if grep -q "have no effect on the TCP listener" "$IGN_TESTDIR/server.log"; then
+    pass "TCP server warns that socket-only options have no effect"
+else
+    fail "TCP server should warn that socket-only options have no effect"
+fi
+kill "$IGN_SERVER_PID" 2>/dev/null
+wait "$IGN_SERVER_PID" 2>/dev/null
+rm -rf "$IGN_TESTDIR"
+
 rm -rf "$UNIX_TESTDIR"
 
 # --trust-proxy over --unix-socket would let any client on the socket
