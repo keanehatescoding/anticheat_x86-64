@@ -38,11 +38,13 @@ ac_report() in src/anticheat_daemon.c). This removes the plaintext-
 network-credential exposure noted above for a daemon and server
 co-located on the same host: filesystem permissions on the socket become
 the trust boundary instead of network reachability. The socket is
-created 0600 (owner-only) to match Store's own DB-file permissions, and
-that mode is reapplied on every start -- a daemon connecting to it must
-run as this server's own user (or root). There's no durable way to widen
-that for a different-user daemon: any group/ACL change made after the
-fact is undone the next time this process (re)starts and rebinds.
+created 0600 (owner-only) by default to match Store's own DB-file
+permissions, and that mode is reapplied on every start -- a daemon
+connecting to it must run as this server's own user (or root). Pass
+--unix-socket-mode and --unix-socket-group to widen that durably for a
+different-user/group daemon (e.g. --unix-socket-mode 0660
+--unix-socket-group acd); widening lets every member of that group
+connect, so name the smallest group containing only your daemons.
 """
 import argparse
 import hmac
@@ -309,8 +311,19 @@ class ThreadingUnixHTTPServer(BoundedThreadingMixIn, http.server.HTTPServer):
     itself is transport-agnostic (it only calls socket.socket(self.address_family,
     self.socket_type) and self.socket.bind(self.server_address)) -- the two
     overrides below are the only AF_UNIX-specific behavior needed."""
-
     address_family = socket.AF_UNIX
+
+    def __init__(self, server_address, RequestHandlerClass, mode=0o600,
+                 group=None, **kwargs):
+        # mode is the numeric socket-file mode applied in server_bind;
+        # group is either None (leave ownership alone) or a numeric gid
+        # already resolved by _resolve_socket_group() -- resolution lives
+        # outside bind so a bad group name fails at startup with a clear
+        # message instead of mid-bind. Extra kwargs (max_connections,
+        # bind_and_activate) pass straight through to the mixin/HTTPServer.
+        self._socket_mode = mode
+        self._socket_gid = group
+        super().__init__(server_address, RequestHandlerClass, **kwargs)
 
     def server_bind(self):
         # Binding an AF_UNIX SOCK_STREAM socket fails outright if a file
@@ -365,12 +378,16 @@ class ThreadingUnixHTTPServer(BoundedThreadingMixIn, http.server.HTTPServer):
         socketserver.TCPServer.server_bind(self)
         self.server_name = "unix"
         self.server_port = 0
-        # Match Store's own DB-file permissions (0600, see Store.__init__):
-        # filesystem permissions on this socket are the trust boundary for
-        # the --unix-socket transport (see the module docstring's "No TLS"
-        # / unix-socket note), not whatever the process umask happens to
-        # be at bind time.
-        os.chmod(self.server_address, 0o600)
+        # Filesystem permissions on this socket are the trust boundary
+        # for the --unix-socket transport (see the module docstring's
+        # "No TLS" / unix-socket note), not whatever the process umask
+        # happens to be at bind time -- so the mode is always reapplied
+        # here, defaulting to 0600 to match Store's own DB-file
+        # permissions (see Store.__init__). chown before chmod: chown
+        # can clear permission bits on some platforms.
+        if self._socket_gid is not None:
+            os.chown(self.server_address, -1, self._socket_gid)
+        os.chmod(self.server_address, self._socket_mode)
         # Recorded so a later cleanup unlink (see main()'s shutdown path)
         # can confirm the path still names *this* socket before removing
         # it -- not, say, a replacement another process created at the
@@ -672,6 +689,39 @@ def _parse_proxy_cidrs(values):
                              "single host (e.g. 10.0.0.5/32), with no "
                              "host bits set" % (v,)) from None
     return nets
+
+
+def _parse_socket_mode(value):
+    """Parse --unix-socket-mode into a numeric file mode.
+    Accepts the usual octal spellings ("0600", "600", "0o600").
+    Raises ValueError on anything else -- main() turns that into a
+    startup refusal. Range-checked to 0..0o777 so a typo like "06000"
+    can't silently land somewhere unexpected."""
+    text = value.strip()
+    for prefix in ("0o", "0O"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    if not text or any(c not in "01234567" for c in text):
+        raise ValueError("invalid --unix-socket-mode %r: use an octal "
+                         "mode like 0600" % (value,))
+    mode = int(text, 8)
+    if mode < 0 or mode > 0o777:
+        raise ValueError("invalid --unix-socket-mode %r: use an octal "
+                         "mode between 0000 and 0777" % (value,))
+    return mode
+
+
+def _resolve_socket_group(name):
+    """Resolve --unix-socket-group into a numeric gid.
+    Raises ValueError naming the unknown group -- main() turns that
+    into a startup refusal instead of binding a socket with the
+    wrong ownership."""
+    import grp
+    try:
+        return grp.getgrnam(name).gr_gid
+    except KeyError:
+        raise ValueError("unknown --unix-socket-group %r" % (name,)) from None
 
 
 def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False,
@@ -1143,9 +1193,30 @@ def main():
         help="listen on an AF_UNIX SOCK_STREAM socket at PATH instead of "
         "TCP -- --host/--port are ignored when this is set. The matching "
         "daemon-side option is AC_REPORT_URL=unix://PATH. The socket is "
-        "created 0600 (owner-only); filesystem permissions on it are the "
-        "trust boundary for this transport, same role network exposure "
-        "plays for the default TCP one (default: off, use TCP)",
+        "created 0600 (owner-only) unless --unix-socket-mode/group below "
+        "say otherwise; filesystem permissions on it are the trust "
+        "boundary for this transport, same role network exposure plays "
+        "for the default TCP one (default: off, use TCP)",
+    )
+    ap.add_argument(
+        "--unix-socket-mode",
+        default="0600",
+        metavar="MODE",
+        help="octal file mode applied to the --unix-socket path on every "
+        "bind (e.g. 0600, 0660, 0770). The default keeps the socket "
+        "owner-only, matching the report DB's own 0600; widening lets "
+        "every local user matching those bits connect, so prefer group "
+        "bits plus --unix-socket-group over other bits (default: 0600)",
+    )
+    ap.add_argument(
+        "--unix-socket-group",
+        default=None,
+        metavar="GROUP",
+        help="group name owning the --unix-socket path (via chown before "
+        "the mode above is applied) -- the durable way to let a "
+        "different-user daemon reach the socket, e.g. --unix-socket-mode "
+        "0660 --unix-socket-group acd. Has no effect without "
+        "--unix-socket (default: leave ownership alone)",
     )
     ap.add_argument("--db", default="ac_server.db")
     ap.add_argument(
@@ -1388,7 +1459,37 @@ def main():
             "--trust-proxy -- the allowlist has no effect unless the "
             "header is actually trusted\n"
         )
-
+    try:
+        socket_mode = _parse_socket_mode(args.unix_socket_mode)
+    except ValueError as e:
+        sys.stderr.write("ac_server: %s -- refusing to start\n" % (e,))
+        sys.exit(1)
+    socket_gid = None
+    if args.unix_socket_group is not None:
+        try:
+            socket_gid = _resolve_socket_group(args.unix_socket_group)
+        except ValueError as e:
+            sys.stderr.write("ac_server: %s -- refusing to start\n" % (e,))
+            sys.exit(1)
+    if (args.unix_socket_mode != "0600" or args.unix_socket_group is not None) \
+            and not args.unix_socket:
+        # Same fail-safe-direction warning shape as the CIDR-without-
+        # --trust-proxy one above: harmless if ignored, but almost
+        # certainly not what was meant.
+        sys.stderr.write(
+            "ac_server: warning: --unix-socket-mode/group given without "
+            "--unix-socket -- they have no effect on the TCP listener\n"
+        )
+    if socket_mode & 0o077:
+        # Widening is the opt-in point of these flags, so it stays
+        # allowed -- but filesystem permissions ARE the trust boundary
+        # on this transport, so say so once at startup rather than
+        # silently running wider than the 0600 default.
+        sys.stderr.write(
+            "ac_server: warning: unix socket mode %04o grants group/other "
+            "access -- every local user matching those bits can submit "
+            "reports and probe the admin API\n" % (socket_mode,)
+        )
     if args.trust_proxy and args.unix_socket:
         # --trust-proxy makes the handler take X-Forwarded-For at face
         # value for rate limiting and source_addr. Over the unix-socket
@@ -1419,7 +1520,8 @@ def main():
     )
     if args.unix_socket:
         httpd = ThreadingUnixHTTPServer(
-            args.unix_socket, handler, max_connections=args.max_connections
+            args.unix_socket, handler, mode=socket_mode, group=socket_gid,
+            max_connections=args.max_connections
         )
     else:
         httpd = BoundedThreadingHTTPServer(
@@ -1459,10 +1561,14 @@ def main():
             % ", ".join(accepted_old_keys)
         )
     if args.unix_socket:
-        listen_desc = (
-            "unix socket %s (0600, filesystem permissions are the trust "
-            "boundary -- see --unix-socket's help)" % args.unix_socket
+        sock_desc = "unix socket %s (%04o" % (args.unix_socket, socket_mode)
+        if args.unix_socket_group is not None:
+            sock_desc += ", group %s" % args.unix_socket_group
+        sock_desc += (
+            ", filesystem permissions are the trust boundary "
+            "-- see --unix-socket's help)"
         )
+        listen_desc = sock_desc
     else:
         listen_desc = (
             "%s:%d (plain HTTP -- put a TLS reverse proxy in front for "
