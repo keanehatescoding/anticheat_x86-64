@@ -134,6 +134,9 @@ if [ "$OFFLINE" -eq 1 ]; then
 elif [ "$repo_url" = "$src_url" ]; then
     err "source= url is not a github /archive/refs/tags/ tarball — can't" \
         "derive the repo to look $tag up in"
+elif [[ ! "$repo_url" =~ ^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+    err "source= url does not point at a github.com/<owner>/<repo> archive" \
+        "tarball (got repo '$repo_url') — refusing to pass it to git"
 elif ! command -v git >/dev/null 2>&1; then
     note "git not found — cannot look up $tag"
 else
@@ -144,7 +147,7 @@ else
     # would read as "tag absent" — i.e. as permission to keep SKIP.
     ls_status=0
     ls_out="$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true \
-                  git ls-remote --tags --exit-code \
+                  git ls-remote --tags --exit-code -- \
                   "$repo_url" "refs/tags/$tag" 2>&1)" || ls_status=$?
     if [ "$ls_status" -eq 0 ]; then
         tag_state="present"
@@ -199,12 +202,15 @@ if [ "$fail" -eq 0 ] && [ "$OFFLINE" -eq 0 ] && [ "$sha" != "SKIP" ] \
    && [ "$tag_state" != "absent" ]; then
     if ! command -v curl >/dev/null 2>&1; then
         err "curl not found — cannot verify sha256sums against $src_url"
+    elif [[ "$src_url" != https://github.com/* ]]; then
+        err "source= url is not an https://github.com/ tarball (got" \
+            "'$src_url') — refusing to pass it to curl"
     else
         tmp="$(mktemp)"
         trap 'rm -f "$tmp"' EXIT
         note "verifying sha256sums against $src_url"
         if curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
-                -o "$tmp" "$src_url"; then
+                -o "$tmp" -- "$src_url"; then
             got="$(sha256sum "$tmp" | cut -d' ' -f1)"
             if [ "$got" = "$sha" ]; then
                 note "OK: tarball hashes to the declared sha256sums"

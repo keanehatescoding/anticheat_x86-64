@@ -19,7 +19,7 @@ resolves once the version in the spec is actually tagged upstream (see
 the same way the AUR README describes for testing:
 
 ```sh
-git archive --format=tar --prefix=hypranticheat-<version>/ HEAD \
+git archive --format=tar --prefix=anticheat_x86-64-<version>/ HEAD \
     | gzip > ~/rpmbuild/SOURCES/v<version>.tar.gz
 rpmbuild -ba hypranticheat.spec
 ```
