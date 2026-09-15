@@ -14,7 +14,9 @@ case "$1" in
         done
         if [ -n "$dkms_src" ]; then
             ver="$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' "$dkms_src/dkms.conf" 2>/dev/null)"
-            [ -n "$ver" ] && dkms remove -m anticheat -v "$ver" --all >/dev/null 2>&1 || true
+            if [ -n "$ver" ]; then
+                dkms remove -m anticheat -v "$ver" --all >/dev/null 2>&1 || true
+            fi
         fi
         ;;
 esac
