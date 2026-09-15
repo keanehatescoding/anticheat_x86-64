@@ -352,13 +352,19 @@ PER_PID=$!
 ./anticheat protect --pid $PER_PID >/dev/null 2>&1
 # Create a child that has the environ we want to fake via AC_MOCK_ENVIRON? Instead we run daemon with AC_MOCK_ENVIRON set so every protected pid appears to have LD_PRELOAD
 per_out=$(timeout -k 2 --preserve-status 4 env AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/evil.so" AC_LD_PRELOAD_CHECK_INTERVAL=1 AC_VK_LAYER_CHECK_INTERVAL=1 AC_IMPLICIT_LAYER_CHECK_INTERVAL=1 AC_RENDER_HOOK_CHECK_INTERVAL=1 AC_SCAN_CHECK_INTERVAL=1 ./anticheat start --foreground 2>&1)
-# LD_PRELOAD warning should appear once per pid, not per interval — but
-# mock state accumulates protects from earlier tests, so count scales with
-# number of protected pids still alive. Allow 1..10 to avoid flaky failure
-# due to state pollution while still catching the "warn every interval" bug
-# (which would be >>10 in 4s with 1s interval).
-per_ld_count=$(printf '%s' "$per_out" | grep -c "LD_PRELOAD=/tmp/evil.so" || true)
-if [ "$per_ld_count" -ge 1 ] && [ "$per_ld_count" -le 10 ]; then pass "periodic LD_PRELOAD warned once per pid (got $per_ld_count)"; else fail "periodic LD_PRELOAD count $per_ld_count unexpected"; fi
+# The property under test is "warn once per pid", not "once per interval",
+# so scope the count to the pid this test actually protected — the same
+# shape the --jit check above uses. Counting every LD_PRELOAD line in the
+# output instead makes the assertion depend on how many protected pids
+# earlier tests left behind in the shared mock state, which is why it had
+# to be bounded by a guess (1..10) and why it failed intermittently when
+# that guess was off by one (#70). Against a single known pid the bound is
+# exact: a genuine warn-every-interval regression would produce ~4 lines
+# for this pid in 4s at a 1s interval, where the daemon's per-pid
+# suppression must produce exactly 1.
+per_ld_count=$(printf '%s' "$per_out" | grep -c "pid $PER_PID (.*LD_PRELOAD=/tmp/evil.so" || true)
+if [ "$per_ld_count" -eq 1 ]; then pass "periodic LD_PRELOAD warned exactly once for pid $PER_PID"; else fail "periodic LD_PRELOAD count $per_ld_count for pid $PER_PID, expected 1"; fi
+./anticheat unprotect --pid $PER_PID >/dev/null 2>&1 || true
 kill $PER_PID 2>/dev/null; wait $PER_PID 2>/dev/null || true
 
 
