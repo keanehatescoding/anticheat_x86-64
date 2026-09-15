@@ -78,19 +78,26 @@ jobs:
       - name: Verify scripts kept their executable bit
         run: |
           fail=0
+          # Debian maintainer scripts and rules(5) carry no .sh suffix but
+          # dpkg requires them executable -- the '*.sh' glob alone misses
+          # a silently-dropped mode on exactly these files (#31).
           while IFS= read -r f; do
             if [ ! -x "$f" ]; then
               echo "::error file=$f::executable bit missing (mode $(stat -c%a "$f"))"
               fail=1
             fi
-          done < <(git ls-files '*.sh')
+          done < <(git ls-files '*.sh' '*.postinst' '*.prerm' 'packaging/debian/rules')
           exit "$fail"
 
       - name: Shellcheck the shell scripts
         run: |
           command -v shellcheck >/dev/null 2>&1 || \
             { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-          git ls-files '*.sh' | xargs shellcheck
+          # Same extensionless-script gap as the executable-bit check above:
+          # the Debian maintainer scripts are /bin/sh and shellcheck-clean,
+          # so cover them too. packaging/debian/rules is deliberately
+          # excluded -- it is a Makefile (#!/usr/bin/make -f), not shell.
+          git ls-files '*.sh' '*.postinst' '*.prerm' | xargs shellcheck
 
       # packaging/aur/PKGBUILD carries sha256sums=('SKIP') as a deliberate
       # placeholder: its source= is a tag-pinned release tarball that does
@@ -342,6 +349,7 @@ jobs:
               - 'src/anticheat.h'
               - 'Makefile'
               - 'dkms.conf'
+              - 'test/ioctl_fuzz.c'
               - 'src/sha256.*'
 
   # --- real-module fuzz seed: short KASAN run against the actual module ---

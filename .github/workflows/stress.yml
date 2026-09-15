@@ -22,6 +22,10 @@ jobs:
   stress:
     name: server/stress_test.sh (sustained concurrent load)
     runs-on: ubuntu-latest
+    # 30 minutes: workers default to 300 s each plus setup/teardown, so a
+    # healthy run finishes well inside this; without any timeout a hung
+    # worker blocks the runner indefinitely (#31).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
