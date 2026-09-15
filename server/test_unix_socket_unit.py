@@ -11,7 +11,9 @@
   ownership.
 - ThreadingUnixHTTPServer applies the given mode (and group) on bind and
   keeps the 0600 default when nothing is passed -- binding real AF_UNIX
-  sockets in a temp dir, no serve_forever, no network.
+  sockets in a temp dir, no serve_forever, no network. Permissions go
+  through the socket descriptor (pre-bind fchmod seed, post-bind fchown),
+  never the pathname, and the temporarily cleared umask is restored.
 
 No unittest framework, no pytest -- matches this project's existing
 test-script style (plain assert-and-report, see
@@ -117,6 +119,22 @@ with tempfile.TemporaryDirectory() as tmp:
         srv.server_close()
         try:
             os.unlink(custom_sock)
+        except FileNotFoundError:
+            pass
+
+    # Binding must not leak its cleared umask into the process: the mode
+    # seed goes through the socket fd, and the umask is restored after.
+    prev_umask = os.umask(0o077)
+    os.umask(prev_umask)
+    umask_sock = os.path.join(tmp, "umask.sock")
+    srv = _bind(umask_sock)
+    try:
+        cur_umask = os.umask(prev_umask)
+        check("server_bind leaves the process umask unchanged", cur_umask == prev_umask)
+    finally:
+        srv.server_close()
+        try:
+            os.unlink(umask_sock)
         except FileNotFoundError:
             pass
 

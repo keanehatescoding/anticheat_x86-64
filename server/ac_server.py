@@ -309,7 +309,7 @@ class ThreadingUnixHTTPServer(BoundedThreadingMixIn, http.server.HTTPServer):
     ThreadingHTTPServer, just over an AF_UNIX SOCK_STREAM socket bound to
     a filesystem path instead of a TCP (host, port). http.server.HTTPServer
     itself is transport-agnostic (it only calls socket.socket(self.address_family,
-    self.socket_type) and self.socket.bind(self.server_address)) -- the two
+    self.socket_type) and self.socket.bind(self.server_address)) -- the
     overrides below are the only AF_UNIX-specific behavior needed."""
     address_family = socket.AF_UNIX
 
@@ -375,24 +375,56 @@ class ThreadingUnixHTTPServer(BoundedThreadingMixIn, http.server.HTTPServer):
         # server_name/server_port instead of failing loudly. Nothing here
         # actually uses those two attributes, but there's no reason to let
         # them hold nonsense when a real placeholder is just as cheap.
-        socketserver.TCPServer.server_bind(self)
+        #
+        # Permissions are applied through the socket descriptor, never the
+        # pathname: between bind() and a pathname chmod/chown, anyone with
+        # write access to the socket directory could swap the path, and the
+        # chmod/chown would then follow the replacement -- a privileged
+        # server must not modify whatever a path happens to name. Instead:
+        # pre-bind fchmod(fd, mode) seeds the mode the bound file gets
+        # (verified on Linux: the directory entry lands at seed & ~umask,
+        # so bind under a cleared umask -- single-threaded here, no
+        # handler threads exist yet -- and a post-bind fchmod would only
+        # change the fstat-visible seed, not the entry itself, so it is
+        # not used), and post-bind fchown(fd, -1, gid) retargets the group
+        # through the fd, which keeps referring to our socket even if the
+        # path is swapped underneath us.
+        old_umask = os.umask(0)
+        try:
+            os.fchmod(self.socket.fileno(), self._socket_mode)
+            socketserver.TCPServer.server_bind(self)
+        finally:
+            os.umask(old_umask)
         self.server_name = "unix"
         self.server_port = 0
+        if self._socket_gid is not None:
+            os.fchown(self.socket.fileno(), -1, self._socket_gid)
+        # Fail closed on anything unexpected: the stat calls below only
+        # read through the path (never modify), so a swapped path just
+        # aborts startup instead of running with unintended permissions.
         # Filesystem permissions on this socket are the trust boundary
         # for the --unix-socket transport (see the module docstring's
-        # "No TLS" / unix-socket note), not whatever the process umask
-        # happens to be at bind time -- so the mode is always reapplied
-        # here, defaulting to 0600 to match Store's own DB-file
-        # permissions (see Store.__init__). chown before chmod: chown
-        # can clear permission bits on some platforms.
-        if self._socket_gid is not None:
-            os.chown(self.server_address, -1, self._socket_gid)
-        os.chmod(self.server_address, self._socket_mode)
+        # "No TLS" / unix-socket note), defaulting to 0600 to match
+        # Store's own DB-file permissions (see Store.__init__).
+        bound = os.stat(self.server_address)
+        if stat.S_IMODE(bound.st_mode) != self._socket_mode:
+            raise RuntimeError(
+                "ac_server: --unix-socket path %r has mode %04o after bind, "
+                "expected %04o -- refusing to run with unintended "
+                "permissions" % (self.server_address,
+                                 stat.S_IMODE(bound.st_mode),
+                                 self._socket_mode)
+            )
+        if self._socket_gid is not None and bound.st_gid != self._socket_gid:
+            raise RuntimeError(
+                "ac_server: --unix-socket path %r has unexpected group "
+                "ownership after bind -- refusing to run" % (self.server_address,)
+            )
         # Recorded so a later cleanup unlink (see main()'s shutdown path)
         # can confirm the path still names *this* socket before removing
         # it -- not, say, a replacement another process created at the
         # same path after this one closed it.
-        self._bound_stat = os.stat(self.server_address)
+        self._bound_stat = bound
 
     def get_request(self):
         # accept()'s peer address for AF_UNIX is '' (the client end is
