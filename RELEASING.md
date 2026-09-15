@@ -113,8 +113,8 @@ the same protocol" case this guards against), independent of whatever
    # from this repo's root; `git -C` so there is no doubt which checkout
    # each command acts on:
    AUR=<path-to-aur-checkout>
-   cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO "$AUR/"
-   git -C "$AUR" diff --stat   # expect both files listed as changed
+   cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO packaging/aur/hypranticheat-dkms.install "$AUR/"
+   git -C "$AUR" diff --stat   # expect all three files listed as changed
    git -C "$AUR" commit -am "Update to v<VERSION>" && git -C "$AUR" push
    ```
 
