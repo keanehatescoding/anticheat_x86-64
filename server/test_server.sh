@@ -1309,6 +1309,40 @@ else
     pass "server refuses to start with an unknown --unix-socket-group"
 fi
 
+# Socket-only options are ignored (not fatal) without --unix-socket: a
+# TCP listener must still start even with an invalid mode and group.
+IGN_PORT=18817
+IGN_TESTDIR="$(mktemp -d /tmp/ac_server_ign_test.XXXXXXXX)"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --host 127.0.0.1 --port "$IGN_PORT" \
+    --db "$IGN_TESTDIR/ac.db" --rate-limit 500 --rate-window 60 \
+    --unix-socket-mode 999 --unix-socket-group "no-such-group-xyz" \
+    >"$IGN_TESTDIR/server.log" 2>&1 &
+IGN_SERVER_PID=$!
+IGN_READY=0
+for _ in $(seq 1 50); do
+    if curl -s "http://127.0.0.1:$IGN_PORT/banned/x" \
+        -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        IGN_READY=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$IGN_READY" -ne 1 ]; then
+    fail "TCP server with inapplicable socket-only options failed to start"
+else
+    pass "TCP server ignores inapplicable socket-only options and still serves"
+fi
+if grep -q "have no effect on the TCP listener" "$IGN_TESTDIR/server.log"; then
+    pass "TCP server warns that socket-only options have no effect"
+else
+    fail "TCP server should warn that socket-only options have no effect"
+fi
+kill "$IGN_SERVER_PID" 2>/dev/null
+wait "$IGN_SERVER_PID" 2>/dev/null
+rm -rf "$IGN_TESTDIR"
+
 rm -rf "$UNIX_TESTDIR"
 
 # --trust-proxy over --unix-socket would let any client on the socket

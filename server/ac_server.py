@@ -1459,36 +1459,43 @@ def main():
             "--trust-proxy -- the allowlist has no effect unless the "
             "header is actually trusted\n"
         )
-    try:
-        socket_mode = _parse_socket_mode(args.unix_socket_mode)
-    except ValueError as e:
-        sys.stderr.write("ac_server: %s -- refusing to start\n" % (e,))
-        sys.exit(1)
+    # Socket-only options are validated only when they take effect: a
+    # TCP-only run must never abort on an inapplicable --unix-socket-mode
+    # value, and the widened-mode trust warning is meaningless with no
+    # socket to widen. Without --unix-socket there is just the one
+    # ignored-options warning below.
+    socket_mode = 0o600
     socket_gid = None
-    if args.unix_socket_group is not None:
+    if args.unix_socket:
         try:
-            socket_gid = _resolve_socket_group(args.unix_socket_group)
+            socket_mode = _parse_socket_mode(args.unix_socket_mode)
         except ValueError as e:
             sys.stderr.write("ac_server: %s -- refusing to start\n" % (e,))
             sys.exit(1)
-    if (args.unix_socket_mode != "0600" or args.unix_socket_group is not None) \
-            and not args.unix_socket:
+        if args.unix_socket_group is not None:
+            try:
+                socket_gid = _resolve_socket_group(args.unix_socket_group)
+            except ValueError as e:
+                sys.stderr.write("ac_server: %s -- refusing to start\n" % (e,))
+                sys.exit(1)
+        if socket_mode & 0o077:
+            # Widening is the opt-in point of these flags, so it stays
+            # allowed -- but filesystem permissions ARE the trust boundary
+            # on this transport, so say so once at startup rather than
+            # silently running wider than the 0600 default.
+            sys.stderr.write(
+                "ac_server: warning: unix socket mode %04o grants group/other "
+                "access -- every local user matching those bits can submit "
+                "reports and probe the admin API\n" % (socket_mode,)
+            )
+    elif args.unix_socket_mode != "0600" or args.unix_socket_group is not None:
         # Same fail-safe-direction warning shape as the CIDR-without-
         # --trust-proxy one above: harmless if ignored, but almost
-        # certainly not what was meant.
+        # certainly not what was meant. Deliberately no parsing here:
+        # these flags have no effect on the TCP listener, valid or not.
         sys.stderr.write(
             "ac_server: warning: --unix-socket-mode/group given without "
             "--unix-socket -- they have no effect on the TCP listener\n"
-        )
-    if socket_mode & 0o077:
-        # Widening is the opt-in point of these flags, so it stays
-        # allowed -- but filesystem permissions ARE the trust boundary
-        # on this transport, so say so once at startup rather than
-        # silently running wider than the 0600 default.
-        sys.stderr.write(
-            "ac_server: warning: unix socket mode %04o grants group/other "
-            "access -- every local user matching those bits can submit "
-            "reports and probe the admin API\n" % (socket_mode,)
         )
     if args.trust_proxy and args.unix_socket:
         # --trust-proxy makes the handler take X-Forwarded-For at face
