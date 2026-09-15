@@ -191,27 +191,33 @@ fi
 # --- and does that digest actually match the tarball? -------------------
 # Only reachable once a real digest is in place, so this costs nothing
 # (no download at all) for as long as the placeholder is legitimately
-# still there.  A mismatch is fatal; not being able to fetch is not —
-# this reports what it verified rather than implying more.
+# still there.  Online runs are fail-closed: every real digest is
+# verified unless the tag is confirmed absent (in which case the verdict
+# above has already failed), and a missing curl or an unfetchable
+# tarball is a failure, not a skipped check.
 if [ "$fail" -eq 0 ] && [ "$OFFLINE" -eq 0 ] && [ "$sha" != "SKIP" ] \
-   && [ "$tag_state" = "present" ] && command -v curl >/dev/null 2>&1; then
-    tmp="$(mktemp)"
-    trap 'rm -f "$tmp"' EXIT
-    note "verifying sha256sums against $src_url"
-    if curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
-            -o "$tmp" "$src_url"; then
-        got="$(sha256sum "$tmp" | cut -d' ' -f1)"
-        if [ "$got" = "$sha" ]; then
-            note "OK: tarball hashes to the declared sha256sums"
-        else
-            err "tarball sha256 mismatch: declared $sha, downloaded $got." \
-                "Re-run \`updpkgsums\` (and regenerate .SRCINFO). GitHub's" \
-                "auto-generated tag archives have changed bytes before —" \
-                "if the tag itself was never moved, that is the likely cause."
-        fi
+   && [ "$tag_state" != "absent" ]; then
+    if ! command -v curl >/dev/null 2>&1; then
+        err "curl not found — cannot verify sha256sums against $src_url"
     else
-        note "WARNING: could not download $src_url — digest not verified" \
-             "against the real tarball this run"
+        tmp="$(mktemp)"
+        trap 'rm -f "$tmp"' EXIT
+        note "verifying sha256sums against $src_url"
+        if curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
+                -o "$tmp" "$src_url"; then
+            got="$(sha256sum "$tmp" | cut -d' ' -f1)"
+            if [ "$got" = "$sha" ]; then
+                note "OK: tarball hashes to the declared sha256sums"
+            else
+                err "tarball sha256 mismatch: declared $sha, downloaded $got." \
+                    "Re-run \`updpkgsums\` (and regenerate .SRCINFO). GitHub's" \
+                    "auto-generated tag archives have changed bytes before —" \
+                    "if the tag itself was never moved, that is the likely cause."
+            fi
+        else
+            err "could not download $src_url — digest not verified" \
+                "against the real tarball this run"
+        fi
     fi
 fi
 
