@@ -30,7 +30,7 @@ then. To test mechanically before a real tag exists: build a local
 tarball with the same layout GitHub's archive produces —
 
 ```sh
-git archive --format=tar --prefix=hypranticheat-<pkgver>/ HEAD \
+git archive --format=tar --prefix=anticheat_x86-64-<pkgver>/ HEAD \
     | gzip > hypranticheat-<pkgver>.tar.gz
 ```
 
@@ -40,20 +40,36 @@ release tarball), build, and revert both `source=`/`sha256sums` before
 committing — do not commit anything pointing anywhere other than the
 real upstream release tarball.
 
+`scripts/check-aur-checksum.sh` keeps that placeholder from outliving
+its reason to exist. It passes only while `v${pkgver}` is genuinely
+untagged, fails the moment the tag (and therefore the tarball) exists
+with `sha256sums` still `SKIP`, and — once a real digest is in place —
+downloads the tarball and checks the digest actually matches it. It also
+checks `.SRCINFO` agrees with `PKGBUILD`, because AUR enforces the digest
+in `.SRCINFO`: an `updpkgsums` run that never went through
+`makepkg --printsrcinfo` leaves the published package exactly as
+unprotected as the placeholder did. `ci.yml` runs it on every push, so
+nobody has to remember it at release time (keanehatescoding/anticheat-arm64#46).
+
 ## Verified locally
 
 Built and packaged successfully with `makepkg` on Arch Linux (both split
 packages, including a full run through the `git archive`-based local
-tarball test above — confirmed the extraction directory name matches a
-real GitHub archive's layout, and that `updpkgsums` computes a genuine
-checksum rather than a no-op). `namcap`-clean except expected/benign
-warnings: an intentionally-empty state directory, the private (`0700`)
-MOK key directory correctly flagged as non-world-readable/executable,
-and two informational/false-positive notes about the `-dkms` package
-having no ELF files and namcap not detecting `dkms`'s use from a shell
-script. `hypranticheat-dkms.install` is `shellcheck -s bash`-clean (no
-shebang is correct/required — pacman sources `.install` files as
-functions, it doesn't execute them). Not yet verified: an actual
-`pacman -U` install/upgrade/remove cycle (would mutate the testing
-machine's real DKMS registry and `/etc/dkms/framework.conf.d/`, so this
-needs a disposable VM/container, not the machine this was authored on).
+tarball test above — confirmed the extraction directory name matches a real
+GitHub archive's layout, and that `updpkgsums` computes a genuine checksum
+rather than a no-op). Re-run end to end after `source=` was corrected to
+the real upstream repository, since that changes the archive's extraction
+prefix: `$_srcname-$pkgver` was checked against a live GitHub tag archive
+(`<repo>-<tag minus the leading v>/`) and then through the same
+local-tarball `makepkg` above, both split packages building and packaging
+their expected contents. `namcap`-clean except expected/benign warnings: an
+intentionally-empty state directory, the private (`0700`) MOK key directory
+correctly flagged as non-world-readable/executable, and two
+informational/false-positive notes about the `-dkms` package having no ELF
+files and namcap not detecting `dkms`'s use from a shell script.
+`hypranticheat-dkms.install` is `shellcheck -s bash`-clean (no shebang is
+correct/required — pacman sources `.install` files as functions, it doesn't
+execute them). Not yet verified: an actual `pacman -U`
+install/upgrade/remove cycle (would mutate the testing machine's real DKMS
+registry and `/etc/dkms/framework.conf.d/`, so this needs a disposable
+VM/container, not the machine this was authored on).

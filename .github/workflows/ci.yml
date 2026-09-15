@@ -92,6 +92,20 @@ jobs:
             { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
           git ls-files '*.sh' | xargs shellcheck
 
+      # packaging/aur/PKGBUILD carries sha256sums=('SKIP') as a deliberate
+      # placeholder: its source= is a tag-pinned release tarball that does
+      # not exist until v<pkgver> is tagged, so there is genuinely nothing
+      # to hash yet. That is fine while it's true and a silent
+      # supply-chain hole the moment it isn't -- and "remember
+      # RELEASING.md step 7" is not a control. This arms the placeholder
+      # instead: it passes only while the tag is absent, and fails on its
+      # own the first CI run after the tag exists. It also checks
+      # .SRCINFO agrees with PKGBUILD, since AUR reads .SRCINFO, not
+      # PKGBUILD, for the digest it enforces.
+      # See keanehatescoding/anticheat-arm64#46.
+      - name: AUR sha256sums placeholder guard
+        run: ./scripts/check-aur-checksum.sh
+
   # --- kernel module: compile smoke test against a pinned modern tree ---
   # The module targets kernels >= 6.12 (uses sized_strscpy, the _noprof
   # allocators, for_class_mod_mem_type, maple-tree VMA iteration).  CI
@@ -337,7 +351,7 @@ jobs:
   # the mock has none of copy_from_user()/access_ok() to stress), while
   # the real run -- root, the real loaded module, full pointer-corruption
   # fuzzing, watching dmesg -- was nightly-only via kasan-boot.yml. See
-  # https://github.com/keanehatescoding/anticheat/issues/68.
+  # https://github.com/keanehatescoding/anticheat_x86-64/issues/68.
   #
   # This job closes part of that gap on every PR/push that touches the
   # module itself, without paying nightly's full cost on every push: it

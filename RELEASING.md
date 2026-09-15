@@ -83,15 +83,46 @@ the same protocol" case this guards against), independent of whatever
    need root). This is **not** a substitute for real load-time testing of
    the kernel module on a live kernel — see point 5 above — just a check
    that the one asset actually shipped isn't obviously broken.
-7. Update the AUR package (`PKGBUILD`) to match:
+7. Update the AUR package (`PKGBUILD`) to match — **in this repo's
+   `packaging/aur/` working copy first, then in the AUR package's own
+   git checkout.** Both, not just one: the copy here is what CI checks,
+   and the copy there is what actually publishes.
 
    ```sh
-   # in the AUR package's own git checkout, not this repo:
+   cd packaging/aur
    sed -i "s/^pkgver=.*/pkgver=<VERSION>/; s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-   updpkgsums
-   makepkg --printsrcinfo > .SRCINFO
-   git commit -am "Update to v<VERSION>" && git push
+   updpkgsums                        # real digest replaces the SKIP
+   makepkg --printsrcinfo > .SRCINFO   # AUR enforces *this* file's digest
+   cd - && ./scripts/check-aur-checksum.sh
    ```
+
+   `updpkgsums` is not optional bookkeeping here. Until the tag from step
+   4 exists there is no tarball to hash, so `sha256sums` sits at the
+   `SKIP` placeholder — which, once the tarball does exist, means the
+   package installs whatever bytes that URL happens to serve, unchecked.
+   `scripts/check-aur-checksum.sh` is the backstop: it tolerates `SKIP`
+   only while `v<pkgver>` is untagged, and `ci.yml` runs it on every
+   push, so forgetting this step turns `master` red rather than shipping
+   quietly (see keanehatescoding/anticheat-arm64#46). Commit the updated
+   `packaging/aur/` copy like any other change, then mirror it across —
+   every edit above happened *here*, so the AUR checkout is still holding
+   the old `pkgver` and the old `SKIP` until the files are copied into
+   it:
+
+   ```sh
+   # from this repo's root; `git -C` so there is no doubt which checkout
+   # each command acts on:
+   AUR=<path-to-aur-checkout>
+   cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO packaging/aur/hypranticheat-dkms.install "$AUR/"
+   git -C "$AUR" diff --stat   # expect all three files listed as changed
+   git -C "$AUR" commit -am "Update to v<VERSION>" && git -C "$AUR" push
+   ```
+
+   If that `commit` reports *nothing to commit*, the `cp` did not land:
+   the `&&` then swallows the `push` and the release has **not** reached
+   AUR, however clean the output looks. `check-aur-checksum.sh` will not
+   catch this either — it reads this repo's copy, which by then is
+   correct.
 
    (`pkgrel` only bumps on its own, without a `pkgver` change, if the
    *packaging* changes but upstream didn't — e.g. a PKGBUILD fix.)
