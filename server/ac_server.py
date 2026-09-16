@@ -198,6 +198,7 @@ class ReportNotifier:
             "ac_server: new report client_id=%s event=%r from %s\n"
             % (payload.get("client_id"), payload.get("event_type"),
                payload.get("source_addr")))
+        if self._queue is None:
             return
         try:
             self._queue.put_nowait(payload)
