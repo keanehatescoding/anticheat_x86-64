@@ -517,6 +517,125 @@ kill "$Q_SERVER_PID" 2>/dev/null
 wait "$Q_SERVER_PID" 2>/dev/null
 Q_SERVER_PID=""
 rm -rf "$Q_TESTDIR"
+# 13d. webhook notifier + log line (#39): a dedicated instance POSTs
+# every accepted report to a hook URL in the background (still 201 on
+# the report path even when the hook is slow), and the same report
+# lands as one stderr line. A second instance with a dead hook URL
+# still 201s -- delivery failure must never fail ingestion.
+W_PORT=18818
+W_TESTDIR="$(mktemp -d /tmp/ac_server_webhook_test.XXXXXXXX)"
+W_DB="$W_TESTDIR/ac.db"
+W_HOOK="$W_TESTDIR/hook.log"
+python3 - "$W_HOOK" <<'PYEOF' &
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+log = sys.argv[1]
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        with open(log, "ab") as f:
+            f.write(self.rfile.read(n) + b"\n")
+        body = b"{}"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+HTTPServer(("127.0.0.1", 18819), H).serve_forever()
+PYEOF
+W_HOOK_PID=$!
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --host 127.0.0.1 --port "$W_PORT" --db "$W_DB" \
+    --report-webhook-url http://127.0.0.1:18819/hook \
+    --rate-limit 500 --rate-window 60 \
+    >"$W_TESTDIR/server.log" 2>&1 &
+W_SERVER_PID=$!
+W_BASE="http://127.0.0.1:$W_PORT"
+W_READY=0
+for _ in $(seq 1 50); do
+    if curl -s "$W_BASE/banned/x" -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        W_READY=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$W_READY" -eq 1 ]; then
+    W_CID="test-webhook-$$"
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$W_BASE/report" \
+        -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$W_CID\",\"event_type\":\"HOOK_EV\",\"detail\":\"hook-me\",\"ts\":1}")
+    if [ "$CODE" = "201" ]; then
+        pass "report with webhook configured -> 201"
+    else
+        fail "report with webhook configured should be 201 (got $CODE)"
+    fi
+    for _ in $(seq 1 50); do
+        [ -s "$W_HOOK" ] && break
+        sleep 0.1
+    done
+    if grep -q "HOOK_EV" "$W_HOOK" 2>/dev/null && grep -q "$W_CID" "$W_HOOK" 2>/dev/null; then
+        pass "webhook receives the accepted report as JSON"
+    else
+        fail "webhook never received the report"
+    fi
+    if grep -q "new report.*$W_CID" "$W_TESTDIR/server.log" 2>/dev/null; then
+        pass "accepted report logged to stderr"
+    else
+        fail "expected a new-report stderr line for $W_CID"
+    fi
+else
+    fail "webhook test server never became ready on port $W_PORT"
+fi
+kill "$W_SERVER_PID" 2>/dev/null
+wait "$W_SERVER_PID" 2>/dev/null
+kill "$W_HOOK_PID" 2>/dev/null
+wait "$W_HOOK_PID" 2>/dev/null
+rm -rf "$W_TESTDIR"
+# Dead hook: delivery failure stays a log line, the report still 201s.
+D_PORT=18820
+D_TESTDIR="$(mktemp -d /tmp/ac_server_deadhook_test.XXXXXXXX)"
+D_DB="$D_TESTDIR/ac.db"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --host 127.0.0.1 --port "$D_PORT" --db "$D_DB" \
+    --report-webhook-url http://127.0.0.1:18999/hook \
+    --report-webhook-timeout 1 \
+    --rate-limit 500 --rate-window 60 \
+    >"$D_TESTDIR/server.log" 2>&1 &
+D_SERVER_PID=$!
+D_BASE="http://127.0.0.1:$D_PORT"
+D_READY=0
+for _ in $(seq 1 50); do
+    if curl -s "$D_BASE/banned/x" -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        D_READY=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$D_READY" -eq 1 ]; then
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$D_BASE/report" \
+        -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"test-deadhook-$$\",\"event_type\":\"X\",\"detail\":\"d\",\"ts\":1}")
+    if [ "$CODE" = "201" ]; then
+        pass "report with dead webhook still -> 201"
+    else
+        fail "report with dead webhook should still be 201 (got $CODE)"
+    fi
+    OUT=$(curl -s "$D_BASE/reports/test-deadhook-$$" -H "Authorization: Bearer $ADMIN_KEY")
+    if printf '%s' "$OUT" | grep -q '"detail": "d"'; then
+        pass "dead-webhook report still stored and listed"
+    else
+        fail "dead-webhook report missing from listing (got: $OUT)"
+    fi
+else
+    fail "dead-webhook test server never became ready on port $D_PORT"
+fi
+kill "$D_SERVER_PID" 2>/dev/null
+wait "$D_SERVER_PID" 2>/dev/null
+rm -rf "$D_TESTDIR"
 
 # 14. ban, then confirm banned lookup flips to true
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/ban" \
