@@ -52,7 +52,8 @@ the push signal for the human reviewer, who otherwise learns about new
 reports only by polling GET /reports/<id>. Webhook delivery never
 blocks ingestion (bounded queue, drops counted and logged), and disk
 pages freed by the trims above are reclaimed by a VACUUM cadence
-(--vacuum-interval) rather than on every insert.
+(--vacuum-interval, only once enough freelist pages accumulate)
+rather than on every insert.
 """
 import argparse
 import hmac
@@ -610,10 +611,14 @@ class Store:
         # Reclaims freelist pages left behind by the trims above:
         # DELETEs only unlink pages, so a trimming workload's file
         # grows to its high-water mark and stays there without VACUUM
-        # (#39). VACUUM rewrites the whole file, so it runs at most
-        # once per `vacuum_interval` inserts that actually deleted
-        # rows -- never on a quiet DB, never every insert. 0/None
-        # disables.
+        # (#39). VACUUM rewrites the whole file while holding the
+        # write lock, so it runs at most once per `vacuum_interval`
+        # inserts that actually deleted rows -- and even then only
+        # when PRAGMA freelist_count shows at least
+        # VACUUM_MIN_FREELIST_PAGES reclaimable pages. At a steady
+        # cap (one row evicted per insert) SQLite reuses those pages
+        # for the new rows, so there is nothing to reclaim and the
+        # cadence hit is a no-op. 0/None disables.
         self.vacuum_interval = vacuum_interval
         self._writes_since_vacuum = 0
         # SQLite only ever allows one writer at a time, even in WAL mode --
@@ -755,9 +760,13 @@ class Store:
         return received_at
 
     def _maybe_vacuum(self, conn, trimmed):
-        """Run VACUUM at most once per `vacuum_interval` trimming inserts."""
+        """Run VACUUM at most once per `vacuum_interval` trimming inserts,
+        and only when enough freelist pages have actually accumulated."""
         # A failure here must never fail the insert it follows -- the file
         # just stays at its high-water mark until the next cadence hit.
+        # Steady-state cap churn (one row evicted per insert) reuses its
+        # own pages, so an unconditional rewrite here would block every
+        # other writer under _write_lock to reclaim nothing, forever.
         if not trimmed or not self.vacuum_interval:
             return
         self._writes_since_vacuum += 1
@@ -765,9 +774,21 @@ class Store:
             return
         self._writes_since_vacuum = 0
         try:
+            freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        except Exception as e:
+            sys.stderr.write("ac_server: freelist check failed: %r\n" % (e,))
+            return
+        if freelist < self.VACUUM_MIN_FREELIST_PAGES:
+            return
+        try:
             conn.execute("VACUUM")
         except Exception as e:
             sys.stderr.write("ac_server: VACUUM failed: %r\n" % (e,))
+
+    # Floor on PRAGMA freelist_count pages that justifies a VACUUM rewrite
+    # (see _maybe_vacuum): ~400KB reclaimable at default 4KiB pages, vs
+    # ~1 page for steady-state cap churn and hundreds after a bulk trim.
+    VACUUM_MIN_FREELIST_PAGES = 100
 
     # Hard ceiling on one listing response: without it, asking for a huge
     # ?limit= pages an arbitrarily large result set into one JSON body
@@ -1454,10 +1475,10 @@ def main():
         default=1000,
         metavar="N",
         help="run VACUUM at most once per N inserts that actually trimmed "
-        "rows, reclaiming freelist pages so a trimming workload's file "
-        "shrinks instead of sitting at its high-water mark; VACUUM "
-        "rewrites the whole file, hence the cadence (default: 1000, "
-        "0 disables)",
+        "rows, and only when at least 100 freelist pages are reclaimable "
+        "(steady-state eviction reuses its own pages, so there is nothing "
+        "to collect); VACUUM rewrites the whole file, hence the cadence "
+        "(default: 1000, 0 disables)",
     )
     ap.add_argument(
         "--max-total-reports",

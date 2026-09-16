@@ -14,10 +14,11 @@ any network or server process.
   the drop counter moves.
 - A dead webhook URL never raises out of notify(): the failure is
   logged by the worker, the report itself already committed.
-- Store.add_report() returns the stored received_at, and with a tiny
-  vacuum_interval the DB file shrinks after trimming churn instead of
-  sitting at its high-water mark; vacuum_interval=0 leaves the file
-  alone.
+- Store.add_report() returns the stored received_at; the VACUUM cadence
+  counts trimming inserts but only rewrites once enough freelist pages
+  accumulate, so steady-state cap churn (which reuses its own pages)
+  never rewrites while a bulk trim still reclaims; vacuum_interval=0
+  leaves the file alone.
 
 Real on-disk SQLite, no server -- matches the existing unit-test style
 (see test_reports_pagination_quota_unit.py).
@@ -187,7 +188,7 @@ with tempfile.TemporaryDirectory() as tmp:
           row is not None and row[1] == returned
           and isinstance(returned, int))
 
-    # --- VACUUM cadence: trimming churn stops file growth ---
+    # --- VACUUM cadence + freelist gate: steady churn never rewrites ---
     big = "x" * 1500
     vac_db = str(pathlib.Path(tmp) / "vac.db")
     vac = ac_server.Store(vac_db, max_reports_per_client=5,
@@ -204,10 +205,28 @@ with tempfile.TemporaryDirectory() as tmp:
         "PRAGMA freelist_count").fetchone()[0]
     novac_free = sqlite3.connect(novac_db).execute(
         "PRAGMA freelist_count").fetchone()[0]
-    check("VACUUM cadence fires on trimming churn",
+    check("VACUUM cadence counts trimming inserts",
           vac._writes_since_vacuum < 2)
-    check("vacuumed file stays below the unvacuumed high-water mark",
-          vac_size < novac_size and vac_free == 0 and novac_free > 0)
+    check("steady-state cap churn reuses its pages: gate suppresses rewrite",
+          vac_size == novac_size and vac_free == novac_free
+          and vac_free < vac.VACUUM_MIN_FREELIST_PAGES)
+
+    # --- bulk garbage above the floor still reclaims ---
+    bulk_db = str(pathlib.Path(tmp) / "bulk.db")
+    bulk = ac_server.Store(bulk_db, max_reports_per_client=500,
+                           max_total_reports=0, vacuum_interval=2)
+    bulk.VACUUM_MIN_FREELIST_PAGES = 20
+    for i in range(120):
+        bulk.add_report("b", "E", big, None, "127.0.0.1")
+    grown = pathlib.Path(bulk_db).stat().st_size
+    bulk.max_reports_per_client = 5
+    bulk.add_report("b", "E", big, None, "127.0.0.1")
+    bulk.add_report("b", "E", big, None, "127.0.0.1")
+    bulk_size = pathlib.Path(bulk_db).stat().st_size
+    bulk_free = sqlite3.connect(bulk_db).execute(
+        "PRAGMA freelist_count").fetchone()[0]
+    check("bulk trim above the freelist floor reclaims",
+          bulk_free == 0 and bulk_size < grown)
 
     # --- vacuum_interval=0 disables; quiet DB never vacuums ---
     check("vacuum_interval=0 disables VACUUM",

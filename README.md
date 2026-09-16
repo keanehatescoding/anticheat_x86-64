@@ -608,8 +608,9 @@ Stored rows are trimmed oldest-first on every insert:
 all `client_id`s -- the per-client cap alone can't stop someone
 minting new IDs from growing the SQLite file without bound (either cap
 is disabled with 0). Pages freed by those trims are reclaimed by a
-VACUUM cadence (`--vacuum-interval`, default 1000 inserts that
-actually trimmed; 0 disables) instead of on every insert. The listing
+VACUUM cadence (`--vacuum-interval`, default 1000 trimming inserts,
+only once at least 100 freelist pages are reclaimable; 0 disables)
+instead of on every insert. The listing
 endpoint pages newest-first via `?limit=`/`?offset=` so history past
 the most recent 200 rows stays reachable through the API.
 
