@@ -546,6 +546,20 @@ class H(BaseHTTPRequestHandler):
 HTTPServer(("127.0.0.1", 18819), H).serve_forever()
 PYEOF
 W_HOOK_PID=$!
+W_HOOK_READY=0
+for _ in $(seq 1 50); do
+    if curl -s -o /dev/null -X POST http://127.0.0.1:18819/hook \
+        -H 'Content-Type: application/json' -d '{}' 2>/dev/null; then
+        W_HOOK_READY=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$W_HOOK_READY" -ne 1 ]; then
+    fail "webhook hook never became ready on port 18819"
+fi
+# Drop the probe bodies above; the assertions below grep for HOOK_EV.
+: > "$W_HOOK"
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$W_PORT" --db "$W_DB" \
     --report-webhook-url http://127.0.0.1:18819/hook \
