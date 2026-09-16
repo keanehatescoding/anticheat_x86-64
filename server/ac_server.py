@@ -193,13 +193,11 @@ class ReportNotifier:
             self._queue = queue.Queue(maxsize=max(notify_queue_size, 1))
             self._worker = threading.Thread(
                 target=self._drain, daemon=True, name="report-notify")
-            self._worker.start()
     def notify(self, payload):
         sys.stderr.write(
-            "ac_server: new report client_id=%s event=%s from %s\n"
+            "ac_server: new report client_id=%s event=%r from %s\n"
             % (payload.get("client_id"), payload.get("event_type"),
                payload.get("source_addr")))
-        if self._queue is None:
             return
         try:
             self._queue.put_nowait(payload)
