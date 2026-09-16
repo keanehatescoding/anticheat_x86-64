@@ -555,7 +555,10 @@ AC_SERVER_REPORT_KEY=<report-key> AC_SERVER_ADMIN_KEY=<admin-key> \
 ```
 
 The socket is created `0600` (owner-only, same reasoning as the DB
-file's own permissions), and a stale socket file left behind by a
+file's own permissions) unless `--unix-socket-mode`/`--unix-socket-group`
+say otherwise (e.g. `0660` plus a daemon-only group, so a
+different-user daemon can connect — widening lets every member of that
+group reach the socket), and a stale socket file left behind by a
 previous run is unlinked before binding — "stale" is checked, not
 assumed: binding refuses to touch the path at all if something's still
 listening on it, or if it exists and isn't a socket. That said, `0600`
