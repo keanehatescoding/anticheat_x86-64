@@ -341,90 +341,129 @@ class ThreadingUnixHTTPServer(BoundedThreadingMixIn, http.server.HTTPServer):
         # keeps running unaware its socket file is gone. Guard both: only
         # ever remove a path that's actually a socket, and only after
         # confirming nothing is listening on it.
+        sock_dir = os.path.dirname(os.path.abspath(self.server_address))
+        sock_name = os.path.basename(self.server_address)
+        # Resolve the directory itself first: opening it with O_NOFOLLOW
+        # would falsely refuse a legitimately symlinked parent (e.g. a
+        # /tmp -> /private/tmp style link), so canonicalize, then hold
+        # the real directory as an fd for every pathname operation below.
+        sock_dir = os.path.realpath(sock_dir)
+        # The bind-time checks below (lstat, probe, stat) all operate on
+        # the pathname, so they are only trustworthy if nobody untrusted
+        # can swap directory entries between them. Refuse to bind into a
+        # directory anyone else can write to instead of racing there:
+        # either put the socket under the service's own state dir (see
+        # ac_server.service) or make the operator-owned dir group/other
+        # non-writable first.
+        dir_stat = os.stat(sock_dir)
+        if dir_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeError(
+                "ac_server: --unix-socket directory %r is writable by "
+                "group/other (mode %04o) -- refusing to bind: anyone able "
+                "to rename entries there could swap the socket path "
+                "mid-bind. Use a directory only this user can write to "
+                "(e.g. the service's own state dir)" % (
+                    sock_dir, stat.S_IMODE(dir_stat.st_mode))
+            )
+        dir_fd = os.open(sock_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            st = os.lstat(self.server_address)
-        except FileNotFoundError:
-            pass
-        else:
-            if not stat.S_ISSOCK(st.st_mode):
-                raise RuntimeError(
-                    "ac_server: --unix-socket path %r exists and is not a "
-                    "socket -- refusing to remove it" % (self.server_address,)
-                )
-            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                probe.connect(self.server_address)
-            except OSError:
-                pass  # nothing listening -- a stale socket file, safe to reclaim
+                st = os.lstat(sock_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
             else:
-                raise RuntimeError(
-                    "ac_server: --unix-socket path %r already has an "
-                    "active listener -- refusing to steal it"
-                    % (self.server_address,)
-                )
+                if not stat.S_ISSOCK(st.st_mode):
+                    raise RuntimeError(
+                        "ac_server: --unix-socket path %r exists and is not a "
+                        "socket -- refusing to remove it" % (self.server_address,)
+                    )
+                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    probe.connect(self.server_address)
+                except OSError:
+                    pass  # nothing listening -- a stale socket file, safe to reclaim
+                else:
+                    raise RuntimeError(
+                        "ac_server: --unix-socket path %r already has an "
+                        "active listener -- refusing to steal it"
+                        % (self.server_address,)
+                    )
+                finally:
+                    probe.close()
+                os.unlink(sock_name, dir_fd=dir_fd)
+            # Deliberately socketserver.TCPServer.server_bind(), not
+            # http.server.HTTPServer.server_bind(): the latter does
+            # `host, port = self.server_address[:2]` afterward, assuming a TCP
+            # (host, port) tuple -- for AF_UNIX, server_address is a path
+            # string, and slicing a 2+ char string still "unpacks" into two
+            # single-character strings without raising, silently assigning
+            # garbage (e.g. the path's first two characters) to
+            # server_name/server_port instead of failing loudly. Nothing here
+            # actually uses those two attributes, but there's no reason to let
+            # them hold nonsense when a real placeholder is just as cheap.
+            #
+            # The mode goes through the socket descriptor as a pre-bind
+            # fchmod() seed, never the pathname: between bind() and a
+            # pathname chmod, anyone with write access to the directory
+            # could swap the path and the chmod would follow the
+            # replacement (verified on Linux the bound entry lands at
+            # seed & ~umask, so bind under a cleared umask --
+            # single-threaded here, no handler threads exist yet -- and a
+            # post-bind fchmod is NOT used: it only changes the
+            # fstat-visible seed, not the entry). The group cannot go
+            # through the socket descriptor either: a bound AF_UNIX path
+            # is an mknod-created filesystem inode distinct from the
+            # sockfs descriptor, so fchown(fd) retargets the wrong inode
+            # (verified: stat(path).st_gid unchanged, fstat(fd).st_gid
+            # changed). Instead it goes through the already-open,
+            # O_NOFOLLOW directory fd held since the stale-path check
+            # above -- fchownat(sock_name, dir_fd, nofollow) can only name
+            # an entry of that directory, never a symlink target
+            # elsewhere, and stale/fresh entries resolve identically
+            # because the directory is required non-writable above.
+            fd = self.socket.fileno()
+            old_umask = os.umask(0)
+            try:
+                os.fchmod(fd, self._socket_mode)
+                socketserver.TCPServer.server_bind(self)
             finally:
-                probe.close()
-            os.unlink(self.server_address)
-        # Deliberately socketserver.TCPServer.server_bind(), not
-        # http.server.HTTPServer.server_bind(): the latter does
-        # `host, port = self.server_address[:2]` afterward, assuming a TCP
-        # (host, port) tuple -- for AF_UNIX, server_address is a path
-        # string, and slicing a 2+ char string still "unpacks" into two
-        # single-character strings without raising, silently assigning
-        # garbage (e.g. the path's first two characters) to
-        # server_name/server_port instead of failing loudly. Nothing here
-        # actually uses those two attributes, but there's no reason to let
-        # them hold nonsense when a real placeholder is just as cheap.
-        #
-        # Permissions are applied through the socket descriptor, never the
-        # pathname: between bind() and a pathname chmod/chown, anyone with
-        # write access to the socket directory could swap the path, and the
-        # chmod/chown would then follow the replacement -- a privileged
-        # server must not modify whatever a path happens to name. Instead:
-        # pre-bind fchmod(fd, mode) seeds the mode the bound file gets
-        # (verified on Linux: the directory entry lands at seed & ~umask,
-        # so bind under a cleared umask -- single-threaded here, no
-        # handler threads exist yet -- and a post-bind fchmod would only
-        # change the fstat-visible seed, not the entry itself, so it is
-        # not used), and post-bind fchown(fd, -1, gid) retargets the group
-        # through the fd, which keeps referring to our socket even if the
-        # path is swapped underneath us.
-        old_umask = os.umask(0)
-        try:
-            os.fchmod(self.socket.fileno(), self._socket_mode)
-            socketserver.TCPServer.server_bind(self)
+                os.umask(old_umask)
+            self.server_name = "unix"
+            self.server_port = 0
+            if self._socket_gid is not None:
+                os.chown(sock_name, -1, self._socket_gid,
+                         dir_fd=dir_fd, follow_symlinks=False)
+            bound = os.stat(sock_name, dir_fd=dir_fd, follow_symlinks=False)
+            if not stat.S_ISSOCK(bound.st_mode):
+                raise RuntimeError(
+                    "ac_server: --unix-socket path %r is not a socket "
+                    "after bind -- refusing to run" % (self.server_address,)
+                )
+            # Fail closed on anything unexpected. Filesystem permissions
+            # on this socket are the trust boundary for the
+            # --unix-socket transport (see the module docstring's "No TLS"
+            # / unix-socket note), defaulting to 0600 to match Store's
+            # own DB-file permissions (see Store.__init__).
+            if stat.S_IMODE(bound.st_mode) != self._socket_mode:
+                raise RuntimeError(
+                    "ac_server: --unix-socket path %r has mode %04o after bind, "
+                    "expected %04o -- refusing to run with unintended "
+                    "permissions" % (self.server_address,
+                                     stat.S_IMODE(bound.st_mode),
+                                     self._socket_mode)
+                )
+            if self._socket_gid is not None and bound.st_gid != self._socket_gid:
+                raise RuntimeError(
+                    "ac_server: --unix-socket path %r has unexpected group "
+                    "ownership after bind -- refusing to run" % (self.server_address,)
+                )
+            # Recorded so a later cleanup unlink (see main()'s shutdown path)
+            # can confirm the path still names *this* socket before removing
+            # it -- not, say, a replacement another process created at the
+            # same path after this one closed it.
+            self._bound_stat = bound
         finally:
-            os.umask(old_umask)
-        self.server_name = "unix"
-        self.server_port = 0
-        if self._socket_gid is not None:
-            os.fchown(self.socket.fileno(), -1, self._socket_gid)
-        # Fail closed on anything unexpected: the stat calls below only
-        # read through the path (never modify), so a swapped path just
-        # aborts startup instead of running with unintended permissions.
-        # Filesystem permissions on this socket are the trust boundary
-        # for the --unix-socket transport (see the module docstring's
-        # "No TLS" / unix-socket note), defaulting to 0600 to match
-        # Store's own DB-file permissions (see Store.__init__).
-        bound = os.stat(self.server_address)
-        if stat.S_IMODE(bound.st_mode) != self._socket_mode:
-            raise RuntimeError(
-                "ac_server: --unix-socket path %r has mode %04o after bind, "
-                "expected %04o -- refusing to run with unintended "
-                "permissions" % (self.server_address,
-                                 stat.S_IMODE(bound.st_mode),
-                                 self._socket_mode)
-            )
-        if self._socket_gid is not None and bound.st_gid != self._socket_gid:
-            raise RuntimeError(
-                "ac_server: --unix-socket path %r has unexpected group "
-                "ownership after bind -- refusing to run" % (self.server_address,)
-            )
-        # Recorded so a later cleanup unlink (see main()'s shutdown path)
-        # can confirm the path still names *this* socket before removing
-        # it -- not, say, a replacement another process created at the
-        # same path after this one closed it.
-        self._bound_stat = bound
+            os.close(dir_fd)
 
     def get_request(self):
         # accept()'s peer address for AF_UNIX is '' (the client end is
@@ -1228,7 +1267,9 @@ def main():
         "created 0600 (owner-only) unless --unix-socket-mode/group below "
         "say otherwise; filesystem permissions on it are the trust "
         "boundary for this transport, same role network exposure plays "
-        "for the default TCP one (default: off, use TCP)",
+        "for the default TCP one. The socket's parent directory must be "
+        "writable only by this user -- binding refuses group/other-"
+        "writable directories (default: off, use TCP)",
     )
     ap.add_argument(
         "--unix-socket-mode",

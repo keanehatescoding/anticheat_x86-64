@@ -1343,6 +1343,21 @@ kill "$IGN_SERVER_PID" 2>/dev/null
 wait "$IGN_SERVER_PID" 2>/dev/null
 rm -rf "$IGN_TESTDIR"
 
+# A group/other-writable socket directory is refused at startup: the
+# bind-time pathname checks are only trustworthy if nobody untrusted can
+# swap directory entries between them.
+WW_DIR="$UNIX_TESTDIR/wwdir"
+mkdir "$WW_DIR"
+chmod 777 "$WW_DIR"
+if AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --unix-socket "$WW_DIR/ac_server.sock" \
+    --db "$UNIX_TESTDIR/ww.db" \
+    >"$UNIX_TESTDIR/ww.log" 2>&1; then
+    fail "server should refuse a group/other-writable --unix-socket directory"
+else
+    pass "server refuses a group/other-writable --unix-socket directory"
+fi
+
 rm -rf "$UNIX_TESTDIR"
 
 # --trust-proxy over --unix-socket would let any client on the socket

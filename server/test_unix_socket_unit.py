@@ -105,14 +105,22 @@ with tempfile.TemporaryDirectory() as tmp:
         except FileNotFoundError:
             pass
 
-    # An explicit mode + group is applied durably at bind time.
+    # An explicit mode + group is applied durably at bind time, onto the
+    # bound path's own filesystem inode (a bound AF_UNIX path is
+    # mknod-created, distinct from the sockfs descriptor, so fchown(fd)
+    # would retarget the wrong inode -- the server chowns through the
+    # socket directory fd instead). Exercise a group other than the
+    # process's own: any supplementary group the process already belongs
+    # to (no root, no new groups created).
     custom_sock = os.path.join(tmp, "custom.sock")
-    gid = grp.getgrnam(own_group).gr_gid
+    other_gids = sorted(set(os.getgroups()) - {os.getgid()})
+    check("a supplementary group exists for the group test", bool(other_gids))
+    gid = other_gids[0] if other_gids else os.getgid()
     srv = _bind(custom_sock, mode=0o660, group=gid)
     try:
         check("custom socket mode is 0660", _sock_mode(custom_sock) == 0o660)
         check(
-            "custom socket group applied",
+            "custom socket group applied to the path inode",
             os.stat(custom_sock).st_gid == gid,
         )
     finally:
@@ -122,21 +130,32 @@ with tempfile.TemporaryDirectory() as tmp:
         except FileNotFoundError:
             pass
 
-    # Binding must not leak its cleared umask into the process: the mode
-    # seed goes through the socket fd, and the umask is restored after.
+    # Keep a restrictive umask active through the bind: server_bind()
+    # clears it only around its own bind (pre-bind fchmod seed lands at
+    # seed & ~umask) and must restore it, so read it back while still in
+    # effect and restore prev_umask only in the finally block.
     prev_umask = os.umask(0o077)
-    os.umask(prev_umask)
     umask_sock = os.path.join(tmp, "umask.sock")
     srv = _bind(umask_sock)
     try:
-        cur_umask = os.umask(prev_umask)
-        check("server_bind leaves the process umask unchanged", cur_umask == prev_umask)
+        cur_umask = os.umask(0o077)
+        check("server_bind leaves the process umask unchanged", cur_umask == 0o077)
     finally:
+        os.umask(prev_umask)
         srv.server_close()
         try:
             os.unlink(umask_sock)
         except FileNotFoundError:
             pass
 
-print("=== %s ===" % ("ALL PASS" if FAIL == 0 else "FAILURES PRESENT"))
-sys.exit(FAIL)
+    ww_dir = os.path.join(tmp, "wwdir")
+    os.mkdir(ww_dir)
+    # mkdir is umask-filtered, so force the mode: the refusal must fire
+    # on the actual directory bits, not on what umask happened to allow.
+    os.chmod(ww_dir, 0o777)
+    try:
+        _bind(os.path.join(ww_dir, "x.sock"))
+    except RuntimeError:
+        check("group/other-writable socket directory is refused", True)
+    else:
+        check("group/other-writable socket directory is refused", False)
