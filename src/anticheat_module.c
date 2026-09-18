@@ -33,6 +33,7 @@
 
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/compat.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/miscdevice.h>
@@ -3166,6 +3167,16 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     if (!ns_capable(&init_user_ns, CAP_SYS_ADMIN))
         return -EPERM;
 
+    /* 32-bit compat callers share no ioctl layout with this LP64-only ABI
+     * (see struct ac_vma_info.flags in anticheat.h: plain `unsigned long`
+     * changes size between ILP32 and LP64, and there is no translation
+     * layer). Fail closed with -ENOTTY instead of letting a compat caller
+     * misparse the structures (#17). This is defense in depth: compat
+     * ioctls are routed to ac_compat_ioctl() below, never here, so this
+     * only fires if that routing ever changes. */
+    if (in_compat_syscall())
+        return -ENOTTY;
+
     switch (cmd) {
     case AC_IOCTL_STATUS: {
         struct ac_status st;
@@ -3508,11 +3519,26 @@ static int ac_release(struct inode *inode, struct file *file)
     return 0;
 }
 
+/* 32-bit compat ioctls (#17): this ABI is LP64-only (see
+ * struct ac_vma_info.flags in anticheat.h) and has no .compat translation,
+ * so reject compat callers explicitly with the same -ENOTTY the VFS would
+ * return for a missing .compat_ioctl -- fail closed instead of silently
+ * misparsing the structures. Native 64-bit callers are unaffected. */
+static long ac_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    (void)file;
+    (void)cmd;
+    (void)arg;
+    pr_warn_once("compat ioctl rejected: 32-bit ABI unsupported, use a 64-bit caller\n");
+    return -ENOTTY;
+}
+
 static const struct file_operations ac_fops = {
     .owner = THIS_MODULE,
     .open = ac_open,
     .release = ac_release,
     .unlocked_ioctl = ac_ioctl,
+    .compat_ioctl = ac_compat_ioctl,
 };
 
 static struct miscdevice ac_misc = {

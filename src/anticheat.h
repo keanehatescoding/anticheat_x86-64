@@ -156,7 +156,18 @@ struct ac_vma_info {
     unsigned long long end;
     unsigned long long offset;
     unsigned long long inode;
-    unsigned long      flags;        /* VM_* flags (kernel semantics) */
+    unsigned long      flags;        /* VM_* flags (kernel semantics).
+                                     * NOTE: LP64-only ABI -- `unsigned long`
+                                     * changes size under a 32-bit (ILP32)
+                                     * caller, and there is no compat
+                                     * translation layer. 32-bit callers are
+                                     * rejected outright with -ENOTTY (see
+                                     * ac_compat_ioctl in
+                                     * anticheat_module.c, #17) rather than
+                                     * allowed to silently misparse this
+                                     * struct, so this field intentionally
+                                     * stays `unsigned long` instead of
+                                     * growing a parallel fixed-width ABI. */
     unsigned int       is_file;      /* 1 if backed by a file */
     char               path[AC_VMA_PATH];
 };
