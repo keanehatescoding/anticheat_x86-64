@@ -595,14 +595,24 @@ fixed-window counter (allows a brief double-rate burst right at a window
 boundary), not built for distributed scale — enough to bound abuse
 against a single small process, which is the deployment this targets.
 
-**Bounded retention, paged review.** Stored rows are trimmed oldest-first
-on every insert: `--max-reports-per-client` (default 1000) bounds one
-`client_id`, and `--max-total-reports` (default 100000) bounds the whole
-table across all `client_id`s — the per-client cap alone can't stop
-someone minting new IDs from growing the SQLite file without bound
-(either cap is disabled with 0). The listing endpoint pages newest-first
-via `?limit=`/`?offset=` so history past the most recent 200 rows stays
-reachable through the API.
+**Push-notified, paged review.** Every accepted report is logged to
+stderr (one line) and, with `--report-webhook-url`, POSTed as JSON to
+that URL by a background thread -- the push signal for the human
+reviewer, who otherwise learns about new reports only by polling. The
+webhook never blocks ingestion: a bounded queue (`--notify-queue-size`,
+default 1000) drops and counts payloads under sustained backpressure
+rather than stalling the report path, and a dead endpoint only logs.
+Stored rows are trimmed oldest-first on every insert:
+`--max-reports-per-client` (default 1000) bounds one `client_id`, and
+`--max-total-reports` (default 100000) bounds the whole table across
+all `client_id`s -- the per-client cap alone can't stop someone
+minting new IDs from growing the SQLite file without bound (either cap
+is disabled with 0). Pages freed by those trims are reclaimed by a
+VACUUM cadence (`--vacuum-interval`, default 1000 trimming inserts,
+only once at least 100 freelist pages are reclaimable; 0 disables)
+instead of on every insert. The listing
+endpoint pages newest-first via `?limit=`/`?offset=` so history past
+the most recent 200 rows stays reachable through the API.
 
 **No TLS.** This is plain HTTP, meant for localhost/LAN or behind a
 reverse proxy that terminates TLS for anything reachable over an

@@ -59,6 +59,9 @@ jobs:
       - name: Reports global quota + pagination unit test (no root, no network)
         run: python3 server/test_reports_pagination_quota_unit.py
 
+      - name: Report notifier + VACUUM cadence unit test (no root, no network)
+        run: python3 server/test_report_notify_vacuum_unit.py
+
       - name: Server auth-dispatch + trusted-proxy unit test (no root, no network)
         run: python3 server/test_auth_dispatch_unit.py
 

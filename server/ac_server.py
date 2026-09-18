@@ -45,6 +45,15 @@ connecting to it must run as this server's own user (or root). Pass
 different-user/group daemon (e.g. --unix-socket-mode 0660
 --unix-socket-group acd); widening lets every member of that group
 connect, so name the smallest group containing only your daemons.
+
+Every accepted report is also logged to stderr (one line) and, with
+--report-webhook-url, POSTed as JSON to that URL in the background --
+the push signal for the human reviewer, who otherwise learns about new
+reports only by polling GET /reports/<id>. Webhook delivery never
+blocks ingestion (bounded queue, drops counted and logged), and disk
+pages freed by the trims above are reclaimed by a VACUUM cadence
+(--vacuum-interval, only once enough freelist pages accumulate)
+rather than on every insert.
 """
 import argparse
 import hmac
@@ -64,6 +73,8 @@ import threading
 import time
 import traceback
 import urllib.parse
+import queue
+import urllib.request
 import collections
 import functools
 
@@ -155,6 +166,68 @@ class RateLimiter:
 
 def now_ts():
     return int(time.time())
+
+
+class ReportNotifier:
+    """Push signal for the human-in-the-loop ban pipeline (#39)."""
+    # POST /report only accumulates rows; without this, a reviewer learns
+    # about new reports only by polling GET /reports/<id>. Every accepted
+    # report is logged to stderr (one grep-able line) and, when
+    # --report-webhook-url is set, POSTed as JSON to that URL.
+    # Delivery never blocks ingestion: _handle_report enqueues with
+    # put_nowait and a daemon worker thread POSTs in the background. A
+    # slow or dead webhook endpoint therefore can't stall the report path
+    # -- at the cost of dropping queued payloads under sustained
+    # backpressure, counted in `dropped` and logged, never silently lost.
+    # A failed POST is logged and the payload dropped: the row is already
+    # committed in SQLite, so the listing endpoint stays the source of
+    # truth and the webhook is purely a hint to go look.
+    def __init__(self, webhook_url=None, webhook_timeout=5,
+                 notify_queue_size=1000):
+        self.webhook_url = webhook_url
+        self.webhook_timeout = webhook_timeout
+        self._queue = None
+        self._worker = None
+        self.dropped = 0
+        self._dropped_lock = threading.Lock()
+        if webhook_url:
+            self._queue = queue.Queue(maxsize=max(notify_queue_size, 1))
+            self._worker = threading.Thread(
+                target=self._drain, daemon=True, name="report-notify")
+            self._worker.start()
+    def notify(self, payload):
+        sys.stderr.write(
+            "ac_server: new report client_id=%s event=%r from %s\n"
+            % (payload.get("client_id"), payload.get("event_type"),
+               payload.get("source_addr")))
+        if self._queue is None:
+            return
+        try:
+            self._queue.put_nowait(payload)
+        except queue.Full:
+            with self._dropped_lock:
+                self.dropped += 1
+                dropped = self.dropped
+            sys.stderr.write(
+                "ac_server: webhook queue full, dropping report "
+                "(%d dropped total)\n" % (dropped,))
+    def _drain(self):
+        while True:
+            payload = self._queue.get()
+            try:
+                req = urllib.request.Request(
+                    self.webhook_url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+                with urllib.request.urlopen(
+                        req, timeout=self.webhook_timeout):
+                    pass
+            except Exception as e:
+                sys.stderr.write(
+                    "ac_server: webhook delivery failed: %r\n" % (e,))
+            finally:
+                self._queue.task_done()
 
 
 UNIX_CLIENT_ADDRESS = ("unix", 0)
@@ -518,7 +591,7 @@ class Store:
     across threads."""
 
     def __init__(self, db_path, max_reports_per_client=1000,
-                 max_total_reports=100000):
+                 max_total_reports=100000, vacuum_interval=1000):
         self.db_path = db_path
         # Bounds how many rows a single client_id can hold in `reports`,
         # trimmed on every insert (see add_report). Without this, a single
@@ -535,6 +608,19 @@ class Store:
         # rows go first, same as the per-client trim. 0/None disables
         # the cap.
         self.max_total_reports = max_total_reports
+        # Reclaims freelist pages left behind by the trims above:
+        # DELETEs only unlink pages, so a trimming workload's file
+        # grows to its high-water mark and stays there without VACUUM
+        # (#39). VACUUM rewrites the whole file while holding the
+        # write lock, so it runs at most once per `vacuum_interval`
+        # inserts that actually deleted rows -- and even then only
+        # when PRAGMA freelist_count shows at least
+        # VACUUM_MIN_FREELIST_PAGES reclaimable pages. At a steady
+        # cap (one row evicted per insert) SQLite reuses those pages
+        # for the new rows, so there is nothing to reclaim and the
+        # cadence hit is a no-op. 0/None disables.
+        self.vacuum_interval = vacuum_interval
+        self._writes_since_vacuum = 0
         # SQLite only ever allows one writer at a time, even in WAL mode --
         # under ThreadingHTTPServer, every write-handling thread opens its
         # own connection and would otherwise all race for that single
@@ -632,29 +718,37 @@ class Store:
         return conn
 
     def add_report(self, client_id, event_type, detail, client_ts, source_addr):
+        # Captured here so the stored row and the webhook payload (see
+        # _handle_report) agree on when the report landed -- calling
+        # now_ts() again at notify time could tick over by a second.
+        received_at = now_ts()
         with self._write_lock:
             conn = self._connect()
             try:
                 conn.execute(
                     "INSERT INTO reports (client_id, event_type, detail, "
                     "client_ts, received_at, source_addr) VALUES (?,?,?,?,?,?)",
-                    (client_id, event_type, detail, client_ts, now_ts(), source_addr),
+                    (client_id, event_type, detail, client_ts, received_at, source_addr),
                 )
+                trimmed = 0
                 if self.max_reports_per_client:
-                    conn.execute(
+                    cur = conn.execute(
                         "DELETE FROM reports WHERE client_id = ? AND id NOT IN ("
                         "SELECT id FROM reports WHERE client_id = ? "
                         "ORDER BY id DESC LIMIT ?)",
                         (client_id, client_id, self.max_reports_per_client),
                     )
+                    trimmed += cur.rowcount
                 if self.max_total_reports:
-                    conn.execute(
+                    cur = conn.execute(
                         "DELETE FROM reports WHERE id NOT IN ("
                         "SELECT id FROM reports "
                         "ORDER BY id DESC LIMIT ?)",
                         (self.max_total_reports,),
                     )
+                    trimmed += cur.rowcount
                 conn.commit()
+                self._maybe_vacuum(conn, trimmed)
                 # SQLite may have (re)created -wal/-shm on this write; lock
                 # them down while the connection is still open (they exist
                 # now, not just at __init__ time). Harmless under the daemon
@@ -663,6 +757,38 @@ class Store:
                 self._ensure_private()
             finally:
                 conn.close()
+        return received_at
+
+    def _maybe_vacuum(self, conn, trimmed):
+        """Run VACUUM at most once per `vacuum_interval` trimming inserts,
+        and only when enough freelist pages have actually accumulated."""
+        # A failure here must never fail the insert it follows -- the file
+        # just stays at its high-water mark until the next cadence hit.
+        # Steady-state cap churn (one row evicted per insert) reuses its
+        # own pages, so an unconditional rewrite here would block every
+        # other writer under _write_lock to reclaim nothing, forever.
+        if not trimmed or not self.vacuum_interval:
+            return
+        self._writes_since_vacuum += 1
+        if self._writes_since_vacuum < self.vacuum_interval:
+            return
+        self._writes_since_vacuum = 0
+        try:
+            freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        except Exception as e:
+            sys.stderr.write("ac_server: freelist check failed: %r\n" % (e,))
+            return
+        if freelist < self.VACUUM_MIN_FREELIST_PAGES:
+            return
+        try:
+            conn.execute("VACUUM")
+        except Exception as e:
+            sys.stderr.write("ac_server: VACUUM failed: %r\n" % (e,))
+
+    # Floor on PRAGMA freelist_count pages that justifies a VACUUM rewrite
+    # (see _maybe_vacuum): ~400KB reclaimable at default 4KiB pages, vs
+    # ~1 page for steady-state cap churn and hundreds after a bulk trim.
+    VACUUM_MIN_FREELIST_PAGES = 100
 
     # Hard ceiling on one listing response: without it, asking for a huge
     # ?limit= pages an arbitrarily large result set into one JSON body
@@ -796,7 +922,7 @@ def _resolve_socket_group(name):
 
 
 def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False,
-                 trusted_proxy_cidrs=()):
+                 trusted_proxy_cidrs=(), notifier=None):
     # Tuple of ipaddress._BaseNetwork parsed once in main(): X-Forwarded-For
     # is only honored for TCP peers inside one of these (see
     # _peer_is_trusted_proxy). main() refuses --trust-proxy without at
@@ -1173,9 +1299,23 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                     return self._send_json(400, {"error": "invalid ts"})
             else:
                 client_ts = None
-            store.add_report(
-                client_id, event_type, detail, client_ts, self._client_ip()
+            source_addr = self._client_ip()
+            received_at = store.add_report(
+                client_id, event_type, detail, client_ts, source_addr
             )
+            if notifier is not None:
+                # Best-effort push signal for the human reviewer (#39):
+                # notify() only appends a log line and a non-blocking
+                # queue put, so a slow/dead webhook delays neither this
+                # response nor the next insert.
+                notifier.notify({
+                    "client_id": client_id,
+                    "event_type": event_type,
+                    "detail": detail,
+                    "client_ts": client_ts,
+                    "received_at": received_at,
+                    "source_addr": source_addr,
+                })
             self._send_json(201, {"ok": True})
 
         @_requires_auth(admin_keys)
@@ -1300,6 +1440,45 @@ def main():
         "trimmed on insert; keeps a single spammy or misbehaving daemon "
         "from growing the SQLite file without bound (default: 1000, "
         "0 disables the cap)",
+    )
+    ap.add_argument(
+        "--report-webhook-url",
+        default=None,
+        metavar="URL",
+        help="POST every accepted report as JSON to this URL (the push "
+        "signal for the human reviewer; without it new reports are only "
+        "visible by polling GET /reports/<id>). Delivery is best-effort "
+        "in a background thread and never blocks ingestion: a slow or "
+        "dead endpoint drops queued payloads instead (counted and "
+        "logged), it never 500s the report (default: off, log line only)",
+    )
+    ap.add_argument(
+        "--report-webhook-timeout",
+        type=float,
+        default=5,
+        metavar="SEC",
+        help="per-attempt POST timeout for --report-webhook-url "
+        "deliveries in seconds (default: 5)",
+    )
+    ap.add_argument(
+        "--notify-queue-size",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="bounded webhook payloads queued for background delivery; "
+        "further reports are dropped (and counted) until the queue "
+        "drains (default: 1000)",
+    )
+    ap.add_argument(
+        "--vacuum-interval",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="run VACUUM at most once per N inserts that actually trimmed "
+        "rows, and only when at least 100 freelist pages are reclaimable "
+        "(steady-state eviction reuses its own pages, so there is nothing "
+        "to collect); VACUUM rewrites the whole file, hence the cadence "
+        "(default: 1000, 0 disables)",
     )
     ap.add_argument(
         "--max-total-reports",
@@ -1500,6 +1679,20 @@ def main():
         )
         sys.exit(1)
 
+    if args.report_webhook_timeout <= 0:
+        sys.stderr.write("ac_server: --report-webhook-timeout must be positive\n")
+        sys.exit(1)
+
+    if args.notify_queue_size <= 0:
+        sys.stderr.write("ac_server: --notify-queue-size must be positive\n")
+        sys.exit(1)
+
+    if args.vacuum_interval < 0:
+        sys.stderr.write(
+            "ac_server: --vacuum-interval must be >= 0 (0 disables)\n"
+        )
+        sys.exit(1)
+
     if args.max_connections <= 0:
         sys.stderr.write("ac_server: --max-connections must be positive\n")
         sys.exit(1)
@@ -1591,12 +1784,18 @@ def main():
     # It lives here, not in Store.__init__, precisely so importing Store as
     # a library never mutates the importer's process-wide umask (#99).
     os.umask(0o077)
+    notifier = ReportNotifier(
+        webhook_url=args.report_webhook_url,
+        webhook_timeout=args.report_webhook_timeout,
+        notify_queue_size=args.notify_queue_size,
+    )
     store = Store(args.db, max_reports_per_client=args.max_reports_per_client,
-                  max_total_reports=args.max_total_reports)
+                  max_total_reports=args.max_total_reports,
+                  vacuum_interval=args.vacuum_interval)
     rate_limiter = RateLimiter(args.rate_limit, args.rate_window)
     handler = make_handler(
         store, report_keys, admin_keys, rate_limiter, args.trust_proxy,
-        tuple(trusted_proxy_cidrs),
+        tuple(trusted_proxy_cidrs), notifier,
     )
     if args.unix_socket:
         httpd = ThreadingUnixHTTPServer(
