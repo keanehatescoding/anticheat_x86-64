@@ -548,7 +548,7 @@ PYEOF
 W_HOOK_PID=$!
 W_HOOK_READY=0
 for _ in $(seq 1 50); do
-    if curl -s -o /dev/null -X POST http://127.0.0.1:18819/hook \
+    if curl -s -o /dev/null --connect-timeout 1 --max-time 2 -X POST http://127.0.0.1:18819/hook \
         -H 'Content-Type: application/json' -d '{}' 2>/dev/null; then
         W_HOOK_READY=1
         break
