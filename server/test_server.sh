@@ -547,8 +547,13 @@ HTTPServer(("127.0.0.1", 18819), H).serve_forever()
 PYEOF
 W_HOOK_PID=$!
 W_HOOK_READY=0
+W_HOOK_DEADLINE=$((SECONDS + 5))
 for _ in $(seq 1 50); do
-    if curl -s -o /dev/null --connect-timeout 1 --max-time 2 -X POST http://127.0.0.1:18819/hook \
+    [ "$SECONDS" -ge "$W_HOOK_DEADLINE" ] && break
+    REM=$((W_HOOK_DEADLINE - SECONDS))
+    [ "$REM" -gt 2 ] && REM=2
+    [ "$REM" -lt 1 ] && REM=1
+    if curl -s -o /dev/null --connect-timeout 1 --max-time "$REM" -X POST http://127.0.0.1:18819/hook \
         -H 'Content-Type: application/json' -d '{}' 2>/dev/null; then
         W_HOOK_READY=1
         break
