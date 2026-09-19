@@ -131,6 +131,48 @@ static void logmsg(int pri, const char *fmt, ...)
         ac_report(pri <= LOG_ALERT ? "ALERT" : "CRITICAL", buf);
 }
 
+/* Trust-boundary clamps (#29): `el.count`, `pl.count` and `b.n_vmas` all
+ * originate on the kernel side of the ioctl boundary. The daemon otherwise
+ * treats the loaded module as a trust boundary (see the AC_IOCTL_VERSION
+ * handshake in cmd_start, and the kzalloc-vs-kmalloc reasoning on the
+ * kernel's own GET_EVENTS path): a stale or buggy module can hand back a
+ * count larger than the array it describes. Each helper below caps the
+ * value at the corresponding AC_MAX_* bound and warns at LOG_WARNING --
+ * deliberately *not* CRIT/ALERT, so a mismatched module can't inject rows
+ * into the ban pipeline via an inflated count. (The MODS_BEGIN count is
+ * not clamped: unlike these best-effort periodic scans, a truncated module
+ * walk must not report a clean verdict, so an over-cap count fails the
+ * whole cross-check as inconclusive instead -- see crosscheck_modules().) */
+static unsigned int clamp_event_count(unsigned int n)
+{
+    if (n > AC_MAX_EVENTS) {
+        logmsg(LOG_WARNING, "kernel reported %u events (max %u); truncating",
+               n, AC_MAX_EVENTS);
+        return AC_MAX_EVENTS;
+    }
+    return n;
+}
+
+static unsigned int clamp_prot_count(unsigned int n)
+{
+    if (n > AC_MAX_PROTS) {
+        logmsg(LOG_WARNING, "kernel reported %u protected processes (max %u); truncating",
+               n, AC_MAX_PROTS);
+        return AC_MAX_PROTS;
+    }
+    return n;
+}
+
+static unsigned int clamp_vma_count(unsigned int n)
+{
+    if (n > AC_MAX_VMAS) {
+        logmsg(LOG_WARNING, "kernel reported %u VMAs (max %u); truncating",
+               n, AC_MAX_VMAS);
+        return AC_MAX_VMAS;
+    }
+    return n;
+}
+
 static int ac_open(void)
 {
     dev_fd = open(AC_DEV_PATH, O_RDWR | O_CLOEXEC);
@@ -322,7 +364,10 @@ static int pid_of_comm(const char *comm, int *pids, int max)
 {
     DIR *d;
     struct dirent *de;
-    int n = 0;
+    /* Total matches, not just stored ones: the caller needs to know when
+     * the fixed-size array truncated the result, so a partial protect
+     * can't be reported as a complete one. */
+    int total = 0;
 
     d = opendir("/proc");
     if (!d)
@@ -343,11 +388,14 @@ static int pid_of_comm(const char *comm, int *pids, int max)
          * thread-group leader -- "tgid-stable" per issue #69 -- with no
          * extra lookup needed. */
 
-        if (pid_identifies_as(pid, comm, NULL, 0) && n < max)
-            pids[n++] = pid;
+        if (pid_identifies_as(pid, comm, NULL, 0)) {
+            if (total < max)
+                pids[total] = pid;
+            total++;
+        }
     }
     closedir(d);
-    return n;
+    return total;
 }
 
 /* Strict positive-pid parse for --pid/--ns-of CLI arguments, same
@@ -408,6 +456,12 @@ static int cmd_protect(int argc, char **argv)
         if (n == 0) {
             fprintf(stderr, "no process with comm '%s'\n", comm);
             return 1;
+        }
+        if (n > 256) {
+            fprintf(stderr,
+                    "warning: %d processes match '%s', protecting only the first 256\n",
+                    n, comm);
+            n = 256;
         }
         for (i = 0; i < n; i++) {
             char cur_comm[AC_MAX_COMM + 1];
@@ -489,6 +543,7 @@ static int cmd_list(void)
     memset(&pl, 0, sizeof(pl));
     if (ioctl_ok(AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return 1;
+    pl.count = clamp_prot_count(pl.count);
     printf("%u protected process(es):\n", pl.count);
     for (i = 0; i < pl.count; i++)
         printf("  pid %-8d %-16s jit=%s\n", pl.items[i].pid,
@@ -1242,6 +1297,7 @@ static int find_libs_by_basenames(int pid, const char *const *prefixes,
     b.emit_events = 0;
     if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) < 0)
         return -1;
+    b.n_vmas = clamp_vma_count(b.n_vmas);
     for (v = 0; v < b.n_vmas; v++) {
         struct ac_scan_get g;
         struct ac_vma_info *vi;
@@ -1379,6 +1435,7 @@ static void check_render_hooks_periodic(void)
     memset(&pl, 0, sizeof(pl));
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return;
+    pl.count = clamp_prot_count(pl.count);
     for (i = 0; i < pl.count; i++) {
         int statuses[AC_RENDER_APIS_COUNT];
         char libpaths[AC_RENDER_APIS_COUNT][AC_VMA_PATH];
@@ -1539,6 +1596,7 @@ static int cmd_scan(int argc, char **argv)
     b.emit_events = 1;
     if (ioctl_ok(AC_IOCTL_SCAN_BEGIN, &b) < 0)
         return 1;
+    b.n_vmas = clamp_vma_count(b.n_vmas);
 
     /* b.resolved_pid, not `pid`, for every /proc/<pid>/... access below:
      * with --ns-of, `pid` is namespace-relative and doesn't name anything
@@ -1745,7 +1803,10 @@ static char proc_names[AC_MAX_PROC_MODS][AC_MOD_NAME_LEN];
  * entries": collect_proc_modules() failing to read the userspace-visible
  * module list says nothing about which modules are actually loaded, and
  * proceeding as if the list were legitimately empty would flag every
- * kernel-reported module as hidden. */
+ * kernel-reported module as hidden. A truncated read (more entries than
+ * `cap`) is also -1: every module past the cap would otherwise be absent
+ * from the name table and miscounted as hidden (false positives), so an
+ * incomplete table is inconclusive, not a verdict. */
 static long collect_proc_modules(unsigned int cap)
 {
     FILE *f = fopen("/proc/modules", "r");
@@ -1754,9 +1815,22 @@ static long collect_proc_modules(unsigned int cap)
 
     if (!f)
         return -1;
-    while (fgets(line, sizeof(line), f) && n < cap) {
+    /* Check the cap *before* reading: with the read first, the iteration
+     * that fills the table would consume (and discard) the first excess
+     * line in the loop condition, so the truncation probe below would see
+     * EOF and mistake "cap + 1 entries" for exactly cap. */
+    while (n < cap && fgets(line, sizeof(line), f)) {
         if (sscanf(line, "%63s", proc_names[n]) == 1)
             n++;
+    }
+    if (n == cap) {
+        /* The loop above stops consuming input once the table is full, so
+         * probe for one more line to distinguish "exactly cap entries"
+         * from "cap entries and counting". */
+        if (fgets(line, sizeof(line), f) != NULL) {
+            fclose(f);
+            return -1;
+        }
     }
     fclose(f);
     return (long)n;
@@ -1766,9 +1840,22 @@ static long crosscheck_modules(int verbose)
 {
     unsigned int count, i, hidden = 0, proc_count;
     long proc_count_r;
+    int walk_failed = 0;
 
     if (ioctl(dev_fd, AC_IOCTL_MODS_BEGIN, &count) < 0)
         return -1;
+    /* Fail inconclusive, not truncated: the walk below can only visit the
+     * first AC_MAX_MODS indices, so a count above that would let modules
+     * past the cutoff go unchecked while a clean prefix still reports
+     * hidden == 0. The real module caps n_mods at AC_MAX_MODS itself, so
+     * this only trips on a stale/buggy module -- the same pairing the
+     * version handshake guards against. */
+    if (count > AC_MAX_MODS) {
+        (void)ioctl(dev_fd, AC_IOCTL_MODS_END, NULL);
+        logmsg(LOG_WARNING, "crosscheck_modules: kernel reported %u modules "
+               "(max %u) -- result inconclusive", count, AC_MAX_MODS);
+        return -1;
+    }
     proc_count_r = collect_proc_modules(AC_MAX_PROC_MODS);
     if (proc_count_r < 0) {
         /* Can't rule out "hidden" vs "we just couldn't read the visible
@@ -1789,8 +1876,15 @@ static long crosscheck_modules(int verbose)
 
         memset(&g, 0, sizeof(g));
         g.index = i;
-        if (ioctl(dev_fd, AC_IOCTL_MODS_GET, &g) < 0)
+        /* A transient failure mid-walk would otherwise fall through to
+         * the success return below, letting modules later in the kernel
+         * list go silently unchecked and reporting a truncated walk as a
+         * clean verdict. Flag it so the caller reports inconclusive
+         * instead of clean. */
+        if (ioctl(dev_fd, AC_IOCTL_MODS_GET, &g) < 0) {
+            walk_failed = 1;
             break;
+        }
         for (j = 0; j < proc_count; j++) {
             if (strcmp(proc_names[j], g.mod.name) == 0) {
                 visible = 1;
@@ -1805,6 +1899,11 @@ static long crosscheck_modules(int verbose)
             hidden++;
     }
     (void)ioctl(dev_fd, AC_IOCTL_MODS_END, NULL); /* END only frees snapshot; failure is non-fatal */
+    if (walk_failed) {
+        logmsg(LOG_WARNING, "crosscheck_modules: kernel module walk failed "
+               "at index %u/%u -- result inconclusive", i, count);
+        return -1;
+    }
     if (verbose)
         printf("hidden modules: %u\n", hidden);
     return hidden;
@@ -2008,6 +2107,7 @@ static int cmd_vmcheck(void)
 static int cmd_events(int argc, char **argv)
 {
     int watch = 0, i;
+    unsigned int n;
 
     for (i = 0; i < argc; i++)
         if (strcmp(argv[i], "--watch") == 0)
@@ -2020,7 +2120,8 @@ static int cmd_events(int argc, char **argv)
         memset(&el, 0, sizeof(el));
         if (ioctl_ok(AC_IOCTL_GET_EVENTS, &el) < 0)
             return 1;
-        for (i = 0; i < (int)el.count; i++)
+        n = clamp_event_count(el.count);
+        for (i = 0; i < (int)n; i++)
             print_event(&el.events[i]);
         if (el.dropped)
             printf("(ring dropped %u events)\n", el.dropped);
@@ -2372,6 +2473,7 @@ static void check_ld_preload_periodic(void)
     memset(&pl, 0, sizeof(pl));
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return;
+    pl.count = clamp_prot_count(pl.count);
     preload_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         char val[512];
@@ -2452,6 +2554,7 @@ static void check_vk_layers_periodic(void)
     memset(&pl, 0, sizeof(pl));
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return;
+    pl.count = clamp_prot_count(pl.count);
     vklayer_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_environ_query vars[AC_VK_LAYER_ENV_VARS_COUNT];
@@ -2898,6 +3001,7 @@ static void check_implicit_layers_periodic(void)
     memset(&pl, 0, sizeof(pl));
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return;
+    pl.count = clamp_prot_count(pl.count);
     implicit_layer_baseline_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_implicit_layer layers[AC_MAX_IMPLICIT_LAYERS];
@@ -2968,6 +3072,7 @@ static int scan_protected_periodic(void)
     memset(&pl, 0, sizeof(pl));
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return -1;
+    pl.count = clamp_prot_count(pl.count);
     anon_baseline_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_scan_begin b;
@@ -2975,6 +3080,7 @@ static int scan_protected_periodic(void)
         memset(&b, 0, sizeof(b));
         b.pid = pl.items[i].pid;
         if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) == 0) {
+            b.n_vmas = clamp_vma_count(b.n_vmas);
             if (b.rwx_count > 0)
                 logmsg(LOG_WARNING, "pid %d (%s): %u RWX mapping(s) present",
                        pl.items[i].pid, pl.items[i].comm, b.rwx_count);
@@ -3003,6 +3109,7 @@ static int check_baselines_periodic(void)
     memset(&pl, 0, sizeof(pl));
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return -1;
+    pl.count = clamp_prot_count(pl.count);
     for (i = 0; i < pl.count; i++) {
         struct ac_scan_begin b;
         unsigned int v;
@@ -3013,6 +3120,7 @@ static int check_baselines_periodic(void)
         b.pid = pl.items[i].pid;
         if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) != 0)
             continue;
+        b.n_vmas = clamp_vma_count(b.n_vmas);
         for (v = 0; v < b.n_vmas; v++) {
             struct ac_scan_get g;
             struct ac_vma_info *vi;
@@ -4203,7 +4311,9 @@ static int cmd_start(int argc, char **argv)
             if (got < 0 && g_stop)
                 break;
             if (got == 0) {
-                for (i = 0; i < (int)el.count; i++) {
+                unsigned int n_ev = clamp_event_count(el.count);
+
+                for (i = 0; i < (int)n_ev; i++) {
                     struct ac_event *e = &el.events[i];
 
                     if (e->type == AC_EV_PTRACE || e->type == AC_EV_PROCESS_VM)
