@@ -1404,18 +1404,24 @@ static int ac_add_prot_pid(pid_t pid, pid_t ref_pid, bool jit_allowed,
     struct task_struct *t = ref_pid > 0 ? ac_find_task_in_ns_of(pid, ref_pid)
                                          : ac_find_task(pid);
     struct mm_struct *mm;
+    /* Snapshot via the canonical accessor (#19): a direct t->comm read can
+     * tear against a concurrent PR_SET_NAME/exec rename. get_task_comm()
+     * needs an array destination (BUILD_BUG_ON on pointers), so snapshot
+     * locally, then pad-copy into the caller's pointer buffer. */
+    char comm[AC_MAX_COMM];
     int ret;
 
     if (!t)
         return -ESRCH;
+    get_task_comm(comm, t);
     if (comm_out)
-        strscpy(comm_out, t->comm, AC_MAX_COMM);
+        strscpy_pad(comm_out, comm, AC_MAX_COMM);
     mm = get_task_mm(t);
     if (!mm) {
         put_task_struct(t);
         return -ESRCH;  /* kernel thread, or already tearing down */
     }
-    ret = ac_add_prot_mm(mm, t->pid, t->comm, jit_allowed);
+    ret = ac_add_prot_mm(mm, t->pid, comm, jit_allowed);
     put_task_struct(t);
     mmput(mm);           /* process context (ioctl): plain mmput() is fine */
     return ret;
@@ -1582,8 +1588,19 @@ static bool ac_is_protected_pid(pid_t pid, char *comm_out)
     if (!t)
         return false;
     prot = ac_is_protected_task_mm(t);
-    if (prot && comm_out)
-        strscpy(comm_out, t->comm, AC_MAX_COMM);
+    if (prot && comm_out) {
+        /* Canonical accessor (#19) -- see ac_add_prot_pid(). The pointer
+         * destination can't go through get_task_comm() directly
+         * (BUILD_BUG_ON on non-arrays), so snapshot locally first, then
+         * pad-copy with an explicit size. put_task_struct() below stays
+         * as-is: the task_struct free path is RCU-delayed, so dropping
+         * the reference is safe in the atomic kprobe contexts this is
+         * called from. */
+        char comm[AC_MAX_COMM];
+
+        get_task_comm(comm, t);
+        strscpy_pad(comm_out, comm, AC_MAX_COMM);
+    }
     put_task_struct(t);
     return prot;
 }
@@ -2081,6 +2098,7 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
     bool is_compat = (p == &ac_kp_ptrace32);
     long request, target;
     char tcomm[AC_MAX_COMM] = "?";
+    char ccomm[AC_MAX_COMM];
     bool deny = false, kill = false, killed = false;
     int rc;
 
@@ -2107,7 +2125,7 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
          * ignores its arguments, so args->si holds whatever was in the
          * register — report current->pid, not stale garbage */
         if (ac_is_protected_current()) {
-            strscpy(tcomm, current->comm, sizeof(tcomm));
+            get_task_comm(tcomm, current);
             target = current->pid;
             deny = true;
         }
@@ -2120,9 +2138,14 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
     if (!deny)
         return 0;
 
+    /* Snapshot the caller's own comm once for the log lines below (#19) --
+     * passing current->comm straight into the format args would read it
+     * twice, potentially tearing against a concurrent rename between the
+     * two reads. */
+    get_task_comm(ccomm, current);
     ac_emit(AC_EV_PTRACE, (int)target, tcomm,
             "ptrace req %ld by pid %d (%s) DENIED",
-            request, current->pid, current->comm);
+            request, current->pid, ccomm);
 
     killed = kill && (READ_ONCE(ac_policy) & 0x1);
     if (killed)
@@ -2158,7 +2181,7 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
          * neutralisation would have produced. Either barrier stops the
          * attack on its own. */
         pr_crit("anticheat: ptrace neutralisation write failed for req %ld target %d (%s) by pid %d (%s) -- killing caller\n",
-                request, (int)target, tcomm, current->pid, current->comm);
+                request, (int)target, tcomm, current->pid, ccomm);
         if (!killed)
             ac_schedule_kill(current);
         if (ac_skip_syscall(regs, -EIO))
@@ -2191,6 +2214,7 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
     pid_t target;
     struct task_struct *t;
     char tcomm[AC_MAX_COMM] = "?";
+    char ccomm[AC_MAX_COMM];
     bool protected_target, killed;
     int rc;
 
@@ -2231,16 +2255,17 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
     }
     protected_target = ac_is_protected_task_mm(t);
     if (protected_target)
-        strscpy(tcomm, t->comm, sizeof(tcomm));
+        get_task_comm(tcomm, t);
     put_task_struct(t);
     if (!protected_target)
         return 0;
 
+    get_task_comm(ccomm, current);
     ac_emit(AC_EV_PROCESS_VM, target, tcomm,
             "process_vm_%s by pid %d (%s) DENIED",
             (p == &ac_kp_process_vm_readv32 ||
              p == &ac_kp_process_vm_readv) ? "readv" : "writev",
-            current->pid, current->comm);
+            current->pid, ccomm);
 
     killed = READ_ONCE(ac_policy) & 0x1;
     if (killed)
@@ -2269,7 +2294,7 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
          * since the queued SIGKILL only lands after the syscall has run
          * and pool exhaustion can drop it outright. */
         pr_crit("anticheat: process_vm neutralisation write failed for target pid %d (%s) by pid %d (%s) -- killing caller\n",
-                target, tcomm, current->pid, current->comm);
+                target, tcomm, current->pid, ccomm);
         if (!killed)
             ac_schedule_kill(current);
         if (ac_skip_syscall(regs, -ESRCH))
@@ -2289,6 +2314,7 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     struct mm_struct *child_mm;
     pid_t cpid;
     char ccomm[AC_MAX_COMM];
+    char pcomm[AC_MAX_COMM];
 
     if (child_pid <= 0)
         return 0;
@@ -2309,7 +2335,7 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
      * entry. */
     child_mm = get_task_mm(child);
     cpid = child->pid;
-    strscpy(ccomm, child->comm, sizeof(ccomm));
+    get_task_comm(ccomm, child);
     put_task_struct(child);
     if (!child_mm)
         return 0;                  /* kernel thread, or already gone */
@@ -2328,13 +2354,15 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
      * protection before the deferred registration has even run would be
      * exactly the kind of false claim the old synchronous code's comment
      * warned about. */
+    /* Snapshot the parent's own comm once for both uses below (#19). */
+    get_task_comm(pcomm, current);
     if (!ac_schedule_prot_add(child_mm, cpid, ccomm, current->pid,
-                              current->comm,
+                              pcomm,
                               ac_prot_jit_allowed_mm(current->mm)))
         ac_emit(AC_EV_INFO, cpid, ccomm,
                 "child of protected pid %d (%s) NOT protected: registration "
                 "request dropped (alloc failure)",
-                current->pid, current->comm);
+                current->pid, pcomm);
     return 0;
 }
 
@@ -2423,7 +2451,10 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
             rcu_read_lock();
             parent = rcu_dereference(current->real_parent);
             d->parent_pid = parent->pid;
-            strscpy(d->parent_comm, parent->comm, sizeof(d->parent_comm));
+            /* RCU holds the task_struct alive here; the accessor still
+             * applies (#19) since comm itself can be renamed
+             * concurrently. */
+            get_task_comm(d->parent_comm, parent);
             rcu_read_unlock();
         }
         return 0;
@@ -2437,8 +2468,13 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
          * AC_EV_EXEC for this exec once that outcome actually lands, so
          * emitting it here too would double-count every successful
          * re-exec of a protected process. */
-        ac_emit(AC_EV_INFO, current->pid, current->comm,
-                "execve() invoked (path is a user pointer, not resolved)");
+        {
+            char cur_comm[AC_MAX_COMM];
+
+            get_task_comm(cur_comm, current);
+            ac_emit(AC_EV_INFO, current->pid, cur_comm,
+                    "execve() invoked (path is a user pointer, not resolved)");
+        }
         return 0;
     }
     /* Not yet in ac_prots[] -- but a fork-inherit request queued for
@@ -2478,7 +2514,13 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     struct ac_exec_entry_data *d = (struct ac_exec_entry_data *)ri->data;
     long rc = (long)regs_return_value(regs);
     struct mm_struct *new_mm;
+    /* Single snapshot for every current->comm use below (#19): the ret
+     * probe runs after the new image is installed, but reading the
+     * pointer repeatedly would still allow a torn log line if a
+     * concurrent rename lands mid-handler. */
+    char cur_comm[AC_MAX_COMM];
 
+    get_task_comm(cur_comm, current);
     if (d->vfork_inherit) {
         if (rc != 0)
             return 0;   /* exec failed: still sharing the parent's mm,
@@ -2486,10 +2528,10 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
         new_mm = get_task_mm(current);
         if (!new_mm)
             return 0;   /* shouldn't happen on a successful exec */
-        if (!ac_schedule_prot_add(new_mm, current->pid, current->comm,
+        if (!ac_schedule_prot_add(new_mm, current->pid, cur_comm,
                                   d->parent_pid, d->parent_comm,
                                   d->jit_allowed))
-            ac_emit(AC_EV_INFO, current->pid, current->comm,
+            ac_emit(AC_EV_INFO, current->pid, cur_comm,
                     "vfork child of protected pid %d (%s) NOT protected: "
                     "registration request dropped (alloc failure)",
                     d->parent_pid, d->parent_comm);
@@ -2522,8 +2564,7 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
                     drop = pr->post_mm;
                     pr->post_mm = new_mm;
                     pr->post_pid = current->pid;
-                    strscpy(pr->post_comm, current->comm,
-                            sizeof(pr->post_comm));
+                    get_task_comm(pr->post_comm, current);
                     new_mm = NULL;  /* reference transferred */
                     complete(&pr->handoff_done);
                     break;
@@ -2538,9 +2579,9 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
                  * registered the pre-exec mm, so queue a fresh request
                  * for the post-exec image. */
                 if (!ac_schedule_prot_add(new_mm, current->pid,
-                                          current->comm, d->parent_pid,
+                                          cur_comm, d->parent_pid,
                                           d->parent_comm, d->jit_allowed))
-                    ac_emit(AC_EV_INFO, current->pid, current->comm,
+                    ac_emit(AC_EV_INFO, current->pid, cur_comm,
                             "child of protected pid %d (%s) exec'd but new "
                             "image NOT protected: registration request "
                             "dropped (alloc failure)",
@@ -2580,9 +2621,9 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
         return 0;
     }
     if (!ac_schedule_prot_rekey(d->old_mm, new_mm, current->pid,
-                                current->comm,
+                                cur_comm,
                                 ac_prot_jit_allowed_mm(d->old_mm)))
-        ac_emit(AC_EV_INFO, current->pid, current->comm,
+        ac_emit(AC_EV_INFO, current->pid, cur_comm,
                 "protected pid %d re-exec'd but new image NOT protected: "
                 "registration request dropped (alloc failure); old entry "
                 "retained",
