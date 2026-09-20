@@ -3461,6 +3461,16 @@ static void reap_stale_resolvers(void)
     }
 }
 
+static int stale_resolver_slot_free(void)
+{
+    int i;
+
+    for (i = 0; i < AC_MAX_STALE_RESOLVERS; i++)
+        if (g_stale_resolvers[i] == 0)
+            return 1;
+    return 0;
+}
+
 /* Hand off a still-running resolver child the bounded reap gave up on:
  * track it for a later reap_stale_resolvers() sweep and log that it is
  * still running (not yet a zombie), so the message doesn't mislead. */
@@ -3506,8 +3516,22 @@ static int ac_resolve_timeout(const char *host, const char *port,
     int n = 0;
 
     /* Sweep any abandoned resolver children that have exited since the
-     * last resolve before forking a new one. */
+     * last resolve before forking a new one. If every slot is still
+     * occupied afterwards, every tracked child is still alive: forking
+     * another child whose timeout could then hit the full-table branch
+     * would hand out an untracked PID that can exit as a zombie with
+     * nobody left to reap it. Refuse instead (EAGAIN) -- the caller
+     * already treats any resolve failure as a logged, dropped report,
+     * which bounds the damage to one lost report rather than an
+     * unbounded zombie leak. */
     reap_stale_resolvers();
+    if (!stale_resolver_slot_free()) {
+        fprintf(stderr, "ac_resolve_timeout: %d resolver children still "
+                "tracked; refusing to fork another\n",
+                AC_MAX_STALE_RESOLVERS);
+        errno = EAGAIN;
+        return -1;
+    }
     if (pipe(pfd) < 0)
         return -1;
 

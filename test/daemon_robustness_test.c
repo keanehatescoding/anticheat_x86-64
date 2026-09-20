@@ -29,10 +29,17 @@
  *
  * Build: make daemon-robustness-test
  */
+/* _GNU_SOURCE for RTLD_DEFAULT/dlsym in the fault-injection section
+ * below; must precede every libc header, including those pulled in via
+ * anticheat_daemon.c. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #define main ac_daemon_unused_main
 #include "../src/anticheat_daemon.c"
 #undef main
 
+#include <dlfcn.h>
 #include <limits.h>
 #include <sys/time.h>
 
@@ -250,6 +257,100 @@ int main(void)
         reap_stale_resolvers();
         CHECK(g_stale_resolvers[0] == 0,
               "the sweep clears a tracked child once it has died");
+    }
+
+    /* --- EINTR fault injection: prove waitpid() itself returned EINTR
+     * during the bounded wait, not just that a signal fired somewhere.
+     * Runs only under AC_WAITPID_FAULT_TEST=1 with the fault injector
+     * preloaded (see the Makefile target): arming it faults 100% of
+     * the wait's WNOHANG waitpids, and the injector's counter -- read
+     * back via dlsym, so this asserts against the injector's own
+     * records rather than assuming -- must be nonzero afterwards. */
+    if (getenv("AC_WAITPID_FAULT_TEST")) {
+        int (*fault_count)(void) =
+            dlsym(RTLD_DEFAULT, "waitpid_fault_count");
+        pid_t pid;
+
+        CHECK(fault_count != NULL,
+              "fault injector present for the EINTR-proof test");
+        if (!fault_count)
+            return 1;
+        CHECK(fault_count() == 0,
+              "no faults injected before the armed wait");
+        pid = fork();
+        CHECK(pid >= 0, "fork for the EINTR-proof timeout test");
+        if (pid == 0) {
+            raise(SIGSTOP);
+            for (;;)
+                pause();
+            _exit(0);
+        }
+        if (pid <= 0)
+            return 1;
+        setenv("AC_WAITPID_FAULT_ARMED", "1", 1);
+        errno = 0;
+        {
+            int rc = waitpid_timeout(pid, 500);
+
+            setenv("AC_WAITPID_FAULT_ARMED", "0", 1);
+            CHECK(rc < 0 && errno == ETIMEDOUT,
+                  "the armed wait still times out with ETIMEDOUT");
+            CHECK(fault_count() > 0,
+                  "waitpid() returned EINTR during the wait "
+                  "(injector fired, so the retry branch ran)");
+        }
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+    }
+
+    /* --- resolve gate: with every stale slot occupied by a live child,
+     * ac_resolve_timeout() refuses to fork (EAGAIN) instead of risking
+     * an untrackable zombie. */
+    {
+        pid_t stuck[AC_MAX_STALE_RESOLVERS] = { 0 };
+        struct ac_resolved_addr addrs[1];
+        int i, all_forked = 1;
+
+        for (i = 0; i < AC_MAX_STALE_RESOLVERS; i++) {
+            stuck[i] = fork();
+            if (stuck[i] == 0) {
+                raise(SIGSTOP);
+                for (;;)
+                    pause();
+                _exit(0);
+            }
+            if (stuck[i] < 0) {
+                all_forked = 0;
+                break;
+            }
+        }
+        CHECK(all_forked,
+              "fork eight stuck children for the full-table test");
+        if (all_forked) {
+            for (i = 0; i < AC_MAX_STALE_RESOLVERS; i++)
+                abandon_resolver_child(stuck[i]);
+            CHECK(!stale_resolver_slot_free(),
+                  "eight live children fill the stale table");
+            errno = 0;
+            CHECK(ac_resolve_timeout("localhost", "80", addrs, 1, 5) < 0 &&
+                  errno == EAGAIN,
+                  "resolve with a full stale table fails fast with "
+                  "EAGAIN, forking nothing");
+            for (i = 0; i < AC_MAX_STALE_RESOLVERS; i++) {
+                kill(stuck[i], SIGKILL);
+                waitpid(stuck[i], NULL, 0);
+            }
+            reap_stale_resolvers();
+            CHECK(stale_resolver_slot_free(),
+                  "slots free again after the stuck children die");
+        } else {
+            for (i = 0; i < AC_MAX_STALE_RESOLVERS; i++) {
+                if (stuck[i] > 0) {
+                    kill(stuck[i], SIGKILL);
+                    waitpid(stuck[i], NULL, 0);
+                }
+            }
+        }
     }
 
     if (failures) {

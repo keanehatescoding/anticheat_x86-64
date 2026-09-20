@@ -24,6 +24,7 @@ test/baseline_test
 test/ac_report_status_test
 test/ac_report_url_test
 test/daemon_robustness_test
+test/libwaitpid_eintr_fault.so
 
 # runtime state
 *.log
