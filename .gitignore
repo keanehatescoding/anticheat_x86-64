@@ -23,6 +23,7 @@ test/ioctl_fuzz
 test/baseline_test
 test/ac_report_status_test
 test/ac_report_url_test
+test/daemon_robustness_test
 
 # runtime state
 *.log

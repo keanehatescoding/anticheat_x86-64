@@ -220,12 +220,29 @@ static const char *ev_type_str(unsigned int t)
     }
 }
 
+static void format_event_time(char *buf, size_t bufsz, time_t t)
+{
+    /* localtime() returns NULL for out-of-range time_t values (a stale
+     * or hostile kernel can hand print_event() an arbitrary u64
+     * nanosecond timestamp) -- passing that NULL straight into
+     * strftime() would crash the CLI/monitor display path (#29).
+     * Fail safe instead: fall back to the raw epoch seconds so the
+     * event is still shown, just without a wall-clock rendering. */
+    struct tm *tm = localtime(&t);
+
+    if (tm != NULL) {
+        strftime(buf, bufsz, "%H:%M:%S", tm);
+        return;
+    }
+    snprintf(buf, bufsz, "%lld", (long long)t);
+}
+
 static void print_event(const struct ac_event *e)
 {
     time_t t = (time_t)(e->ts / 1000000000ULL);
     char ts[32];
 
-    strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&t));
+    format_event_time(ts, sizeof(ts), t);
     printf("%s [%s] pid=%d comm=%s %s\n",
            ts, ev_type_str(e->type), e->pid, e->comm, e->data);
     fflush(stdout);
@@ -2322,7 +2339,11 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
         vars[i].found = 0;
 
     snprintf(path, sizeof(path), "/proc/%d/environ", pid);
-    fd = open(path, O_RDONLY);
+    /* O_CLOEXEC: this fd must not leak into forked children (the DNS
+     * resolver child inherits everything -- see ac_close_extra_fds()).
+     * O_NOFOLLOW: /proc/<pid>/environ is never a symlink; fail closed
+     * on the unexpected rather than reading through one (#29). */
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0)
         return -1;
     buf = malloc(AC_ENVIRON_BUF);
@@ -2337,6 +2358,12 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
     while (total < AC_ENVIRON_BUF - 1) {
         n = read(fd, buf + total, AC_ENVIRON_BUF - 1 - total);
         if (n < 0) {
+            /* Handlers here run without SA_RESTART (see cmd_start()),
+             * so a SIGTERM/SIGINT mid-read surfaces as EINTR -- retry
+             * it rather than reporting this pid's environ as
+             * unreadable/inconclusive over a transient interruption. */
+            if (errno == EINTR)
+                continue;
             close(fd);
             free(buf);
             return -1;
@@ -3369,6 +3396,41 @@ static void ac_close_extra_fds(int keep_fd)
     }
 }
 
+/* Bounded reap for a child we just SIGKILLed (see ac_resolve_timeout()
+ * below): waitpid(pid, NULL, 0) blocks indefinitely if the child is stuck
+ * in uninterruptible sleep (D state) -- SIGKILL can't touch it there --
+ * which would stall the monitor loop behind a report-path DNS resolve
+ * (#29). Poll with WNOHANG instead and give up after timeout_ms,
+ * returning 0 when the child was reaped and -1 otherwise (errno is
+ * ETIMEDOUT on a genuine timeout). A timed-out child stays a zombie
+ * until it actually dies; the caller logs and moves on rather than
+ * hanging the whole daemon behind it. */
+static int waitpid_timeout(pid_t pid, long timeout_ms)
+{
+    long waited_ms = 0;
+
+    for (;;) {
+        pid_t r = waitpid(pid, NULL, WNOHANG);
+
+        if (r == pid)
+            return 0;
+        if (r < 0) {
+            /* No SA_RESTART on this daemon's handlers (see cmd_start()),
+             * so a concurrent SIGTERM/SIGINT surfaces here as EINTR --
+             * retry the reap rather than misreporting it as failed. */
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (waited_ms >= timeout_ms) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        usleep(20000);
+        waited_ms += 20;
+    }
+}
+
 /* getaddrinfo() has no built-in timeout: against a slow or blackholed DNS
  * path it can block for the resolver's own timeout, which runs well past
  * AC_REPORT_TIMEOUT_SEC. ac_report() runs synchronously in the daemon's
@@ -3377,7 +3439,9 @@ static void ac_close_extra_fds(int keep_fd)
  * detections. Resolve in a short-lived child and bound how long we wait
  * for it with poll(), the same technique ac_connect_timeout() above uses
  * to bound connect(). Returns the number of addresses resolved (>=0), or
- * -1 on failure/timeout; the child is always reaped before returning. */
+ * -1 on failure/timeout; the child is reaped before returning, or at
+ * most a bounded reap-wait past it (see waitpid_timeout()) so a child
+ * wedged in D state can't stall the monitor loop indefinitely. */
 static int ac_resolve_timeout(const char *host, const char *port,
                                struct ac_resolved_addr *out, int max,
                                int timeout_sec)
@@ -3477,7 +3541,15 @@ static int ac_resolve_timeout(const char *host, const char *port,
     }
     close(pfd[0]);
     kill(pid, SIGKILL);
-    waitpid(pid, NULL, 0);
+    /* Bounded: a child wedged in D state ignores SIGKILL, and an
+     * unbounded waitpid() here would stall the monitor loop behind a
+     * report-path resolve (#29). On timeout the zombie is left for the
+     * kernel to clean up when it finally exits; the daemon itself
+     * moves on. */
+    if (waitpid_timeout(pid, 2000) < 0 && errno == ETIMEDOUT)
+        fprintf(stderr, "ac_resolve_timeout: resolver child %d did not "
+                "exit after SIGKILL; abandoning (still a zombie)\n",
+                (int)pid);
     return n;
 }
 
