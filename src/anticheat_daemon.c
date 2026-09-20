@@ -220,12 +220,29 @@ static const char *ev_type_str(unsigned int t)
     }
 }
 
+static void format_event_time(char *buf, size_t bufsz, time_t t)
+{
+    /* localtime() returns NULL for out-of-range time_t values (a stale
+     * or hostile kernel can hand print_event() an arbitrary u64
+     * nanosecond timestamp) -- passing that NULL straight into
+     * strftime() would crash the CLI/monitor display path (#29).
+     * Fail safe instead: fall back to the raw epoch seconds so the
+     * event is still shown, just without a wall-clock rendering. */
+    struct tm *tm = localtime(&t);
+
+    if (tm != NULL) {
+        strftime(buf, bufsz, "%H:%M:%S", tm);
+        return;
+    }
+    snprintf(buf, bufsz, "%lld", (long long)t);
+}
+
 static void print_event(const struct ac_event *e)
 {
     time_t t = (time_t)(e->ts / 1000000000ULL);
     char ts[32];
 
-    strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&t));
+    format_event_time(ts, sizeof(ts), t);
     printf("%s [%s] pid=%d comm=%s %s\n",
            ts, ev_type_str(e->type), e->pid, e->comm, e->data);
     fflush(stdout);
@@ -2322,7 +2339,11 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
         vars[i].found = 0;
 
     snprintf(path, sizeof(path), "/proc/%d/environ", pid);
-    fd = open(path, O_RDONLY);
+    /* O_CLOEXEC: this fd must not leak into forked children (the DNS
+     * resolver child inherits everything -- see ac_close_extra_fds()).
+     * O_NOFOLLOW: /proc/<pid>/environ is never a symlink; fail closed
+     * on the unexpected rather than reading through one (#29). */
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0)
         return -1;
     buf = malloc(AC_ENVIRON_BUF);
@@ -2337,6 +2358,12 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
     while (total < AC_ENVIRON_BUF - 1) {
         n = read(fd, buf + total, AC_ENVIRON_BUF - 1 - total);
         if (n < 0) {
+            /* Handlers here run without SA_RESTART (see cmd_start()),
+             * so a SIGTERM/SIGINT mid-read surfaces as EINTR -- retry
+             * it rather than reporting this pid's environ as
+             * unreadable/inconclusive over a transient interruption. */
+            if (errno == EINTR)
+                continue;
             close(fd);
             free(buf);
             return -1;
@@ -3369,6 +3396,103 @@ static void ac_close_extra_fds(int keep_fd)
     }
 }
 
+/* Bounded reap for a child we just SIGKILLed (see ac_resolve_timeout()
+ * below): waitpid(pid, NULL, 0) blocks indefinitely if the child is stuck
+ * in uninterruptible sleep (D state) -- SIGKILL can't touch it there --
+ * which would stall the monitor loop behind a report-path DNS resolve
+ * (#29). Poll with WNOHANG instead and give up after timeout_ms,
+ * returning 0 when the child was reaped and -1 otherwise (errno is
+ * ETIMEDOUT on a genuine timeout). The deadline is absolute
+ * (CLOCK_MONOTONIC): an EINTR from a concurrent SIGTERM/SIGINT -- this
+ * daemon's handlers run without SA_RESTART, see cmd_start() -- retries
+ * the reap but never extends the bound, so even a signal storm can't
+ * push the synchronous resolve path past its deadline. A timed-out
+ * child is still running, not a zombie yet; the caller must hand it to
+ * abandon_resolver_child() below rather than leaking it. */
+static int waitpid_timeout(pid_t pid, long timeout_ms)
+{
+    struct timespec start, now;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        pid_t r = waitpid(pid, NULL, WNOHANG);
+        long elapsed_ms;
+
+        if (r == pid)
+            return 0;
+        if (r < 0 && errno != EINTR)
+            return -1;
+        /* r == 0 (still running) or EINTR (interrupted by a signal
+         * handler without SA_RESTART): either way fall through to the
+         * deadline check, so neither path can outlive the bound. */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L +
+                     (now.tv_nsec - start.tv_nsec) / 1000000L;
+        if (elapsed_ms >= timeout_ms) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        usleep(20000);
+    }
+}
+
+/* Resolver children that outlived waitpid_timeout(): at ETIMEDOUT the
+ * child is still running, and this daemon stays its parent -- without a
+ * later waitpid() it would linger as a zombie once it finally exits, one
+ * per stalled resolve. Resolves only ever happen serially on the
+ * daemon's single thread, so a small tracked set reaped opportunistically
+ * (every resolve first sweeps for children that have since exited) is
+ * enough to keep that bounded without a SIGCHLD handler, which would
+ * race waitpid_timeout()'s own reaping. */
+#define AC_MAX_STALE_RESOLVERS 8
+static pid_t g_stale_resolvers[AC_MAX_STALE_RESOLVERS];
+
+static void reap_stale_resolvers(void)
+{
+    int i;
+
+    for (i = 0; i < AC_MAX_STALE_RESOLVERS; i++) {
+        if (g_stale_resolvers[i] > 0) {
+            pid_t r = waitpid(g_stale_resolvers[i], NULL, WNOHANG);
+
+            if (r == g_stale_resolvers[i] || (r < 0 && errno == ECHILD))
+                g_stale_resolvers[i] = 0;
+        }
+    }
+}
+
+static int stale_resolver_slot_free(void)
+{
+    int i;
+
+    for (i = 0; i < AC_MAX_STALE_RESOLVERS; i++)
+        if (g_stale_resolvers[i] == 0)
+            return 1;
+    return 0;
+}
+
+/* Hand off a still-running resolver child the bounded reap gave up on:
+ * track it for a later reap_stale_resolvers() sweep and log that it is
+ * still running (not yet a zombie), so the message doesn't mislead. */
+static void abandon_resolver_child(pid_t pid)
+{
+    int i;
+
+    reap_stale_resolvers();
+    for (i = 0; i < AC_MAX_STALE_RESOLVERS; i++) {
+        if (g_stale_resolvers[i] == 0) {
+            g_stale_resolvers[i] = pid;
+            fprintf(stderr, "ac_resolve_timeout: resolver child %d still "
+                    "running after SIGKILL; tracked for later reap, "
+                    "moving on\n", (int)pid);
+            return;
+        }
+    }
+    fprintf(stderr, "ac_resolve_timeout: resolver child %d still running "
+            "after SIGKILL and the stale-child table is full; it will "
+            "remain until process exit\n", (int)pid);
+}
+
 /* getaddrinfo() has no built-in timeout: against a slow or blackholed DNS
  * path it can block for the resolver's own timeout, which runs well past
  * AC_REPORT_TIMEOUT_SEC. ac_report() runs synchronously in the daemon's
@@ -3377,7 +3501,12 @@ static void ac_close_extra_fds(int keep_fd)
  * detections. Resolve in a short-lived child and bound how long we wait
  * for it with poll(), the same technique ac_connect_timeout() above uses
  * to bound connect(). Returns the number of addresses resolved (>=0), or
- * -1 on failure/timeout; the child is always reaped before returning. */
+ * -1 on failure/timeout; the child is reaped before returning, or at
+ * most a bounded reap-wait past it (see waitpid_timeout()) so a child
+ * wedged in D state can't stall the monitor loop indefinitely. A child
+ * the bounded reap gives up on is tracked via abandon_resolver_child()
+ * and reaped by a later call's sweep, so stalled resolves can't
+ * accumulate zombies either. */
 static int ac_resolve_timeout(const char *host, const char *port,
                                struct ac_resolved_addr *out, int max,
                                int timeout_sec)
@@ -3386,6 +3515,23 @@ static int ac_resolve_timeout(const char *host, const char *port,
     pid_t pid;
     int n = 0;
 
+    /* Sweep any abandoned resolver children that have exited since the
+     * last resolve before forking a new one. If every slot is still
+     * occupied afterwards, every tracked child is still alive: forking
+     * another child whose timeout could then hit the full-table branch
+     * would hand out an untracked PID that can exit as a zombie with
+     * nobody left to reap it. Refuse instead (EAGAIN) -- the caller
+     * already treats any resolve failure as a logged, dropped report,
+     * which bounds the damage to one lost report rather than an
+     * unbounded zombie leak. */
+    reap_stale_resolvers();
+    if (!stale_resolver_slot_free()) {
+        fprintf(stderr, "ac_resolve_timeout: %d resolver children still "
+                "tracked; refusing to fork another\n",
+                AC_MAX_STALE_RESOLVERS);
+        errno = EAGAIN;
+        return -1;
+    }
     if (pipe(pfd) < 0)
         return -1;
 
@@ -3477,7 +3623,13 @@ static int ac_resolve_timeout(const char *host, const char *port,
     }
     close(pfd[0]);
     kill(pid, SIGKILL);
-    waitpid(pid, NULL, 0);
+    /* Bounded: a child wedged in D state ignores SIGKILL, and an
+     * unbounded waitpid() here would stall the monitor loop behind a
+     * report-path resolve (#29). On timeout the child is still running,
+     * so track it for a later reap sweep instead of leaking a zombie
+     * per stalled resolve. */
+    if (waitpid_timeout(pid, 2000) < 0 && errno == ETIMEDOUT)
+        abandon_resolver_child(pid);
     return n;
 }
 

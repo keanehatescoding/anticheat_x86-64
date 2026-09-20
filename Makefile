@@ -214,6 +214,27 @@ test/ac_report_status_test: test/ac_report_status_test.c src/anticheat_daemon.c 
 test/ac_report_url_test: test/ac_report_url_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ test/ac_report_url_test.c src/sha256.c $(LDFLAGS)
 
+# daemon robustness unit test (#29): pulls anticheat_daemon.c in directly
+# and proves format_event_time() never crashes on an out-of-range kernel
+# timestamp (falls back to raw epoch seconds when localtime() returns
+# NULL) and waitpid_timeout() reaps an exited child at once while giving
+# up with ETIMEDOUT -- instead of hanging forever -- on an unreapable
+# (SIGSTOPped, standing in for D-state) child. Children given up on are
+# tracked and reaped by a later sweep (a full stale table refuses the
+# next fork with EAGAIN), and an LD_PRELOAD fault-injection rerun proves
+# the EINTR-retry branch executes instead of merely assuming a timer
+# signal landed in waitpid(). See test/daemon_robustness_test.c and
+# test/waitpid_eintr_fault.c.
+daemon-robustness-test: test/daemon_robustness_test test/libwaitpid_eintr_fault.so
+	./test/daemon_robustness_test
+	AC_WAITPID_FAULT_TEST=1 LD_PRELOAD=./test/libwaitpid_eintr_fault.so ./test/daemon_robustness_test
+
+test/daemon_robustness_test: test/daemon_robustness_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ test/daemon_robustness_test.c src/sha256.c -ldl $(LDFLAGS)
+
+test/libwaitpid_eintr_fault.so: test/waitpid_eintr_fault.c
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ test/waitpid_eintr_fault.c -ldl
+
 # pagination/cap smoke test (Phase 5.4): mock returns n_vmas=5000, n_mods=1100,
 # n_events=70 when AC_MOCK_PAGINATION=1; pagination_test proves begin/get/end
 # truncation and AC_GET_EVENTS_MAX_BLOCK_MS clamping.
@@ -231,12 +252,12 @@ test-mock: mock daemon
 # headers and is exercised separately in CI against a prepared kernel tree.)
 ci:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test
+	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test daemon-robustness-test
 	./test/mock_test.sh
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/process_vm_test test/pagination_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/process_vm_test test/pagination_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/daemon_robustness_test test/libwaitpid_eintr_fault.so
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat
 	install -D -m 0644 anticheat.ko /lib/modules/$(KVER)/extra/anticheat.ko
@@ -264,4 +285,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf $(DECK_PREFIX)
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test process-vm-test pagination-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test process-vm-test pagination-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test daemon-robustness-test ci clean install uninstall install-deck uninstall-deck
