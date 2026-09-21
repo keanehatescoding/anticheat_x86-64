@@ -74,6 +74,9 @@ jobs:
       - name: Server unix-socket mode/group unit test (no root, no network)
         run: python3 server/test_unix_socket_unit.py
 
+      - name: Store DB hygiene unit test (no root, no network)
+        run: python3 server/test_store_db_hygiene_unit.py
+
       # A rebase, auto-fix commit, or artifact re-download can silently
       # drop a script's mode from 100755 to 100644 (this happened to
       # scripts/kasan_boot_test.sh once, and only surfaced when the

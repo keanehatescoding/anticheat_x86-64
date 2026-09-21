@@ -1683,6 +1683,29 @@ else
     pass "server refuses to start with a low-entropy (repeated-character) report key"
 fi
 
+# DB-hygiene startup refusals (#30): a symlinked --db path would redirect
+# every report/ban read+write (and the 0600 chmod) through the link, and
+# an unknown future schema version is not something this server
+# understands -- both must refuse to start fail-closed.
+ln -sf "$TESTDIR/ac_server.db" "$TESTDIR/link.db"
+if AC_SERVER_REPORT_KEY="test-report-key-$$" AC_SERVER_ADMIN_KEY="test-admin-key-$$" \
+    python3 ./ac_server.py --port 18816 --db "$TESTDIR/link.db" \
+    >/dev/null 2>&1; then
+    fail "server should refuse to start with a symlinked --db path"
+else
+    pass "server refuses to start with a symlinked --db path"
+fi
+rm -f "$TESTDIR/link.db"
+
+python3 -c "import sqlite3; c=sqlite3.connect('$TESTDIR/future.db'); c.execute('PRAGMA user_version=99'); c.commit(); c.close()"
+if AC_SERVER_REPORT_KEY="test-report-key-$$" AC_SERVER_ADMIN_KEY="test-admin-key-$$" \
+    python3 ./ac_server.py --port 18817 --db "$TESTDIR/future.db" \
+    >/dev/null 2>&1; then
+    fail "server should refuse to start with an unknown --db schema version"
+else
+    pass "server refuses to start with an unknown --db schema version"
+fi
+
 # CLI-supplied keys leak to any local user via /proc/<pid>/cmdline; the
 # server should say so on stderr instead of silently accepting them.
 CLIWARN_TESTDIR="$(mktemp -d /tmp/ac_server_cliwarn_test.XXXXXXXX)"
