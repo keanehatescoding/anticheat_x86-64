@@ -756,14 +756,16 @@ class Store:
         conn = sqlite3.connect(self.db_path, timeout=5)
         # journal_mode is persistent per database file, so re-setting WAL
         # on every connection (#30) just retakes the writer lock for no
-        # effect. Query first and only upgrade when not already in WAL;
-        # this also leaves :memory:/read-only handles alone instead of
-        # forcing a mode change they may not support.
+        # effect. Query first and only upgrade when not already in WAL.
+        # :memory: handles are excluded outright: their mode reports
+        # "memory" and WAL is unsupported there, so upgrading would be a
+        # wasted no-op against a handle the mode check alone can't spare.
         try:
             mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         except Exception:
             mode = ""
-        if not isinstance(mode, str) or mode.lower() != "wal":
+        if (self.db_path != ":memory:"
+                and (not isinstance(mode, str) or mode.lower() != "wal")):
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
             except Exception:

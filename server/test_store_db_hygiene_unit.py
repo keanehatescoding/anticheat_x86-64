@@ -168,6 +168,40 @@ with tempfile.TemporaryDirectory() as tmp:
     check("already-WAL DB skips the redundant journal_mode=WAL set",
           wal_sets == [])
 
+    # 5b. :memory: handles never get the WAL upgrade pragma: their mode
+    # reports "memory", which the WAL check alone would treat as "not
+    # WAL" and try to upgrade. (Construction only -- a :memory: Store
+    # can't serve later requests anyway since every connection gets its
+    # own private database.)
+    mem_calls = []
+
+    class _MemRecConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *a, **k):
+            mem_calls.append(sql)
+            return self._conn.execute(sql, *a, **k)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    class _MemRecMod:
+        def connect(self, *a, **k):
+            return _MemRecConn(real_sqlite_mod.connect(*a, **k))
+
+        def __getattr__(self, name):
+            return getattr(real_sqlite_mod, name)
+
+    ac_server.sqlite3 = _MemRecMod()
+    try:
+        ac_server.Store(":memory:")
+    finally:
+        ac_server.sqlite3 = real_sqlite_mod
+    mem_wal_sets = [c for c in mem_calls
+                    if str(c).strip().lower() == "pragma journal_mode=wal"]
+    check(":memory: issues no journal_mode=WAL pragma", mem_wal_sets == [])
+
     # 6. _ensure_private never follows symlinks: a planted
     # <db>-wal symlink must be left alone (no chmod on the target).
     # (A planted -wal link also makes SQLite itself refuse the next
