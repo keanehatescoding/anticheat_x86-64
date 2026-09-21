@@ -681,6 +681,27 @@ class Store:
         # would otherwise reuse as-is.
         with self._write_lock:
             self._ensure_private()
+            # Validate the schema version BEFORE running any DDL: a DB
+            # stamped with an unknown future version must be refused
+            # without creating tables in it first. The probe is a bare
+            # connection, not _connect() -- whose WAL upgrade would
+            # itself persist a change to the refused file.
+            probe = sqlite3.connect(self.db_path, timeout=5)
+            try:
+                try:
+                    cur_ver = probe.execute("PRAGMA user_version").fetchone()[0]
+                except Exception:
+                    cur_ver = 0
+            finally:
+                probe.close()
+            if not isinstance(cur_ver, int):
+                cur_ver = 0
+            if cur_ver != 0 and cur_ver != self.SCHEMA_VERSION:
+                raise RuntimeError(
+                    "ac_server: --db schema version %d unsupported "
+                    "(this server understands version %d) -- refusing to "
+                    "open it" % (cur_ver, self.SCHEMA_VERSION)
+                )
             conn = self._connect()
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS reports (
@@ -703,21 +724,8 @@ class Store:
                        banned_at INTEGER NOT NULL
                    )"""
             )
-            try:
-                cur_ver = conn.execute("PRAGMA user_version").fetchone()[0]
-            except Exception:
-                cur_ver = 0
-            if not isinstance(cur_ver, int):
-                cur_ver = 0
             if cur_ver == 0:
                 conn.execute("PRAGMA user_version=%d" % (self.SCHEMA_VERSION,))
-            elif cur_ver != self.SCHEMA_VERSION:
-                conn.close()
-                raise RuntimeError(
-                    "ac_server: --db schema version %d unsupported "
-                    "(this server understands version %d) -- refusing to "
-                    "open it" % (cur_ver, self.SCHEMA_VERSION)
-                )
             conn.commit()
             conn.close()
             # Fresh files (or -wal/-shm siblings checkpoint-created above) may

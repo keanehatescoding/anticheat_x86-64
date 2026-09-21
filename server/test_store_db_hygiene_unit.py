@@ -53,6 +53,18 @@ def journal_mode(db_path):
         conn.close()
 
 
+def _table_names(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return sorted(
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        )
+    finally:
+        conn.close()
+
+
 print("=== Store unit test: DB hygiene (#30) ===")
 print()
 
@@ -122,19 +134,29 @@ with tempfile.TemporaryDirectory() as tmp:
     check("upgrade preserves existing rows",
           len(legacy_store.list_reports("legacy-client")) == 1)
 
-    # 4. Unknown future schema refused instead of written into.
+    # 4. Unknown future schema refused INSTEAD of written into: the
+    # fixture is a bare version-99 file (no tables, delete mode), and
+    # the refused open must leave it exactly that way -- no DDL, no
+    # version stamp change, no WAL upgrade.
     future = str(tmp / "future.db")
-    ac_server.Store(future)
-    conn = sqlite3.connect(future)
-    conn.execute("PRAGMA user_version=99")
-    conn.commit()
-    conn.close()
+    fconn = sqlite3.connect(future)
+    fconn.execute("PRAGMA user_version=99")
+    fconn.commit()
+    fconn.close()
+    check("future fixture starts at user_version 99 with no tables",
+          user_version(future) == 99
+          and _table_names(future) == []
+          and str(journal_mode(future)).lower() != "wal")
     try:
         ac_server.Store(future)
         refused_future = False
     except RuntimeError:
         refused_future = True
     check("unknown future schema version refused", refused_future)
+    check("refused DB gained no tables", _table_names(future) == [])
+    check("refused DB version untouched", user_version(future) == 99)
+    check("refused DB journal mode untouched (no WAL upgrade)",
+          str(journal_mode(future)).lower() != "wal")
 
     # 5. Second open on an already-WAL DB does not re-issue the WAL
     # pragma (the #30 "re-set on every connection" waste).
