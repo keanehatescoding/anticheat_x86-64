@@ -590,9 +590,37 @@ class Store:
     be correct under ThreadingHTTPServer without sharing a connection
     across threads."""
 
+    # SQLite schema version, tracked via PRAGMA user_version (#30: the
+    # server previously had no schema-migration/versioning story at all).
+    # Fresh DBs are stamped with this; pre-existing version-0 DBs (every
+    # DB created before this existed) are stamped on open since their
+    # tables already match version 1. Anything else is a newer/unknown
+    # schema this code doesn't understand -- fail closed rather than
+    # writing into it.
+    SCHEMA_VERSION = 1
+
     def __init__(self, db_path, max_reports_per_client=1000,
                  max_total_reports=100000, vacuum_interval=1000):
         self.db_path = db_path
+        # Fail closed on a symlinked DB path (#30): sqlite3.connect()
+        # follows symlinks, so a pre-planted link would redirect every
+        # report/ban read and write (and the _ensure_private chmod below)
+        # at an attacker-chosen target. Only the final component is
+        # checked -- a symlinked parent dir (e.g. /tmp -> /private/tmp)
+        # is a normal configuration, not an attack. The check races a
+        # concurrent swap between lstat and connect when the DB dir is
+        # writable by someone else; the deployment expectation (same as
+        # the --unix-socket dir rule) is an operator-owned dir.
+        try:
+            st = os.lstat(db_path)
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(st.st_mode):
+                raise RuntimeError(
+                    "ac_server: --db path %r is a symlink -- refusing to "
+                    "open it (point --db at the real file)" % (db_path,)
+                )
         # Bounds how many rows a single client_id can hold in `reports`,
         # trimmed on every insert (see add_report). Without this, a single
         # spammy or misbehaving daemon has no limit on how much it can grow
@@ -653,6 +681,27 @@ class Store:
         # would otherwise reuse as-is.
         with self._write_lock:
             self._ensure_private()
+            # Validate the schema version BEFORE running any DDL: a DB
+            # stamped with an unknown future version must be refused
+            # without creating tables in it first. The probe is a bare
+            # connection, not _connect() -- whose WAL upgrade would
+            # itself persist a change to the refused file.
+            probe = sqlite3.connect(self.db_path, timeout=5)
+            try:
+                try:
+                    cur_ver = probe.execute("PRAGMA user_version").fetchone()[0]
+                except Exception:
+                    cur_ver = 0
+            finally:
+                probe.close()
+            if not isinstance(cur_ver, int):
+                cur_ver = 0
+            if cur_ver != 0 and cur_ver != self.SCHEMA_VERSION:
+                raise RuntimeError(
+                    "ac_server: --db schema version %d unsupported "
+                    "(this server understands version %d) -- refusing to "
+                    "open it" % (cur_ver, self.SCHEMA_VERSION)
+                )
             conn = self._connect()
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS reports (
@@ -675,6 +724,8 @@ class Store:
                        banned_at INTEGER NOT NULL
                    )"""
             )
+            if cur_ver == 0:
+                conn.execute("PRAGMA user_version=%d" % (self.SCHEMA_VERSION,))
             conn.commit()
             conn.close()
             # Fresh files (or -wal/-shm siblings checkpoint-created above) may
@@ -693,18 +744,40 @@ class Store:
         __init__ when Store is used as a library without main()'s umask).
         A vanishing file between the exists check and the chmod (another
         thread's connection checkpointing the WAL away) just means there
-        is nothing left to lock down."""
+        is nothing left to lock down. A symlink is skipped rather than
+        followed: Store.__init__ already refuses a symlinked DB path, so
+        one appearing later is suspicious and chmod would otherwise act
+        on the link target."""
         for suffix in ("", "-wal", "-shm"):
             path = self.db_path + suffix
-            if os.path.exists(path):
-                try:
-                    os.chmod(path, 0o600)
-                except FileNotFoundError:
-                    pass
+            try:
+                if stat.S_ISLNK(os.lstat(path).st_mode):
+                    continue
+            except FileNotFoundError:
+                continue
+            try:
+                os.chmod(path, 0o600)
+            except FileNotFoundError:
+                pass
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=5)
-        conn.execute("PRAGMA journal_mode=WAL")
+        # journal_mode is persistent per database file, so re-setting WAL
+        # on every connection (#30) just retakes the writer lock for no
+        # effect. Query first and only upgrade when not already in WAL.
+        # :memory: handles are excluded outright: their mode reports
+        # "memory" and WAL is unsupported there, so upgrading would be a
+        # wasted no-op against a handle the mode check alone can't spare.
+        try:
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        except Exception:
+            mode = ""
+        if (self.db_path != ":memory:"
+                and (not isinstance(mode, str) or mode.lower() != "wal")):
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except Exception:
+                pass
         # Explicit busy_timeout as defense-in-depth: timeout=5 above is the
         # Python-level busy handler, but setting the SQLite-level pragma
         # ensures the same 5s bound even if the connection is used via raw
@@ -1789,9 +1862,17 @@ def main():
         webhook_timeout=args.report_webhook_timeout,
         notify_queue_size=args.notify_queue_size,
     )
-    store = Store(args.db, max_reports_per_client=args.max_reports_per_client,
-                  max_total_reports=args.max_total_reports,
-                  vacuum_interval=args.vacuum_interval)
+    try:
+        store = Store(args.db, max_reports_per_client=args.max_reports_per_client,
+                      max_total_reports=args.max_total_reports,
+                      vacuum_interval=args.vacuum_interval)
+    except RuntimeError as e:
+        # Store refuses symlinked DB paths and unknown schema versions
+        # fail-closed (see Store.__init__): surface that as a clean
+        # startup refusal like the other --db/flag validations above,
+        # not an uncaught traceback.
+        sys.stderr.write("%s -- refusing to start\n" % (e,))
+        sys.exit(1)
     rate_limiter = RateLimiter(args.rate_limit, args.rate_window)
     handler = make_handler(
         store, report_keys, admin_keys, rate_limiter, args.trust_proxy,
