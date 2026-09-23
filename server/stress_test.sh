@@ -195,35 +195,92 @@ TOTAL_OK=0
 TOTAL_TIMEOUTS=0
 TOTAL_ERRORS=0
 DB_MISMATCH=0
+# Page size for the API durability walk below: one DEFAULT_LIST_LIMIT page
+# at a time (see Store.DEFAULT_LIST_LIMIT in ac_server.py), so any worker
+# that stored more than a page forces the walk past offset=0 and actually
+# exercises multi-page pagination rather than a single full-store fetch.
+API_PAGE=200
 for i in $(seq 1 "$CONCURRENCY"); do
     read -r CID OK TIMEOUTS ERRORS < "$TESTDIR/worker-$i.result"
     TOTAL_OK=$((TOTAL_OK + OK))
     TOTAL_TIMEOUTS=$((TOTAL_TIMEOUTS + TIMEOUTS))
     TOTAL_ERRORS=$((TOTAL_ERRORS + ERRORS))
-    # Queried directly against the DB file, not the /reports API -- that
-    # endpoint caps at 200 rows (see list_reports()'s default limit),
-    # which a sustained run can easily exceed; a direct COUNT(*) has no
-    # such cap and is the actual ground truth being checked here.
+    # COUNT(*) against the DB file is the ground truth for what is
+    # actually stored -- but on its own it bypasses the API contract an
+    # operator reviews reports through (#30). The paginated walk below
+    # proves the same rows are reachable via ?limit=&offset=? (#27); both
+    # halves have to agree before this check passes.
     DB_COUNT=$(python3 -c "
 import sqlite3
 con = sqlite3.connect('$DB')
 print(con.execute('SELECT COUNT(*) FROM reports WHERE client_id = ?', ('$CID',)).fetchone()[0])
 ")
-    # The real durability question is "did the DB lose anything the
-    # client saw succeed" (DB_COUNT < OK) -- NOT exact equality. A
-    # client-side timeout (curl gave up, counted above, not in $OK) for a
-    # request the server actually completed makes DB_COUNT > OK
-    # perfectly legitimately; treating that as a failure was itself a
-    # bug in this check, not a sign of one in the server (verified
-    # directly: every DB_COUNT > OK case traced back to a 000 in that
-    # worker's timeout count, and the server log showed a clean 201 for
-    # it, not an error).
-    if [ "$DB_COUNT" -lt "$OK" ]; then
-        fail "worker $i: sent $OK successful reports but DB only has $DB_COUNT rows for $CID"
+    API_COUNT="$(python3 - "$BASE" "$CID" "$ADMIN_KEY" "$API_PAGE" <<'EOF'
+import json
+import sys
+import urllib.request
+base, cid, key, page = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+total = 0
+offset = 0
+# Stored rows here are bounded by the per-client retention cap (1000 by
+# default, 5 pages at this page size), so this loop is short -- the guard
+# is only against looping forever if the server ever misbehaves.
+for _ in range(1000):
+    url = "%s/reports/%s?limit=%d&offset=%d" % (base, cid, page, offset)
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + key})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            rows = json.load(r).get("reports", [])
+    except Exception as e:  # noqa: BLE001 -- any fetch failure fails the check below
+        sys.stderr.write("page fetch failed at offset %d: %r\n" % (offset, e))
+        sys.exit(2)
+    total += len(rows)
+    if len(rows) < page:
+        break
+    offset += len(rows)
+else:
+    sys.stderr.write("pagination walk did not terminate\n")
+    sys.exit(3)
+print(total)
+EOF
+)"
+    API_RC=$?
+    if [ "$API_RC" -ne 0 ]; then
+        fail "worker $i: paginated /reports walk failed for $CID (rc=$API_RC)"
+        DB_MISMATCH=1
+        continue
+    fi
+    if [ "$API_COUNT" != "$DB_COUNT" ]; then
+        fail "worker $i: paginated API lists $API_COUNT reports for $CID but DB stores $DB_COUNT -- listing diverged from ground truth"
+        DB_MISMATCH=1
+    fi
+    # Retention-aware durability floor: the server trims each client to
+    # --max-reports-per-client (this run uses the default, 1000, newest
+    # win -- see Store.__init__ in ac_server.py), so a worker that 201'd
+    # more than that legitimately stores only the newest 1000. (The global
+    # --max-total-reports default of 100000 needs ~100 full clients to
+    # bite; with one client per worker it can't trim here, so the
+    # per-client cap is the only trimming this floor accounts for.)
+    if [ "$OK" -gt 1000 ]; then
+        FLOOR=1000
+    else
+        FLOOR="$OK"
+    fi
+    # Beyond that trimming, the real durability question is "did the DB
+    # lose anything the client saw succeed" (DB_COUNT < FLOOR) -- NOT
+    # exact equality. A client-side timeout (curl gave up, counted above,
+    # not in $OK) for a request the server actually completed makes
+    # DB_COUNT > OK perfectly legitimately; treating that as a failure
+    # was itself a bug in this check, not a sign of one in the server
+    # (verified directly: every DB_COUNT > OK case traced back to a 000
+    # in that worker's timeout count, and the server log showed a clean
+    # 201 for it, not an error).
+    if [ "$DB_COUNT" -lt "$FLOOR" ]; then
+        fail "worker $i: sent $OK successful reports but DB only has $DB_COUNT rows for $CID (floor $FLOOR)"
         DB_MISMATCH=1
     fi
 done
-[ "$DB_MISMATCH" -eq 0 ] && pass "no worker's successful reports went missing from the DB"
+[ "$DB_MISMATCH" -eq 0 ] && pass "no worker's successful reports went missing from the DB, and the paginated API listed every stored row"
 
 pass "sustained load: $TOTAL_OK total successful reports across $CONCURRENCY workers in ${DURATION}s"
 if [ "$TOTAL_TIMEOUTS" -gt 0 ]; then
