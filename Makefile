@@ -165,6 +165,17 @@ thread-spawn-after-protect-test: test/thread_spawn_after_protect_test
 test/thread_spawn_after_protect_test: test/thread_spawn_after_protect_test.c src/anticheat.h
 	$(CC) $(CFLAGS) -pthread -o $@ $< $(LDFLAGS)
 
+# clone-vm-exec live test helper: a clone(CLONE_VM|SIGCHLD) child (no
+# CLONE_VFORK, no CLONE_THREAD) shares the parent's live mm with
+# vfork_done == NULL, then execs -- exercises ac_exec_entry()'s
+# borrowed-mm detection (#83: the old vfork_done test sent this down the
+# old_mm path and unregistered the still-running protected parent).
+# Needs root and the module loaded -- see test.sh.
+clone-vm-exec-test: test/clone_vm_exec_test
+
+test/clone_vm_exec_test: test/clone_vm_exec_test.c src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 # process_vm denial test: proves process_vm_readv/writev against a
 # protected victim are rewritten to -ESRCH and emit AC_EV_PROCESS_VM,
 # and with ac_policy 0x1 / AC_MOCK_ATTACK=1 the attacker is SIGKILLed.
@@ -257,7 +268,7 @@ ci:
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/process_vm_test test/pagination_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/daemon_robustness_test test/libwaitpid_eintr_fault.so
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/clone_vm_exec_test test/process_vm_test test/pagination_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/daemon_robustness_test test/libwaitpid_eintr_fault.so
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat
 	install -D -m 0644 anticheat.ko /lib/modules/$(KVER)/extra/anticheat.ko
@@ -285,4 +296,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf $(DECK_PREFIX)
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test process-vm-test pagination-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test daemon-robustness-test ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test clone-vm-exec-test process-vm-test pagination-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test daemon-robustness-test ci clean install uninstall install-deck uninstall-deck

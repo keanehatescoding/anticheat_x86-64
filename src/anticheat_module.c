@@ -2397,23 +2397,38 @@ static struct kretprobe ac_kp_clone = {
  * rekey/remove the PARENT's own live registry entry once this exec
  * succeeds, permanently dropping the parent's protection and logging a
  * false "protected process exited" for a process that's still running.
- * current->vfork_done is non-NULL for exactly the duration of that
- * borrowed-mm window (set at clone time, cleared by mm_release()), so
- * detecting it here and never touching old_mm/d->old_mm is what keeps the
- * parent's entry untouched -- ac_clone_ret() already decided at clone time
- * that this shared period needs no registry work of its own, and that
- * decision must hold until current gets its own independent mm.
+ *
+ * That borrowed-mm state must be detected from the mm itself, not from
+ * current->vfork_done (#83): clone(CLONE_VM | SIGCHLD) with neither
+ * CLONE_VFORK nor CLONE_THREAD shares the parent's *live* mm with
+ * vfork_done == NULL, so the old vfork_done test sent it down the
+ * old_mm path and unregistered the still-running parent on exec;
+ * conversely clone(CLONE_VFORK) *without* CLONE_VM sets vfork_done on a
+ * child that owns its own (fork-race-tracked) mm, so the old test
+ * returned before the fork-race claim below and the stale pre-exec mm
+ * was what got registered while the new image stayed unprotected.
+ * Comparing current->mm against current->real_parent->mm under RCU
+ * takes the inherit branch exactly when current really borrows the
+ * parent's mm, in both cases.
+ *
+ * parent->mm itself is read without the parent's task_lock: an aligned
+ * pointer load is single-copy, and either side of a concurrent parent
+ * exec is safe. Seeing the parent's old mm (== current->mm) takes the
+ * inherit branch while the parent's own exec rekeys it -- both images
+ * end up registered. Seeing the parent's new mm falls through to the
+ * old_mm path, where ac_del_prot_mm() on an already-rekeyed entry is a
+ * no-op and the surviving entry still covers the right image.
  *
  * That still leaves the vfork child itself needing to inherit protection
  * across its own exec, the same as a plain fork()+exec() child already
  * does -- current->real_parent is exactly who that inheritance decision
  * should be attributed to, and it's safe to read without extra locking
- * here specifically because current->vfork_done being set guarantees the
- * parent is synchronously blocked waiting on this exec/exit, so it can't
- * be concurrently reaped or reparented out from under us. The entry
- * itself is queued the same way ac_clone_ret() queues a fork-inherit
- * add -- a fresh registration for the new mm, not a rekey -- since there
- * was never an old_mm entry belonging to current to remove. */
+ * here specifically because a true vfork parent is synchronously blocked
+ * waiting on this exec/exit, so it can't be concurrently reaped or
+ * reparented out from under us. The entry itself is queued the same way
+ * ac_clone_ret() queues a fork-inherit add -- a fresh registration for
+ * the new mm, not a rekey -- since there was never an old_mm entry
+ * belonging to current to remove. */
 struct ac_exec_entry_data {
     struct mm_struct *old_mm;
     bool vfork_inherit;
@@ -2441,23 +2456,38 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
     d->fork_race_inherit = false;
     d->pending_req = NULL;
     d->pending_id = 0;
-    if (current->vfork_done) {
-        if (current->mm && ac_is_protected_mm(current->mm)) {
-            struct task_struct *parent;
+    /* Borrowed-mm inherit (#83): take the inherit branch exactly when
+     * current->mm really is the parent's live mm (vfork() or a plain
+     * clone(CLONE_VM) without CLONE_VFORK/CLONE_THREAD alike). A stale
+     * vfork_done on a child that owns its own mm (clone(CLONE_VFORK)
+     * without CLONE_VM) deliberately falls through to the old_mm /
+     * fork-race paths below as an ordinary exec. */
+    {
+        struct task_struct *parent;
+        bool borrowed = false;
 
+        rcu_read_lock();
+        parent = rcu_dereference(current->real_parent);
+        if (parent && current->mm && parent->mm == current->mm)
+            borrowed = true;
+        if (borrowed && ac_is_protected_mm(current->mm)) {
             d->vfork_inherit = true;
             d->jit_allowed = ac_prot_jit_allowed_mm(current->mm);
 
-            rcu_read_lock();
-            parent = rcu_dereference(current->real_parent);
             d->parent_pid = parent->pid;
             /* RCU holds the task_struct alive here; the accessor still
              * applies (#19) since comm itself can be renamed
              * concurrently. */
             get_task_comm(d->parent_comm, parent);
-            rcu_read_unlock();
         }
-        return 0;
+        rcu_read_unlock();
+        /* Borrowed either way: never pin the parent's live mm as
+         * old_mm (see the comment above). When it is protected the
+         * ret probe registers the new image fresh via vfork_inherit;
+         * when it isn't there is nothing of current's to rekey or
+         * claim -- ac_clone_ret() queued no request for a shared mm. */
+        if (borrowed)
+            return 0;
     }
     if (current->mm && ac_is_protected_mm(current->mm)) {
         d->old_mm = current->mm;
@@ -2976,8 +3006,8 @@ static unsigned long long ac_module_size(const struct module *mod)
  * every kernel address, poisoning both the hidden-module check and the
  * syscall plausibility filter.
  *
- * The is_vmalloc_addr() check guards against a subtler problem than a
- * torn entry: both walk sites below do
+ * The MODULES_VADDR..MODULES_END range check guards against a subtler
+ * problem than a torn entry: both walk sites below do
  * list_for_each_entry_rcu(m, &THIS_MODULE->list, list), which only stops
  * once it circles back to THIS_MODULE's own list node -- not the
  * kernel's real (unexported) `modules` list_head sentinel. A full walk
@@ -2988,13 +3018,20 @@ static unsigned long long ac_module_size(const struct module *mod)
  * that computed offset -- a real, reproduced KASAN global-out-of-bounds
  * (confirmed: lands inside a kernel workqueue global on one tested
  * layout). A genuine struct module always lives inside that module's
- * own vmalloc'd core memory; the sentinel-derived pointer instead lands
- * in the kernel's statically-linked image, so is_vmalloc_addr() tells
- * the two apart without ever needing the sentinel's own (unexported)
- * address. */
+ * own core memory, which on x86-64 is allocated from
+ * MODULES_VADDR..MODULES_END (arch/x86/include/asm/pgtable_64_types.h),
+ * NOT the VMALLOC_START..VMALLOC_END range is_vmalloc_addr() tests --
+ * that is exactly what is_vmalloc_or_module_addr() exists for. The
+ * sentinel-derived pointer instead lands in the kernel's
+ * statically-linked image, so the module-range test tells the two apart
+ * without ever needing the sentinel's own (unexported) address.
+ *
+ * (#82: the previous is_vmalloc_addr() test rejected every real module
+ * on x86-64, so ac_build_mod_snapshot() walked zero entries and the
+ * hidden-module cross-check was silently dead.) */
 static bool ac_module_sane(const struct module *m)
 {
-    if (!is_vmalloc_addr(m))
+    if (!is_vmalloc_or_module_addr(m))
         return false;
     if (m->state != MODULE_STATE_LIVE)
         return false;
