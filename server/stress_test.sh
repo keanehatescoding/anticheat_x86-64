@@ -210,12 +210,32 @@ for i in $(seq 1 "$CONCURRENCY"); do
     # operator reviews reports through (#30). The paginated walk below
     # proves the same rows are reachable via ?limit=&offset=? (#27); both
     # halves have to agree before this check passes.
-    DB_COUNT=$(python3 -c "
+    #
+    # That agreement is reached by convergence, never by a single
+    # immediate compare: wait $WORKER_PIDS above only reaps the
+    # client-side curl loops, while the server keeps running. A request
+    # curl gave up on (client-side 000, counted in TIMEOUTS rather than
+    # OK) can still be sitting in the server's write queue and commit
+    # after this check starts. A commit landing between the COUNT(*) read
+    # and the walk -- or mid-walk, shifting ORDER BY id DESC offsets so a
+    # row is skipped or double-counted across a page boundary -- would
+    # fail an exact one-shot match even though the server behaved
+    # correctly. So each walk is retried until its total equals a fresh
+    # COUNT(*): every worker is reaped, so only already-received requests
+    # can still commit -- a finite tail, meaning the readings must
+    # converge. Disagreement that survives the retries is a real listing
+    # bug, and fails.
+    STABLE=0
+    DB_COUNT=0
+    API_COUNT=""
+    API_RC=0
+    for _ in $(seq 1 6); do
+        DB_COUNT=$(python3 -c "
 import sqlite3
 con = sqlite3.connect('$DB')
 print(con.execute('SELECT COUNT(*) FROM reports WHERE client_id = ?', ('$CID',)).fetchone()[0])
 ")
-    API_COUNT="$(python3 - "$BASE" "$CID" "$ADMIN_KEY" "$API_PAGE" <<'EOF'
+        API_COUNT="$(python3 - "$BASE" "$CID" "$ADMIN_KEY" "$API_PAGE" <<'EOF'
 import json
 import sys
 import urllib.request
@@ -244,15 +264,21 @@ else:
 print(total)
 EOF
 )"
-    API_RC=$?
-    if [ "$API_RC" -ne 0 ]; then
-        fail "worker $i: paginated /reports walk failed for $CID (rc=$API_RC)"
+        API_RC=$?
+        if [ "$API_RC" -eq 0 ] && [ "$API_COUNT" = "$DB_COUNT" ]; then
+            STABLE=1
+            break
+        fi
+        sleep 2
+    done
+    if [ "$STABLE" -ne 1 ]; then
+        if [ "$API_RC" -ne 0 ]; then
+            fail "worker $i: paginated /reports walk failed for $CID (rc=$API_RC, 6 attempts)"
+        else
+            fail "worker $i: paginated API lists $API_COUNT reports for $CID but DB stores $DB_COUNT after 6 walks -- listing diverged from ground truth"
+        fi
         DB_MISMATCH=1
         continue
-    fi
-    if [ "$API_COUNT" != "$DB_COUNT" ]; then
-        fail "worker $i: paginated API lists $API_COUNT reports for $CID but DB stores $DB_COUNT -- listing diverged from ground truth"
-        DB_MISMATCH=1
     fi
     # Retention-aware durability floor: the server trims each client to
     # --max-reports-per-client (this run uses the default, 1000, newest
