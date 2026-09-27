@@ -10,6 +10,7 @@ REPORT_SERVER_PID=""
 MIGTEST_PID=""
 SPAWNTEST_PID=""
 CLONEVMTEST_PID=""
+CLONEVM_CHILD=""
 CHILD_PIDFILE=""
 FAILED=0
 
@@ -26,6 +27,10 @@ cleanup() {
     [ -n "$MIGTEST_PID" ] && kill -9 "$MIGTEST_PID" 2>/dev/null
     [ -n "$SPAWNTEST_PID" ] && kill -9 "$SPAWNTEST_PID" 2>/dev/null
     [ -n "$CLONEVMTEST_PID" ] && kill -9 "$CLONEVMTEST_PID" 2>/dev/null
+    if [ -n "$CLONEVM_CHILD" ]; then
+        ./anticheat unprotect --pid "$CLONEVM_CHILD" >/dev/null 2>&1
+        kill -9 "$CLONEVM_CHILD" 2>/dev/null
+    fi
     [ -n "$CHILD_PIDFILE" ] && rm -f "$CHILD_PIDFILE"
     sleep 0.2
     rmmod anticheat 2>/dev/null
@@ -164,75 +169,86 @@ wait "$SPAWNTEST_PID" 2>/dev/null
 SPAWNTEST_PID=""
 
 say "exec from a CLONE_VM child keeps the still-running parent protected (#83)"
-coproc CLONEVMTEST { exec ./test/clone_vm_exec_test; }
-# -t bounds every read below: if the helper hangs instead of writing the
-# expected protocol line, a plain read would block test.sh forever instead
-# of reaching the failure checks and cleanup path further down.
-read -r -t 5 _ CLONEVM_PARENT <&"${CLONEVMTEST[0]}" || CLONEVM_PARENT=""
-if [ -n "$CLONEVM_PARENT" ]; then
-    if ./anticheat protect --pid "$CLONEVM_PARENT" >/dev/null; then
-        ok "protected clone_vm parent pid $CLONEVM_PARENT (child clones+execs after this)"
-    else
-        bad "protect clone_vm parent pid $CLONEVM_PARENT"
-    fi
+# plain: CLONE_VM only; parent: + CLONE_PARENT (child's real_parent is not
+# the task it shares the mm with); vfork: + CLONE_VFORK.
+for CLONEVM_MODE in plain parent vfork; do
+    coproc CLONEVMTEST { exec ./test/clone_vm_exec_test "$CLONEVM_MODE"; }
+    # -t bounds every read below: if the helper hangs instead of writing the
+    # expected protocol line, a plain read would block test.sh forever instead
+    # of reaching the failure checks and cleanup path further down.
+    read -r -t 5 _ CLONEVM_PARENT <&"${CLONEVMTEST[0]}" || CLONEVM_PARENT=""
+    if [ -n "$CLONEVM_PARENT" ]; then
+        if ./anticheat protect --pid "$CLONEVM_PARENT" >/dev/null; then
+            ok "[$CLONEVM_MODE] protected clone_vm parent pid $CLONEVM_PARENT (child clones+execs after this)"
+        else
+            bad "[$CLONEVM_MODE] protect clone_vm parent pid $CLONEVM_PARENT"
+        fi
 
-    # unblock the parent now that protection is in place; it clones a
-    # CLONE_VM (no CLONE_VFORK, no CLONE_THREAD) child -- sharing its own
-    # live mm with vfork_done == NULL, the exact case the old
-    # vfork_done test misclassified -- and the child immediately execs.
-    echo go >&"${CLONEVMTEST[1]}"
+        # unblock the parent now that protection is in place; it clones a
+        # CLONE_VM child (flavour per $CLONEVM_MODE, never CLONE_THREAD)
+        # sharing its own live mm, and the child immediately execs.
+        echo go >&"${CLONEVMTEST[1]}"
 
-    # Two lines follow, in either order: CHILD_PID (printed by the parent
-    # strictly after clone() returns) and EXEC_CHILD (printed by the
-    # exec'd image itself, proving the exec completed; same pid).
-    CLONEVM_CHILD=""
-    EXEC_SEEN=0
-    for _ in 1 2; do
-        read -r -t 10 tag val <&"${CLONEVMTEST[0]}" || break
-        case "$tag" in
-            CHILD_PID) CLONEVM_CHILD="$val" ;;
-            EXEC_CHILD) EXEC_SEEN=1; CLONEVM_CHILD="$val" ;;
-        esac
-    done
-
-    if [ "$EXEC_SEEN" -ne 1 ] || [ -z "$CLONEVM_CHILD" ]; then
-        bad "clone_vm_exec_test child never reported EXEC_CHILD; exec may not have happened"
-    else
-        # Registration rides an async workqueue: poll for the child's new
-        # image, then the parent must still be listed -- and still be
-        # listed after the dust settles, since the #83 unregister landed
-        # asynchronously from that same workqueue.
-        CHILD_LISTED=0
-        for _ in $(seq 1 20); do
-            if ./anticheat list | grep -qw -- "$CLONEVM_CHILD"; then
-                CHILD_LISTED=1
-                break
-            fi
-            sleep 0.5
+        # Two lines follow, in either order: CHILD_PID (printed by the parent
+        # strictly after clone() returns) and EXEC_CHILD (printed by the
+        # exec'd image itself, proving the exec completed; same pid).
+        CLONEVM_CHILD=""
+        EXEC_SEEN=0
+        for _ in 1 2; do
+            read -r -t 10 tag val <&"${CLONEVMTEST[0]}" || break
+            case "$tag" in
+                CHILD_PID) CLONEVM_CHILD="$val" ;;
+                EXEC_CHILD) EXEC_SEEN=1; CLONEVM_CHILD="$val" ;;
+            esac
         done
-        if [ "$CHILD_LISTED" -ne 1 ]; then
-            bad "exec'd CLONE_VM child $CLONEVM_CHILD never inherited protection"
-        else
-            ok "exec'd CLONE_VM child $CLONEVM_CHILD inherited protection"
-        fi
-        sleep 2
-        LISTED=$(./anticheat list)
-        if printf '%s' "$LISTED" | grep -qw -- "$CLONEVM_PARENT"; then
-            ok "parent pid $CLONEVM_PARENT stayed protected across the CLONE_VM child exec"
-        else
-            bad "parent pid $CLONEVM_PARENT lost protection when its CLONE_VM child exec'd (list: $LISTED)"
-        fi
-        ./anticheat unprotect --pid "$CLONEVM_CHILD" >/dev/null 2>&1
-        kill -9 "$CLONEVM_CHILD" 2>/dev/null
-    fi
 
-    ./anticheat unprotect --pid "$CLONEVM_PARENT" >/dev/null 2>&1
-else
-    bad "clone_vm_exec_test did not report PARENT_PID"
-fi
-kill -9 "$CLONEVMTEST_PID" 2>/dev/null
-wait "$CLONEVMTEST_PID" 2>/dev/null
-CLONEVMTEST_PID=""
+        if [ "$EXEC_SEEN" -ne 1 ] || [ -z "$CLONEVM_CHILD" ]; then
+            bad "[$CLONEVM_MODE] clone_vm_exec_test child never reported EXEC_CHILD; exec may not have happened"
+            # The coproc kill below reaches only the parent; a child that
+            # reported CHILD_PID but never exec'd would outlive it.
+            if [ -n "$CLONEVM_CHILD" ]; then
+                ./anticheat unprotect --pid "$CLONEVM_CHILD" >/dev/null 2>&1
+                kill -9 "$CLONEVM_CHILD" 2>/dev/null
+                CLONEVM_CHILD=""
+            fi
+        else
+            # Registration rides an async workqueue: poll for the child's new
+            # image, then the parent must still be listed -- and still be
+            # listed after the dust settles, since the #83 unregister landed
+            # asynchronously from that same workqueue.
+            CHILD_LISTED=0
+            for _ in $(seq 1 20); do
+                if ./anticheat list | grep -qw -- "$CLONEVM_CHILD"; then
+                    CHILD_LISTED=1
+                    break
+                fi
+                sleep 0.5
+            done
+            if [ "$CHILD_LISTED" -ne 1 ]; then
+                bad "[$CLONEVM_MODE] exec'd CLONE_VM child $CLONEVM_CHILD never inherited protection"
+            else
+                ok "[$CLONEVM_MODE] exec'd CLONE_VM child $CLONEVM_CHILD inherited protection"
+            fi
+            sleep 2
+            LISTED=$(./anticheat list)
+            if printf '%s' "$LISTED" | grep -qw -- "$CLONEVM_PARENT"; then
+                ok "[$CLONEVM_MODE] parent pid $CLONEVM_PARENT stayed protected across the CLONE_VM child exec"
+            else
+                bad "[$CLONEVM_MODE] parent pid $CLONEVM_PARENT lost protection when its CLONE_VM child exec'd (list: $LISTED)"
+            fi
+            ./anticheat unprotect --pid "$CLONEVM_CHILD" >/dev/null 2>&1
+            kill -9 "$CLONEVM_CHILD" 2>/dev/null
+            CLONEVM_CHILD=""
+        fi
+
+        ./anticheat unprotect --pid "$CLONEVM_PARENT" >/dev/null 2>&1
+    else
+        bad "[$CLONEVM_MODE] clone_vm_exec_test did not report PARENT_PID"
+    fi
+    kill -9 "$CLONEVMTEST_PID" 2>/dev/null
+    wait "$CLONEVMTEST_PID" 2>/dev/null
+    CLONEVMTEST_PID=""
+done
 
 say "registry survives leader-only exit: mm-keyed entry needs no migration (#62)"
 coproc MIGTEST { exec ./test/thread_exit_migration_test; }

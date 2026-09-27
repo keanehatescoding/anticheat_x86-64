@@ -12,11 +12,18 @@
  * deleted the parent's own live registry entry -- the protected parent
  * silently lost protection.
  *
+ * argv[1] picks the clone flavour (default "plain"):
+ *   plain  -- CLONE_VM | SIGCHLD (the original #83 case)
+ *   parent -- CLONE_VM | CLONE_PARENT | SIGCHLD: the child's real_parent
+ *             is *our* parent, so a real_parent->mm test misses the
+ *             sharing entirely
+ *   vfork  -- CLONE_VM | CLONE_VFORK | SIGCHLD (vfork() proper)
+ *
  * Protocol (same coproc style as thread_spawn_after_protect_test):
  *   - parent prints "PARENT_PID <pid>", blocks on a stdin line so the
  *     driver (test.sh) can protect PARENT_PID *before* any clone
- *     happens. Once unblocked it clones a CLONE_VM (no CLONE_VFORK, no
- *     CLONE_THREAD) child that immediately execs /proc/self/exe with
+ *     happens. Once unblocked it clones a CLONE_VM child (flavour as
+ *     above, never CLONE_THREAD) that immediately execs /proc/self/exe with
  *     the "exec-child" argument, then prints "CHILD_PID <pid>" (the
  *     clone() return value) and parks.
  *   - the exec'd image prints "EXEC_CHILD <pid>" -- same pid, proving
@@ -56,12 +63,23 @@ static int child_fn(void *arg)
 
 int main(int argc, char **argv)
 {
+    int flags = CLONE_VM | SIGCHLD;
+
     if (argc > 1 && strcmp(argv[1], "exec-child") == 0) {
         printf("EXEC_CHILD %d\n", (int)getpid());
         fflush(stdout);
         for (;;)
             pause();
         return 0; /* unreachable */
+    }
+
+    if (argc > 1 && strcmp(argv[1], "parent") == 0) {
+        flags |= CLONE_PARENT;
+    } else if (argc > 1 && strcmp(argv[1], "vfork") == 0) {
+        flags |= CLONE_VFORK;
+    } else if (argc > 1 && strcmp(argv[1], "plain") != 0) {
+        fprintf(stderr, "usage: %s [plain|parent|vfork]\n", argv[0]);
+        return 2;
     }
 
     {
@@ -81,7 +99,7 @@ int main(int argc, char **argv)
         fflush(stdout); /* shared buffer must be clean before CLONE_VM */
         child = clone(child_fn,
                       child_stack + sizeof(child_stack),
-                      CLONE_VM | SIGCHLD,
+                      flags,
                       argv_exec);
         if (child < 0) {
             perror("clone_vm_exec_test: clone");

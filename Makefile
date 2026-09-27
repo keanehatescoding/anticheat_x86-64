@@ -165,11 +165,10 @@ thread-spawn-after-protect-test: test/thread_spawn_after_protect_test
 test/thread_spawn_after_protect_test: test/thread_spawn_after_protect_test.c src/anticheat.h
 	$(CC) $(CFLAGS) -pthread -o $@ $< $(LDFLAGS)
 
-# clone-vm-exec live test helper: a clone(CLONE_VM|SIGCHLD) child (no
-# CLONE_VFORK, no CLONE_THREAD) shares the parent's live mm with
-# vfork_done == NULL, then execs -- exercises ac_exec_entry()'s
-# borrowed-mm detection (#83: the old vfork_done test sent this down the
-# old_mm path and unregistered the still-running protected parent).
+# clone-vm-exec live test helper: a CLONE_VM child (plain, +CLONE_PARENT,
+# or +CLONE_VFORK; never CLONE_THREAD) shares the protected parent's live
+# mm, then execs -- the rekey must keep the parent's entry while it is
+# still running in that mm (#83).
 # Needs root and the module loaded -- see test.sh.
 clone-vm-exec-test: test/clone_vm_exec_test
 
