@@ -1627,13 +1627,14 @@ static bool ac_is_protected_pid(pid_t pid, char *comm_out)
 /* ac_pending_forks below is what closes it: a fork-inherit request     */
 /* links itself into this list at queue time (see                       */
 /* ac_schedule_prot_add_req()), and ac_exec_entry() -- finding           */
-/* current->mm neither in ac_prots[] nor covered by the vfork_inherit    */
-/* case -- scans it too. A match means "there's a fork-inherit for       */
-/* exactly this mm still in flight"; it claims the request and records   */
-/* the request pointer plus its generation tag (req_id, against struct   */
-/* recycling) in its own kretprobe instance data, where ac_exec_ret()   */
-/* can find it again. A chained second exec before the worker consumed   */
-/* the first handoff matches the same way via post_mm (see below).       */
+/* current->mm not in ac_prots[] -- scans it too. A match (same mm AND  */
+/* current's tgid is the forked pid) means "there's a fork-inherit for   */
+/* exactly this process still in flight"; it claims the request and     */
+/* records the request pointer plus its generation tag (req_id, against */
+/* struct recycling) in its own kretprobe instance data, where          */
+/* ac_exec_ret() can find it again. A chained second exec before the   */
+/* worker consumed the first handoff matches the same way via post_mm   */
+/* (see below).                                                         */
 /*                                                                      */
 /* The worker owns the post-exec handoff, not the kretprobe: once        */
 /* claimed, ac_prot_add_worker() waits -- bounded by                      */
@@ -1875,7 +1876,20 @@ static void ac_prot_add_worker(struct work_struct *w)
     }
 
     if (r->old_mm) {
-        if (ret == 0) {
+        /* Our own exec-entry pin is one mm_users reference; any other
+         * means a task that shared old_mm (vfork(), clone(CLONE_VM),
+         * clone(CLONE_VM | CLONE_PARENT), ...) is still running in it,
+         * so its entry must stay (#83). Should that last sharer exit
+         * right after this read, the old entry just self-releases via
+         * ac_mmu_release() on the mmput() below. */
+        bool still_shared = atomic_read(&r->old_mm->mm_users) > 1;
+
+        if (ret == 0 && still_shared) {
+            ac_emit(AC_EV_FORK, r->new_pid, r->new_comm,
+                    "pid %d exec'd out of a protected address space still "
+                    "in use; new image protected, existing entry kept",
+                    r->src_pid);
+        } else if (ret == 0) {
             ac_del_prot_mm(r->old_mm);
             ac_emit(AC_EV_EXEC, r->new_pid, r->new_comm,
                     "protected pid %d re-exec'd; protection carried to new image",
@@ -2388,35 +2402,30 @@ static struct kretprobe ac_kp_clone = {
  * queued. On a failed exec (nonzero return), current is unchanged and
  * still owns old_mm -- nothing to rekey, just drop the pin.
  *
- * CLONE_VM without CLONE_THREAD -- vfork(), and therefore posix_spawn()/
- * system()/popen() on a libc that uses it -- makes current->mm literally
- * the still-live PARENT's mm_struct pointer until this exec (or an exit)
- * releases it back via mm_release(). If that shared mm happens to be
- * protected, that protection belongs to the parent, not to current: an
- * entry_handler here that pinned it as old_mm would have the ret probe
- * rekey/remove the PARENT's own live registry entry once this exec
- * succeeds, permanently dropping the parent's protection and logging a
- * false "protected process exited" for a process that's still running.
- * current->vfork_done is non-NULL for exactly the duration of that
- * borrowed-mm window (set at clone time, cleared by mm_release()), so
- * detecting it here and never touching old_mm/d->old_mm is what keeps the
- * parent's entry untouched -- ac_clone_ret() already decided at clone time
- * that this shared period needs no registry work of its own, and that
- * decision must hold until current gets its own independent mm.
+ * CLONE_VM without CLONE_THREAD -- vfork(), posix_spawn()/system()/
+ * popen() on a libc that uses it, a plain clone(CLONE_VM), or
+ * clone(CLONE_VM | CLONE_PARENT) -- makes current->mm literally another
+ * still-running process's mm_struct until this exec (or an exit)
+ * releases it. If that shared mm is protected, dropping its entry once
+ * this exec succeeds would permanently strip protection from the other
+ * process and log a false "protected process exited" for it (#83).
  *
- * That still leaves the vfork child itself needing to inherit protection
- * across its own exec, the same as a plain fork()+exec() child already
- * does -- current->real_parent is exactly who that inheritance decision
- * should be attributed to, and it's safe to read without extra locking
- * here specifically because current->vfork_done being set guarantees the
- * parent is synchronously blocked waiting on this exec/exit, so it can't
- * be concurrently reaped or reparented out from under us. The entry
- * itself is queued the same way ac_clone_ret() queues a fork-inherit
- * add -- a fresh registration for the new mm, not a rekey -- since there
- * was never an old_mm entry belonging to current to remove. */
+ * Who shares the mm is deliberately NOT inferred here: vfork_done misses
+ * a plain clone(CLONE_VM) child, and real_parent->mm misses
+ * clone(CLONE_VM | CLONE_PARENT), whose real_parent is the *caller's*
+ * parent. Instead every exec of a protected mm pins it as old_mm and
+ * queues a rekey, and ac_prot_add_worker() decides only after the new
+ * image is registered: if old_mm still has users besides that pin,
+ * someone is still running in it, so its entry stays and is dropped
+ * organically by ac_mmu_release() once the last of them exits.
+ *
+ * The fork-race claim below keys on task identity for the same reason:
+ * a pending fork-inherit request belongs to the forked process
+ * (pr->new_pid, its tgid), not to whoever happens to share its mm, so a
+ * CLONE_VM borrower's exec must not steal that request's handoff and
+ * leave the forked process's own mm unregistered. */
 struct ac_exec_entry_data {
     struct mm_struct *old_mm;
-    bool vfork_inherit;
     /* Fork-then-exec race closure (#6): current->mm matched an in-flight
      * fork-inherit request in ac_pending_forks rather than an already-
      * registered entry in ac_prots[] -- see that list's comment. The
@@ -2427,7 +2436,7 @@ struct ac_exec_entry_data {
     bool fork_race_inherit;
     struct ac_prot_add_req *pending_req; /* claimed request, still linked */
     int pending_id;                      /* req_id at claim time */
-    bool jit_allowed;      /* meaningful if vfork_inherit or fork_race_inherit */
+    bool jit_allowed;      /* meaningful if fork_race_inherit */
     pid_t parent_pid;
     char parent_comm[AC_MAX_COMM];
 };
@@ -2437,28 +2446,12 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
     struct ac_exec_entry_data *d = (struct ac_exec_entry_data *)ri->data;
 
     d->old_mm = NULL;
-    d->vfork_inherit = false;
     d->fork_race_inherit = false;
     d->pending_req = NULL;
     d->pending_id = 0;
-    if (current->vfork_done) {
-        if (current->mm && ac_is_protected_mm(current->mm)) {
-            struct task_struct *parent;
-
-            d->vfork_inherit = true;
-            d->jit_allowed = ac_prot_jit_allowed_mm(current->mm);
-
-            rcu_read_lock();
-            parent = rcu_dereference(current->real_parent);
-            d->parent_pid = parent->pid;
-            /* RCU holds the task_struct alive here; the accessor still
-             * applies (#19) since comm itself can be renamed
-             * concurrently. */
-            get_task_comm(d->parent_comm, parent);
-            rcu_read_unlock();
-        }
-        return 0;
-    }
+    /* Shared or not, a protected mm is always pinned as old_mm: whether
+     * its entry may be dropped is decided by ac_prot_add_worker() from
+     * old_mm's remaining users, not guessed here (#83, see above). */
     if (current->mm && ac_is_protected_mm(current->mm)) {
         d->old_mm = current->mm;
         mmget(d->old_mm);
@@ -2491,8 +2484,11 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
         spin_lock_irqsave(&ac_pending_fork_lock, flags);
         list_for_each_entry(pr, &ac_pending_forks, pending_link) {
-            if (pr->mm == current->mm ||
-                (pr->claimed && pr->post_mm == current->mm)) {
+            /* tgid, not just mm: a CLONE_VM borrower of the forked
+             * process's mm must not claim its request (see above). */
+            if ((pr->mm == current->mm && pr->new_pid == current->tgid) ||
+                (pr->claimed && pr->post_mm == current->mm &&
+                 pr->post_pid == current->tgid)) {
                 pr->claimed = true;
                 d->fork_race_inherit = true;
                 d->pending_req = pr;
@@ -2521,23 +2517,6 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     char cur_comm[AC_MAX_COMM];
 
     get_task_comm(cur_comm, current);
-    if (d->vfork_inherit) {
-        if (rc != 0)
-            return 0;   /* exec failed: still sharing the parent's mm,
-                          * which the parent's own entry keeps covering */
-        new_mm = get_task_mm(current);
-        if (!new_mm)
-            return 0;   /* shouldn't happen on a successful exec */
-        if (!ac_schedule_prot_add(new_mm, current->pid, cur_comm,
-                                  d->parent_pid, d->parent_comm,
-                                  d->jit_allowed))
-            ac_emit(AC_EV_INFO, current->pid, cur_comm,
-                    "vfork child of protected pid %d (%s) NOT protected: "
-                    "registration request dropped (alloc failure)",
-                    d->parent_pid, d->parent_comm);
-        return 0;
-    }
-
     if (d->fork_race_inherit) {
         /* The worker for the original fork-inherit request is waiting on
          * this handoff (see ac_pending_forks' comment), so post the mm
@@ -2976,8 +2955,8 @@ static unsigned long long ac_module_size(const struct module *mod)
  * every kernel address, poisoning both the hidden-module check and the
  * syscall plausibility filter.
  *
- * The is_vmalloc_addr() check guards against a subtler problem than a
- * torn entry: both walk sites below do
+ * The MODULES_VADDR..MODULES_END range check guards against a subtler
+ * problem than a torn entry: both walk sites below do
  * list_for_each_entry_rcu(m, &THIS_MODULE->list, list), which only stops
  * once it circles back to THIS_MODULE's own list node -- not the
  * kernel's real (unexported) `modules` list_head sentinel. A full walk
@@ -2988,13 +2967,20 @@ static unsigned long long ac_module_size(const struct module *mod)
  * that computed offset -- a real, reproduced KASAN global-out-of-bounds
  * (confirmed: lands inside a kernel workqueue global on one tested
  * layout). A genuine struct module always lives inside that module's
- * own vmalloc'd core memory; the sentinel-derived pointer instead lands
- * in the kernel's statically-linked image, so is_vmalloc_addr() tells
- * the two apart without ever needing the sentinel's own (unexported)
- * address. */
+ * own core memory, which on x86-64 is allocated from
+ * MODULES_VADDR..MODULES_END (arch/x86/include/asm/pgtable_64_types.h),
+ * NOT the VMALLOC_START..VMALLOC_END range is_vmalloc_addr() tests --
+ * that is exactly what is_vmalloc_or_module_addr() exists for. The
+ * sentinel-derived pointer instead lands in the kernel's
+ * statically-linked image, so the module-range test tells the two apart
+ * without ever needing the sentinel's own (unexported) address.
+ *
+ * (#82: the previous is_vmalloc_addr() test rejected every real module
+ * on x86-64, so ac_build_mod_snapshot() walked zero entries and the
+ * hidden-module cross-check was silently dead.) */
 static bool ac_module_sane(const struct module *m)
 {
-    if (!is_vmalloc_addr(m))
+    if (!is_vmalloc_or_module_addr(m))
         return false;
     if (m->state != MODULE_STATE_LIVE)
         return false;
