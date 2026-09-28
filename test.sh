@@ -633,15 +633,20 @@ else
     say "no process with libEGL loaded found on this machine, skipping both EGL render-hook checks"
 fi
 
-# Launches render_hook_test with the given args and prints its pid (empty
-# if it never reported READY -- e.g. the library isn't installed).
+# Launches render_hook_test with the given args. Sets RHT_PID (empty if it
+# never reported READY) and RHT_LINE (its first output line -- READY, or
+# the diagnostic it failed with). Called directly, not via $(...), so both
+# stay visible to the caller and the helper is this shell's own child.
 start_render_hook_test() {
     RHT_FIFO=$(mktemp -u)
     mkfifo "$RHT_FIFO"
     setsid ./test/render_hook_test "$@" >"$RHT_FIFO" 2>&1 &
     RHT_LINE=$(timeout 5 head -n1 "$RHT_FIFO")
     rm -f "$RHT_FIFO"
-    printf '%s' "$RHT_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p'
+    RHT_PID=$(printf '%s' "$RHT_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
+    if [ -z "$RHT_PID" ]; then
+        pkill -f "test/render_hook_test" 2>/dev/null
+    fi
 }
 
 say "render-hook check: a lower-addressed decoy mapping can't hide a hook (#84)"
@@ -652,12 +657,23 @@ say "render-hook check: a lower-addressed decoy mapping can't hide a hook (#84)"
 # clean. Now only executable mappings count, and every one is compared.
 # remap-anon covers the flip side: the symbol's page swapped for an
 # anonymous copy, so no file-backed mapping contains it any more.
-make render-hook-test >/dev/null 2>&1
-for DECOY_MODE in decoy-ro decoy-x remap-anon; do
-    DECOY_PID=$(start_render_hook_test libvulkan.so.1 vkQueuePresentKHR 0 "$DECOY_MODE")
+if ! make render-hook-test >/dev/null 2>&1; then
+    bad "could not build test/render_hook_test for the decoy checks"
+    DECOY_MODES=""
+else
+    DECOY_MODES="decoy-ro decoy-x remap-anon"
+fi
+for DECOY_MODE in $DECOY_MODES; do
+    start_render_hook_test libvulkan.so.1 vkQueuePresentKHR 0 "$DECOY_MODE"
+    DECOY_PID=$RHT_PID
     if [ -z "$DECOY_PID" ]; then
-        say "render_hook_test $DECOY_MODE did not start (no libvulkan.so.1?), skipping"
-        pkill -f "test/render_hook_test" 2>/dev/null
+        # Only a missing Vulkan loader is an environment skip; a decoy
+        # mmap/dlinfo/mprotect failure is the test itself breaking.
+        if printf '%s' "$RHT_LINE" | grep -q '^render_hook_test: dlopen libvulkan\.so\.1:'; then
+            say "libvulkan.so.1 not loadable here, skipping $DECOY_MODE check"
+        else
+            bad "render_hook_test $DECOY_MODE did not start: $RHT_LINE"
+        fi
         continue
     fi
     DECOY_OUT=$(./anticheat scan --pid "$DECOY_PID" --check-hooks 2>&1)
@@ -676,8 +692,13 @@ say "render-hook check: lld layout (p_vaddr != p_offset) reads the right bytes (
 # and lld's does not. An untouched lld-linked library used to read as
 # hooked (a CRIT false positive fed to the ban pipeline). The fixture is
 # a stand-in libEGL.so.1 exporting eglSwapBuffers, linked with lld.
-if make lld-render-lib >/dev/null 2>&1; then
-    LLD_PID=$(start_render_hook_test ./test/lld/libEGL.so.1 eglSwapBuffers 0 clean)
+if ! command -v clang >/dev/null 2>&1 || ! command -v ld.lld >/dev/null 2>&1; then
+    say "clang/ld.lld not available, skipping lld-layout render-hook checks"
+elif ! make lld-render-lib >/dev/null 2>&1; then
+    bad "clang and ld.lld are installed but test/lld/libEGL.so.1 failed to build"
+else
+    start_render_hook_test ./test/lld/libEGL.so.1 eglSwapBuffers 0 clean
+    LLD_PID=$RHT_PID
     if [ -n "$LLD_PID" ]; then
         LLD_OUT=$(./anticheat scan --pid "$LLD_PID" --check-hooks 2>&1)
         if printf '%s' "$LLD_OUT" | grep -q "eglSwapBuffers clean"; then
@@ -688,10 +709,10 @@ if make lld-render-lib >/dev/null 2>&1; then
         kill "$LLD_PID" 2>/dev/null
         wait "$LLD_PID" 2>/dev/null
     else
-        bad "lld render_hook_test (clean) did not report READY"
-        pkill -f "test/render_hook_test" 2>/dev/null
+        bad "lld render_hook_test (clean) did not start: $RHT_LINE"
     fi
-    LLD_PID=$(start_render_hook_test ./test/lld/libEGL.so.1 eglSwapBuffers 0)
+    start_render_hook_test ./test/lld/libEGL.so.1 eglSwapBuffers 0
+    LLD_PID=$RHT_PID
     if [ -n "$LLD_PID" ]; then
         LLD_OUT=$(./anticheat scan --pid "$LLD_PID" --check-hooks 2>&1)
         if printf '%s' "$LLD_OUT" | grep -q "render hook (EGL)"; then
@@ -702,11 +723,8 @@ if make lld-render-lib >/dev/null 2>&1; then
         kill "$LLD_PID" 2>/dev/null
         wait "$LLD_PID" 2>/dev/null
     else
-        bad "lld render_hook_test (hook) did not report READY"
-        pkill -f "test/render_hook_test" 2>/dev/null
+        bad "lld render_hook_test (hook) did not start: $RHT_LINE"
     fi
-else
-    say "clang/ld.lld not available, skipping lld-layout render-hook checks"
 fi
 
 say "render-hook check: resolves a target-namespaced path correctly (not the host's)"
