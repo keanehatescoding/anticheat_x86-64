@@ -795,11 +795,16 @@ static int do_ioctl(unsigned long req, void *arg)
                     /* ensure tmp file exists (copy host lib) */
                     ensure_hook_tmp_file(hc.lib);
                     struct ac_vma_info vi;
+                    struct stat hst;
                     memset(&vi, 0, sizeof(vi));
                     vi.start = g_hook_base;
                     vi.end = g_hook_base + 0x100000;
                     vi.offset = 0;
-                    vi.inode = 0x12345;
+                    /* The daemon only trusts a reference file whose inode
+                     * matches the mapping's (#84), so report the real
+                     * inode of the /tmp copy it will open. */
+                    vi.inode = stat(tmp, &hst) == 0 ? (unsigned long long)hst.st_ino
+                                                    : 0x12345;
                     vi.flags = 0x1 | AC_VM_EXEC; /* R+X */
                     vi.is_file = 1;
                     { size_t _l = strlen(tmp); if (_l >= sizeof(vi.path)) _l = sizeof(vi.path)-1; memcpy(vi.path, tmp, _l); vi.path[_l]='\0'; }

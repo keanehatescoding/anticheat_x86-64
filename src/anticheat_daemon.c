@@ -1004,7 +1004,7 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
 /* target itself is using, read fresh at check time.                   */
 /*                                                                      */
 /* Deliberately never dlopen()s that file: it's resolved through the   */
-/* *target's own* mount namespace (see compare_render_symbol() below), */
+/* *target's own* mount namespace (see load_render_reference() below), */
 /* which is not a trusted input -- a process can be set up so an       */
 /* attacker controls what's mounted at the path the kernel reports for */
 /* it. dlopen()ing an attacker-chosen file means running its           */
@@ -1029,20 +1029,81 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
 #define AC_ELF_MAX_SHNUM    2048           /* generous; real .so files have <100 */
 #define AC_ELF_MAX_STRTAB   (4 * 1024 * 1024)
 #define AC_ELF_MAX_SYMS     500000
+#define AC_ELF_MAX_PHNUM    256            /* generous; real .so files have <15 */
+
+/* Where a symbol's bytes live in its library file: file_off is the
+ * symbol itself, [seg_off, seg_end) the file-backed extent of the
+ * executable PT_LOAD containing it. */
+struct ac_elf_loc {
+    uint64_t file_off;
+    uint64_t seg_off;
+    uint64_t seg_end;
+};
+
+/* Translates a symbol's st_value (a *virtual address* relative to the
+ * library's load base) into the file offset holding its bytes, via the
+ * PT_LOAD program header that contains it (#85). st_value only equals
+ * the file offset when that segment has p_vaddr == p_offset, which
+ * GNU ld's default layout happens to give the text segment but lld
+ * (and some gold/mold layouts, e.g. -z separate-code) routinely do not
+ * -- comparing against pread(st_value) there reads unrelated bytes and
+ * flags a clean library as hooked. Also requires the containing segment
+ * to be PF_X: a "present-call" symbol that doesn't live in executable
+ * code isn't something this check knows how to compare. Fills *loc.
+ * Returns 0 on success, -1 if no executable PT_LOAD contains the
+ * address -- inconclusive, never a mismatch. */
+static int elf_vaddr_to_file_off(int fd, const Elf64_Ehdr *eh, uint64_t vaddr,
+                                  struct ac_elf_loc *loc)
+{
+    Elf64_Phdr *phdrs;
+    size_t sz;
+    unsigned int i;
+    int ret = -1;
+
+    if (eh->e_phentsize != sizeof(Elf64_Phdr) || eh->e_phnum == 0 ||
+        eh->e_phnum > AC_ELF_MAX_PHNUM)
+        return -1;
+    sz = (size_t)eh->e_phnum * sizeof(Elf64_Phdr);
+    phdrs = malloc(sz);
+    if (!phdrs)
+        return -1;
+    if (pread(fd, phdrs, sz, (off_t)eh->e_phoff) != (ssize_t)sz)
+        goto out;
+    for (i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *ph = &phdrs[i];
+
+        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_X))
+            continue;
+        /* Subtraction form so an attacker-chosen p_vaddr + p_filesz
+         * can't wrap around and "contain" any address. */
+        if (vaddr < ph->p_vaddr || vaddr - ph->p_vaddr >= ph->p_filesz)
+            continue;
+        if (ph->p_offset > UINT64_MAX - ph->p_filesz)
+            continue;
+        loc->file_off = ph->p_offset + (vaddr - ph->p_vaddr);
+        loc->seg_off = ph->p_offset;
+        loc->seg_end = ph->p_offset + ph->p_filesz;
+        ret = 0;
+        break;
+    }
+out:
+    free(phdrs);
+    return ret;
+}
 
 /* Parses fd's ELF64 section headers to find `symbol` in .dynsym, using
  * only plain pread() -- never dlopen(), see the block comment above.
- * Returns 0 on success (fills *offset_out with the symbol's
- * file-relative offset, which for the ET_DYN shared libraries this
- * checks is the same value as its runtime offset from the load base,
- * and *size_out with its declared st_size, 0 if the symbol table
- * doesn't carry one), -1 on any parse/read/bounds failure. Every
- * failure is inconclusive, never a positive detection -- a malformed or
+ * Returns 0 on success (fills *loc with where the symbol's bytes are in
+ * the file -- st_value translated through its executable PT_LOAD by
+ * elf_vaddr_to_file_off(), not st_value itself, see #85 -- and
+ * *size_out with its declared st_size, 0 if the symbol table doesn't
+ * carry one), -1 on any parse/read/bounds failure. Every failure is
+ * inconclusive, never a positive detection -- a malformed or
  * unexpected-shape ELF file is a skip, same as an unreadable one.
  * x86-64 only (ELFCLASS64 / little-endian), matching the rest of this
  * project's scope. */
-static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_out,
-                                   uint64_t *size_out)
+static int elf_find_symbol_offset(int fd, const char *symbol,
+                                   struct ac_elf_loc *loc, uint64_t *size_out)
 {
     Elf64_Ehdr eh;
     Elf64_Shdr *shdrs = NULL;
@@ -1133,9 +1194,10 @@ static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_o
                     (size_t)(dynstr->sh_size - syms[i].st_name)))
             continue;
         if (strcmp(dynstrtab + syms[i].st_name, symbol) == 0) {
-            *offset_out = syms[i].st_value;
-            *size_out = syms[i].st_size;
-            ret = 0;
+            if (elf_vaddr_to_file_off(fd, &eh, syms[i].st_value, loc) == 0) {
+                *size_out = syms[i].st_size;
+                ret = 0;
+            }
             break;
         }
     }
@@ -1148,44 +1210,60 @@ out:
     return ret;
 }
 
-/* Reads `symbol` from libpath (resolved via the target's own
- * /proc/<pid>/root/ -- see below) and compares against the same offset
- * in the target pid's live memory (lib_base = that mapping's lowest VMA
- * start, i.e. its file-offset-0 load address). Compares the symbol's
- * *entire* declared length (its ELF st_size, clamped to
- * [AC_HOOK_CHECK_MIN_BYTES, AC_HOOK_CHECK_MAX_BYTES], or
- * AC_HOOK_CHECK_DEFAULT_BYTES if the symbol table has no usable size for
- * it) rather than a fixed guess -- a "detour"-style hook patching
- * further into the function body than a small fixed window would still
- * be inside the function's own real bytes, and would still be caught.
- * Empirically, real present-call functions are tiny (glXSwapBuffers is
- * 17 bytes on a real system, smaller than the old fixed 32-byte
- * window -- meaning that window used to read a few bytes *past* the
- * real function into whatever follows it, which this also fixes).
- * Returns 1 if hooked, 0 if clean, -1 if inconclusive (never treated as
- * a positive detection -- an unreadable/unparseable library is a skip,
- * not an alert). Silent by design -- callers decide how (or whether) to
- * surface the result, since the CLI's one-shot `scan --check-hooks` and
- * the daemon's silent-unless-hooked periodic check want very different
- * presentation of the same underlying check. */
-static int compare_render_symbol(int pid, const char *libpath,
-                                  unsigned long long lib_base,
-                                  const char *symbol)
+/* One executable, file-backed VMA whose basename names a render library
+ * (see find_render_lib_maps() below). Anchoring on VM_EXEC mappings is
+ * what closes #84: the old "lowest-addressed VMA whose basename starts
+ * with the prefix" base let a cheat hook the real function, then
+ * mmap(PROT_READ) a clean copy of the library (or any file named
+ * libvulkan.so.<anything>) below it -- the check would parse the decoy,
+ * read the decoy's bytes, and compare clean against clean. Only a
+ * mapping the CPU can actually execute can be what a present() call
+ * runs, so those are what get compared -- all of them, not a chosen
+ * one, so an extra executable decoy can't shadow the real mapping
+ * either. */
+struct ac_render_map {
+    unsigned long long start;
+    unsigned long long end;
+    unsigned long long offset;    /* file offset of `start` */
+    unsigned long long inode;
+    char path[AC_VMA_PATH];
+};
+
+/* Hard cap on executable mappings tracked per library. A legitimately
+ * loaded library has one text VMA (a handful if something mprotect()ed
+ * pages inside it and split it); anything past this is treated as
+ * inconclusive rather than silently dropping the overflow, so flooding
+ * decoy mappings can't push the real one out of view. */
+#define AC_RENDER_MAX_MAPS 16
+
+/* Reads `symbol`'s reference bytes from libpath, resolved via the
+ * target's own /proc/<pid>/root/ (see below), into expected[] (at least
+ * AC_HOOK_CHECK_MAX_BYTES). Compares the symbol's *entire* declared
+ * length (its ELF st_size, clamped to [AC_HOOK_CHECK_MIN_BYTES,
+ * AC_HOOK_CHECK_MAX_BYTES], or AC_HOOK_CHECK_DEFAULT_BYTES if the symbol
+ * table has no usable size for it) rather than a fixed guess -- a
+ * "detour"-style hook patching further into the function body than a
+ * small fixed window would still be inside the function's own real
+ * bytes, and would still be caught. Empirically, real present-call
+ * functions are tiny (glXSwapBuffers is 17 bytes on a real system,
+ * smaller than the old fixed 32-byte window -- meaning that window used
+ * to read a few bytes *past* the real function into whatever follows
+ * it, which this also fixes). The length is further clamped to what's
+ * left of the symbol's file-backed segment. Refuses a file whose inode
+ * isn't the one the kernel reported for the mapping: the path is just a
+ * d_path() string, and whatever sits there now (a replaced file, a
+ * truncated-path collision) isn't necessarily what's mapped. Fills
+ * *loc and *checklen_out. Returns 0 on success, -1 if inconclusive. */
+static int load_render_reference(int pid, const char *libpath,
+                                  unsigned long long inode, const char *symbol,
+                                  struct ac_elf_loc *loc, unsigned char *expected,
+                                  size_t *checklen_out)
 {
-    unsigned char expected[AC_HOOK_CHECK_MAX_BYTES];
-    unsigned char actual[AC_HOOK_CHECK_MAX_BYTES];
-    char memp[64];
     char nspath[AC_VMA_PATH + 32];
-    uint64_t offset, size;
+    uint64_t size;
     size_t checklen;
     int fd;
     ssize_t r;
-
-    /* TOCTOU: pid may have been reused between SCAN_BEGIN and this check.
-     * Verify it still exists before opening control files. kill(pid,0)
-     * is the cheapest liveness probe; ESRCH means the pid is gone. */
-    if (kill(pid, 0) < 0 && errno == ESRCH)
-        return -1;
 
     /* libpath came from the kernel's d_path() on the target's VMA, which
      * is just a string -- opening it directly from the daemon's own
@@ -1219,7 +1297,8 @@ static int compare_render_symbol(int pid, const char *libpath,
     {
         struct stat st;
 
-        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+            (unsigned long long)st.st_ino != inode) {
             close(fd);
             return -1;
         }
@@ -1230,7 +1309,7 @@ static int compare_render_symbol(int pid, const char *libpath,
                 (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
         }
     }
-    if (elf_find_symbol_offset(fd, symbol, &offset, &size) != 0) {
+    if (elf_find_symbol_offset(fd, symbol, loc, &size) != 0) {
         close(fd);
         return -1;
     }
@@ -1242,22 +1321,133 @@ static int compare_render_symbol(int pid, const char *libpath,
         checklen = AC_HOOK_CHECK_MAX_BYTES;
     else
         checklen = (size_t)size;
+    if (checklen > loc->seg_end - loc->file_off)
+        checklen = (size_t)(loc->seg_end - loc->file_off);
 
-    r = pread(fd, expected, checklen, (off_t)offset);
+    r = pread(fd, expected, checklen, (off_t)loc->file_off);
     close(fd);
     if (r != (ssize_t)checklen)
         return -1;
+    *checklen_out = checklen;
+    return 0;
+}
 
-    snprintf(memp, sizeof(memp), "/proc/%d/mem", pid);
-    fd = open(memp, O_RDONLY);
-    if (fd < 0)
-        return -1;
-    r = pread(fd, actual, checklen, (off_t)(lib_base + offset));
-    close(fd);
+/* Compares the symbol's live bytes (via the target's /proc/<pid>/mem,
+ * memfd) at the address one executable mapping says it's at, against
+ * the reference. That address is start + (file_off - offset): every
+ * piece of the text segment's mapping shares one vaddr-minus-file-offset
+ * delta, so this is exactly where the loader put the symbol, whatever
+ * the library's segment layout -- *even when this piece doesn't contain
+ * it*. That matters: a cheat can mmap(MAP_FIXED) an anonymous RX page
+ * with patched code over just the page holding the function, leaving
+ * the file-backed text split around a hole; the neighbouring pieces
+ * still point into the hole, so the hook is read and caught instead of
+ * the check finding "no mapping contains the symbol". A mapping whose
+ * file range doesn't overlap the symbol's segment at all (some other
+ * segment of the file) predicts nothing and returns -2. Returns 1 if
+ * hooked, 0 if clean, -1 if inconclusive (nothing readable there). */
+static int compare_render_map(int memfd, const struct ac_render_map *m,
+                               const struct ac_elf_loc *loc,
+                               const unsigned char *expected, size_t checklen)
+{
+    unsigned char actual[AC_HOOK_CHECK_MAX_BYTES];
+    ssize_t r;
+
+    if (m->end <= m->start || m->offset >= loc->seg_end ||
+        m->end - m->start > UINT64_MAX - m->offset ||
+        m->offset + (m->end - m->start) <= loc->seg_off)
+        return -2;
+    /* Unsigned wraparound is intended if file_off < offset; a garbage
+     * address just fails the pread() below and reads as inconclusive. */
+    r = pread(memfd, actual, checklen,
+              (off_t)(m->start + (loc->file_off - m->offset)));
     if (r != (ssize_t)checklen)
         return -1;
-
     return memcmp(expected, actual, checklen) != 0 ? 1 : 0;
+}
+
+struct ac_lib_result {
+    unsigned int n;               /* executable mappings found */
+    int incomplete;               /* VMA snapshot truncated, or more than
+                                   * AC_RENDER_MAX_MAPS candidates -- a
+                                   * mapping may be missing from maps[] */
+    struct ac_render_map maps[AC_RENDER_MAX_MAPS];
+};
+
+/* Checks `symbol` in every executable mapping in res, grouping mappings
+ * of the same file (inode + path) so each file's ELF is parsed once.
+ * Returns 1 if the symbol's bytes at any mapping's predicted address
+ * differ from the reference (hooked beats everything: a clean decoy
+ * next to a hooked real mapping must not hide it), else -1 if any
+ * comparison was inconclusive, the candidate list is incomplete, or no
+ * mapping covered the symbol's segment, else 0. Silent by design -- callers
+ * decide how (or whether) to surface the result, since the CLI's
+ * one-shot `scan --check-hooks` and the daemon's silent-unless-hooked
+ * periodic check want very different presentation of the same
+ * underlying check. libpath_out (AC_VMA_PATH bytes) gets the path of
+ * the hooked mapping, or the first mapping's otherwise. */
+static int check_render_lib(int pid, const struct ac_lib_result *res,
+                             const char *symbol, char *libpath_out)
+{
+    unsigned char expected[AC_HOOK_CHECK_MAX_BYTES];
+    char memp[64];
+    int hooked = 0, inconclusive = res->incomplete, clean = 0;
+    unsigned int i, j;
+    int memfd;
+
+    snprintf(libpath_out, AC_VMA_PATH, "%s", res->maps[0].path);
+
+    /* TOCTOU: pid may have been reused between SCAN_BEGIN and this check.
+     * Verify it still exists before opening control files. kill(pid,0)
+     * is the cheapest liveness probe; ESRCH means the pid is gone. */
+    if (kill(pid, 0) < 0 && errno == ESRCH)
+        return -1;
+    snprintf(memp, sizeof(memp), "/proc/%d/mem", pid);
+    memfd = open(memp, O_RDONLY);
+    if (memfd < 0)
+        return -1;
+
+    for (i = 0; i < res->n; i++) {
+        const struct ac_render_map *mi = &res->maps[i];
+        struct ac_elf_loc loc = { 0, 0, 0 };
+        size_t checklen = 0;
+        int ref_ok = 1;
+
+        for (j = 0; j < i; j++)
+            if (res->maps[j].inode == mi->inode &&
+                strcmp(res->maps[j].path, mi->path) == 0)
+                break;
+        if (j < i)
+            continue;             /* already checked with its group */
+
+        if (load_render_reference(pid, mi->path, mi->inode, symbol,
+                                  &loc, expected, &checklen) != 0)
+            ref_ok = 0;
+        for (j = i; j < res->n; j++) {
+            const struct ac_render_map *mj = &res->maps[j];
+            int r;
+
+            if (mj->inode != mi->inode || strcmp(mj->path, mi->path) != 0)
+                continue;
+            r = ref_ok ? compare_render_map(memfd, mj, &loc, expected, checklen)
+                       : -1;
+            if (r == 1 && !hooked) {
+                hooked = 1;
+                snprintf(libpath_out, AC_VMA_PATH, "%s", mj->path);
+            } else if (r == 0) {
+                clean = 1;
+            } else if (r == -1) {
+                inconclusive = 1;
+            }
+        }
+    }
+    close(memfd);
+
+    if (hooked)
+        return 1;
+    if (inconclusive || !clean)
+        return -1;
+    return 0;
 }
 
 /* Every rendering API a Linux game is realistically using -- native
@@ -1270,7 +1460,7 @@ static int compare_render_symbol(int pid, const char *libpath,
  * counterpart below, so the two can't drift on which APIs/symbols they
  * check. */
 static const struct {
-    const char *lib_prefix;
+    const char *soname;
     const char *symbol;
     const char *label;
 } AC_RENDER_APIS[] = {
@@ -1281,32 +1471,52 @@ static const struct {
 #define AC_RENDER_APIS_COUNT \
     (sizeof(AC_RENDER_APIS) / sizeof(AC_RENDER_APIS[0]))
 
-struct ac_lib_result {
-    int found;                    /* 1 = located, 0 = not loaded */
-    unsigned long long lib_base;
-    char libpath[AC_VMA_PATH];
-};
+/* Exact soname match (#84): `base` must be `soname` itself or `soname`
+ * followed by a numeric version (".1", ".1.3.275"), optionally with the
+ * " (deleted)" suffix d_path() appends to an unlinked file -- that case
+ * stays a candidate so it reads as inconclusive (reference can't be
+ * opened) rather than as "not loaded". A plain prefix match let any
+ * file named e.g. libvulkan.so.evil stand in for the library. */
+static int render_lib_name_matches(const char *base, const char *soname,
+                                    size_t soname_len)
+{
+    static const char deleted[] = " (deleted)";
+    size_t len = strlen(base), i;
 
-/* Single streaming pass over the target's VMAs that locates the load
- * base of every AC_RENDER_APIS[] library at once -- one
- * SCAN_BEGIN/SCAN_GET/SCAN_END cycle for all n prefixes instead of one
- * per prefix, without collecting the (potentially thousands-of-entries)
- * VMA list into memory -- same "don't build a big buffer you don't
- * need" discipline as the rest of this file. results[] must have n
- * entries, index-aligned with prefixes[]/prefix_lens[]. Returns 0 on
- * success (each results[k].found reports whether that prefix matched
- * anything), -1 on ioctl failure. */
-static int find_libs_by_basenames(int pid, const char *const *prefixes,
-                                   const size_t *prefix_lens, unsigned int n,
-                                   struct ac_lib_result *results)
+    if (len >= sizeof(deleted) - 1 &&
+        strcmp(base + len - (sizeof(deleted) - 1), deleted) == 0)
+        len -= sizeof(deleted) - 1;
+    if (len < soname_len || strncmp(base, soname, soname_len) != 0)
+        return 0;
+    if (len == soname_len)
+        return 1;
+    if (base[soname_len] != '.' || len == soname_len + 1)
+        return 0;
+    for (i = soname_len + 1; i < len; i++)
+        if (!isdigit((unsigned char)base[i]) && base[i] != '.')
+            return 0;
+    return 1;
+}
+
+/* Single streaming pass over the target's VMAs that collects every
+ * executable, file-backed mapping of every AC_RENDER_APIS[] library at
+ * once -- one SCAN_BEGIN/SCAN_GET/SCAN_END cycle for all of them,
+ * without collecting the (potentially thousands-of-entries) VMA list
+ * into memory -- same "don't build a big buffer you don't need"
+ * discipline as the rest of this file. results[] must have
+ * AC_RENDER_APIS_COUNT entries, index-aligned with AC_RENDER_APIS[].
+ * Returns 0 on success, -1 on ioctl failure. */
+static int find_render_lib_maps(int pid, struct ac_lib_result *results)
 {
     struct ac_scan_begin b;
+    size_t soname_lens[AC_RENDER_APIS_COUNT];
     unsigned int v, k;
+    int incomplete;
 
-    for (k = 0; k < n; k++) {
-        results[k].found = 0;
-        results[k].lib_base = 0;
-        results[k].libpath[0] = '\0';
+    for (k = 0; k < AC_RENDER_APIS_COUNT; k++) {
+        results[k].n = 0;
+        results[k].incomplete = 0;
+        soname_lens[k] = strlen(AC_RENDER_APIS[k].soname);
     }
 
     memset(&b, 0, sizeof(b));
@@ -1314,6 +1524,7 @@ static int find_libs_by_basenames(int pid, const char *const *prefixes,
     b.emit_events = 0;
     if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) < 0)
         return -1;
+    incomplete = b.truncated || b.n_vmas > AC_MAX_VMAS;
     b.n_vmas = clamp_vma_count(b.n_vmas);
     for (v = 0; v < b.n_vmas; v++) {
         struct ac_scan_get g;
@@ -1323,66 +1534,78 @@ static int find_libs_by_basenames(int pid, const char *const *prefixes,
         memset(&g, 0, sizeof(g));
         g.pid = pid;
         g.index = v;
-        if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0)
+        if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0) {
+            incomplete = 1;
             break;
+        }
         vi = &g.vma;
-        if (!vi->is_file || !vi->path[0])
+        if (!vi->is_file || !vi->path[0] || !(vi->flags & AC_VM_EXEC))
             continue;
         base = strrchr(vi->path, '/');
         base = base ? base + 1 : vi->path;
-        for (k = 0; k < n; k++) {
-            if (strncmp(base, prefixes[k], prefix_lens[k]) != 0)
+        for (k = 0; k < AC_RENDER_APIS_COUNT; k++) {
+            struct ac_lib_result *res = &results[k];
+            struct ac_render_map *m;
+
+            if (!render_lib_name_matches(base, AC_RENDER_APIS[k].soname,
+                                         soname_lens[k]))
                 continue;
-            if (!results[k].found || vi->start < results[k].lib_base) {
-                results[k].lib_base = vi->start;
-                snprintf(results[k].libpath, sizeof(results[k].libpath),
-                         "%s", vi->path);
-                results[k].found = 1;
+            if (res->n >= AC_RENDER_MAX_MAPS) {
+                res->incomplete = 1;
+                continue;
             }
+            m = &res->maps[res->n++];
+            m->start = vi->start;
+            m->end = vi->end;
+            m->offset = vi->offset;
+            m->inode = vi->inode;
+            snprintf(m->path, sizeof(m->path), "%s", vi->path);
         }
     }
     (void)ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL); /* END only frees snapshot; failure is non-fatal */
+    if (incomplete)
+        for (k = 0; k < AC_RENDER_APIS_COUNT; k++)
+            results[k].incomplete = 1;
     return 0;
 }
 
 /* render_hook_statuses_for(): the single source of truth both the
- * one-shot CLI check and the periodic daemon check build on -- locates
- * every AC_RENDER_APIS[] library in one VMA pass via
- * find_libs_by_basenames(), then compares each one that's actually
- * loaded against a freshly-loaded reference copy. statuses[] must have
+ * one-shot CLI check and the periodic daemon check build on -- collects
+ * every AC_RENDER_APIS[] library's executable mappings in one VMA pass
+ * via find_render_lib_maps(), then compares each one that's actually
+ * loaded against a freshly-read reference copy. statuses[] must have
  * AC_RENDER_APIS_COUNT entries. Each status is -2 (that library not
  * loaded in this process -- not an error, most processes only use one
  * rendering API), -1 (inconclusive), 0 (clean), or 1 (hooked); libpaths[]
  * (same length, each AC_VMA_PATH bytes) is filled on any non-(-2)
- * status. */
+ * status. A library not found in a truncated VMA snapshot is -1, not
+ * -2: its mapping may just be past the cut-off. */
 static void render_hook_statuses_for(int pid, int *statuses,
                                       char libpaths[][AC_VMA_PATH])
 {
-    struct ac_lib_result results[AC_RENDER_APIS_COUNT];
-    const char *prefixes[AC_RENDER_APIS_COUNT];
-    size_t prefix_lens[AC_RENDER_APIS_COUNT];
+    struct ac_lib_result *results;
     unsigned int k;
-    int rc;
 
     for (k = 0; k < AC_RENDER_APIS_COUNT; k++) {
-        prefixes[k] = AC_RENDER_APIS[k].lib_prefix;
-        prefix_lens[k] = strlen(AC_RENDER_APIS[k].lib_prefix);
-    }
-    rc = find_libs_by_basenames(pid, prefixes, prefix_lens,
-                                 AC_RENDER_APIS_COUNT, results);
-    for (k = 0; k < AC_RENDER_APIS_COUNT; k++) {
         libpaths[k][0] = '\0';
-        if (rc < 0) {
-            statuses[k] = -1;
-        } else if (!results[k].found) {
-            statuses[k] = -2;
-        } else {
-            snprintf(libpaths[k], AC_VMA_PATH, "%s", results[k].libpath);
-            statuses[k] = compare_render_symbol(pid, results[k].libpath,
-                                                 results[k].lib_base,
-                                                 AC_RENDER_APIS[k].symbol);
+        statuses[k] = -1;
+    }
+    /* ~7 KiB for all three libraries -- heap, not the stack of a
+     * function the periodic loop calls per protected process. */
+    results = calloc(AC_RENDER_APIS_COUNT, sizeof(*results));
+    if (!results)
+        return;
+    if (find_render_lib_maps(pid, results) == 0) {
+        for (k = 0; k < AC_RENDER_APIS_COUNT; k++) {
+            if (results[k].n == 0)
+                statuses[k] = results[k].incomplete ? -1 : -2;
+            else
+                statuses[k] = check_render_lib(pid, &results[k],
+                                               AC_RENDER_APIS[k].symbol,
+                                               libpaths[k]);
         }
     }
+    free(results);
 }
 
 /* Shared presentation for one (api, symbol) check's result -- used by
@@ -1402,7 +1625,7 @@ static int print_render_hook_result(int pid, const char *api_label,
         return 0;
     case -1:
         printf("  render-hook check (%s): could not verify %s in %s, skipping\n",
-               api_label, symbol, libpath);
+               api_label, symbol, libpath[0] ? libpath : "(not located)");
         return 0;
     case 1:
         printf("  [!] render hook (%s): %s in %s (target pid %d) differs\n"

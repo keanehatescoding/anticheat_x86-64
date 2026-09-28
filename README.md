@@ -212,12 +212,20 @@ have one mapped.
 This needs no signature database and can't go stale across distros or
 driver/loader versions: the daemon reads the *exact same on-disk file*
 the target process has mapped, parses its ELF section headers directly to
-find the target symbol's file-relative offset, and compares its bytes
-against the same offset read from the target's memory (`/proc/<pid>/mem`,
-the same mechanism `--hash` already uses — see
-`compare_render_symbol()`/`elf_find_symbol_offset()` in the daemon, and
-`render_hook_status_for()`/`find_lib_by_basename()` for the
-library/symbol-parameterized lookup all three APIs share). A classic
+find the target symbol, translates its address through the executable
+`PT_LOAD` segment that contains it into a file offset (so lld/mold-style
+layouts where a segment's vaddr differs from its file offset compare the
+right bytes), and compares those bytes against every *executable* mapping
+of that file in the target's memory (`/proc/<pid>/mem`, the same mechanism
+`--hash` already uses — see `load_render_reference()`/
+`elf_find_symbol_offset()` in the daemon, and
+`render_hook_statuses_for()`/`find_render_lib_maps()` for the
+library/symbol-parameterized lookup all three APIs share). Only exact
+soname matches (`libvulkan.so`, `libvulkan.so.1`, `libvulkan.so.1.4.357`,
+…) count, only `PROT_EXEC` mappings are compared, and the reference file
+must have the inode the kernel reports for the mapping — so a clean decoy
+copy mapped next to a hooked library (read-only or executable) can't stand
+in for it. A classic
 inline/trampoline hook — patching the function's bytes to jump into
 injected code — changes those bytes; an unmodified process matches
 byte-for-byte. The reference copy is whatever the target itself is

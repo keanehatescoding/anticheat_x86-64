@@ -481,7 +481,7 @@ if [ -n "$VK_PID" ]; then
     say "render-hook check: catches a hook past the old fixed 32-byte window"
     # The check used to compare a fixed first-32-bytes window; it now
     # compares the symbol's whole ELF-declared size instead (see
-    # compare_render_symbol()). vkQueuePresentKHR is 81 bytes on real
+    # load_render_reference()). vkQueuePresentKHR is 81 bytes on real
     # systems -- patch offset 40 is comfortably past the old window and
     # comfortably inside the real function, so this specifically proves
     # the new capability, not just that hooks at byte 0 are still caught
@@ -633,8 +633,84 @@ else
     say "no process with libEGL loaded found on this machine, skipping both EGL render-hook checks"
 fi
 
+# Launches render_hook_test with the given args and prints its pid (empty
+# if it never reported READY -- e.g. the library isn't installed).
+start_render_hook_test() {
+    RHT_FIFO=$(mktemp -u)
+    mkfifo "$RHT_FIFO"
+    setsid ./test/render_hook_test "$@" >"$RHT_FIFO" 2>&1 &
+    RHT_LINE=$(timeout 5 head -n1 "$RHT_FIFO")
+    rm -f "$RHT_FIFO"
+    printf '%s' "$RHT_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p'
+}
+
+say "render-hook check: a lower-addressed decoy mapping can't hide a hook (#84)"
+# The check used to take the lowest-addressed VMA whose basename merely
+# *started with* libvulkan.so as the library's base. A cheat could hook
+# the real vkQueuePresentKHR, then map a clean copy of the library below
+# it: the check parsed and read the decoy and compared clean against
+# clean. Now only executable mappings count, and every one is compared.
+# remap-anon covers the flip side: the symbol's page swapped for an
+# anonymous copy, so no file-backed mapping contains it any more.
+make render-hook-test >/dev/null 2>&1
+for DECOY_MODE in decoy-ro decoy-x remap-anon; do
+    DECOY_PID=$(start_render_hook_test libvulkan.so.1 vkQueuePresentKHR 0 "$DECOY_MODE")
+    if [ -z "$DECOY_PID" ]; then
+        say "render_hook_test $DECOY_MODE did not start (no libvulkan.so.1?), skipping"
+        pkill -f "test/render_hook_test" 2>/dev/null
+        continue
+    fi
+    DECOY_OUT=$(./anticheat scan --pid "$DECOY_PID" --check-hooks 2>&1)
+    if printf '%s' "$DECOY_OUT" | grep -q "render hook (Vulkan)"; then
+        ok "hook with a $DECOY_MODE mapping correctly flagged (pid $DECOY_PID)"
+    else
+        bad "hook with a $DECOY_MODE mapping was NOT flagged (pid $DECOY_PID): $DECOY_OUT"
+    fi
+    kill "$DECOY_PID" 2>/dev/null
+    wait "$DECOY_PID" 2>/dev/null
+done
+
+say "render-hook check: lld layout (p_vaddr != p_offset) reads the right bytes (#85)"
+# st_value is a vaddr; it's only the file offset when the containing
+# PT_LOAD has p_vaddr == p_offset, which GNU ld's layout happens to give
+# and lld's does not. An untouched lld-linked library used to read as
+# hooked (a CRIT false positive fed to the ban pipeline). The fixture is
+# a stand-in libEGL.so.1 exporting eglSwapBuffers, linked with lld.
+if make lld-render-lib >/dev/null 2>&1; then
+    LLD_PID=$(start_render_hook_test ./test/lld/libEGL.so.1 eglSwapBuffers 0 clean)
+    if [ -n "$LLD_PID" ]; then
+        LLD_OUT=$(./anticheat scan --pid "$LLD_PID" --check-hooks 2>&1)
+        if printf '%s' "$LLD_OUT" | grep -q "eglSwapBuffers clean"; then
+            ok "untouched lld-linked library reads as clean (pid $LLD_PID)"
+        else
+            bad "untouched lld-linked library not clean (pid $LLD_PID): $LLD_OUT"
+        fi
+        kill "$LLD_PID" 2>/dev/null
+        wait "$LLD_PID" 2>/dev/null
+    else
+        bad "lld render_hook_test (clean) did not report READY"
+        pkill -f "test/render_hook_test" 2>/dev/null
+    fi
+    LLD_PID=$(start_render_hook_test ./test/lld/libEGL.so.1 eglSwapBuffers 0)
+    if [ -n "$LLD_PID" ]; then
+        LLD_OUT=$(./anticheat scan --pid "$LLD_PID" --check-hooks 2>&1)
+        if printf '%s' "$LLD_OUT" | grep -q "render hook (EGL)"; then
+            ok "hooked lld-linked library correctly flagged (pid $LLD_PID)"
+        else
+            bad "hooked lld-linked library was NOT flagged (pid $LLD_PID): $LLD_OUT"
+        fi
+        kill "$LLD_PID" 2>/dev/null
+        wait "$LLD_PID" 2>/dev/null
+    else
+        bad "lld render_hook_test (hook) did not report READY"
+        pkill -f "test/render_hook_test" 2>/dev/null
+    fi
+else
+    say "clang/ld.lld not available, skipping lld-layout render-hook checks"
+fi
+
 say "render-hook check: resolves a target-namespaced path correctly (not the host's)"
-# Proves the /proc/<pid>/root/ fix in compare_render_symbol(): create a
+# Proves the /proc/<pid>/root/ fix in load_render_reference(): create a
 # private mount namespace where a *different* (empty) file sits at the
 # same path the daemon would naively try to open from its own (host)
 # namespace, bind-mount the real libvulkan.so.1 over that path -- but
