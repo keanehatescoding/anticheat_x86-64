@@ -435,6 +435,7 @@ if [ -n "$VK_PID" ]; then
     FIFO=$(mktemp -u)
     mkfifo "$FIFO"
     setsid ./test/render_hook_test >"$FIFO" 2>&1 &
+    HOOK_BG=$!
     HOOK_LINE=$(timeout 5 head -n1 "$FIFO")
     rm -f "$FIFO"
     HOOK_PID=$(printf '%s' "$HOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
@@ -472,10 +473,8 @@ if [ -n "$VK_PID" ]; then
         wait "$HOOK_PID" 2>/dev/null
     else
         bad "render_hook_test did not report READY (output: $HOOK_LINE)"
-        # HOOK_PID was never captured (empty/timed-out READY line), so it
-        # can't be killed by pid -- if the harness is just slow rather than
-        # dead, it would otherwise leak as an orphan for the rest of the run.
-        pkill -f "test/render_hook_test" 2>/dev/null
+        kill "$HOOK_BG" 2>/dev/null
+        wait "$HOOK_BG" 2>/dev/null
     fi
 
     say "render-hook check: catches a hook past the old fixed 32-byte window"
@@ -489,6 +488,7 @@ if [ -n "$VK_PID" ]; then
     OFFFIFO=$(mktemp -u)
     mkfifo "$OFFFIFO"
     setsid ./test/render_hook_test libvulkan.so.1 vkQueuePresentKHR 40 >"$OFFFIFO" 2>&1 &
+    OFFHOOK_BG=$!
     OFFHOOK_LINE=$(timeout 5 head -n1 "$OFFFIFO")
     rm -f "$OFFFIFO"
     OFFHOOK_PID=$(printf '%s' "$OFFHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
@@ -503,7 +503,8 @@ if [ -n "$VK_PID" ]; then
         wait "$OFFHOOK_PID" 2>/dev/null
     else
         bad "offset-40 render_hook_test did not report READY (output: $OFFHOOK_LINE)"
-        pkill -f "test/render_hook_test" 2>/dev/null
+        kill "$OFFHOOK_BG" 2>/dev/null
+        wait "$OFFHOOK_BG" 2>/dev/null
     fi
 else
     say "no process with libvulkan loaded found on this machine, skipping both render-hook checks"
@@ -532,6 +533,7 @@ if [ -n "$GL_PID" ]; then
     GLFIFO=$(mktemp -u)
     mkfifo "$GLFIFO"
     setsid ./test/render_hook_test libGL.so.1 glXSwapBuffers >"$GLFIFO" 2>&1 &
+    GLHOOK_BG=$!
     GLHOOK_LINE=$(timeout 5 head -n1 "$GLFIFO")
     rm -f "$GLFIFO"
     GLHOOK_PID=$(printf '%s' "$GLHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
@@ -565,7 +567,8 @@ if [ -n "$GL_PID" ]; then
         wait "$GLHOOK_PID" 2>/dev/null
     else
         bad "GL render_hook_test did not report READY (output: $GLHOOK_LINE)"
-        pkill -f "test/render_hook_test" 2>/dev/null
+        kill "$GLHOOK_BG" 2>/dev/null
+        wait "$GLHOOK_BG" 2>/dev/null
     fi
 else
     say "no process with libGL loaded found on this machine, skipping both GLX render-hook checks"
@@ -594,6 +597,7 @@ if [ -n "$EGL_PID" ]; then
     EGLFIFO=$(mktemp -u)
     mkfifo "$EGLFIFO"
     setsid ./test/render_hook_test libEGL.so.1 eglSwapBuffers >"$EGLFIFO" 2>&1 &
+    EGLHOOK_BG=$!
     EGLHOOK_LINE=$(timeout 5 head -n1 "$EGLFIFO")
     rm -f "$EGLFIFO"
     EGLHOOK_PID=$(printf '%s' "$EGLHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
@@ -627,7 +631,8 @@ if [ -n "$EGL_PID" ]; then
         wait "$EGLHOOK_PID" 2>/dev/null
     else
         bad "EGL render_hook_test did not report READY (output: $EGLHOOK_LINE)"
-        pkill -f "test/render_hook_test" 2>/dev/null
+        kill "$EGLHOOK_BG" 2>/dev/null
+        wait "$EGLHOOK_BG" 2>/dev/null
     fi
 else
     say "no process with libEGL loaded found on this machine, skipping both EGL render-hook checks"
