@@ -12,6 +12,10 @@ on:
 
 jobs:
   claude-review:
+    # claude-code-action refuses bot-triggered runs (e.g. CodeRabbit pushing
+    # an autofix commit), which fails the job. Skip those runs instead; the
+    # next human push to the PR gets reviewed as usual.
+    if: github.event.sender.type != 'Bot'
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
