@@ -640,12 +640,16 @@ fi
 start_render_hook_test() {
     RHT_FIFO=$(mktemp -u)
     mkfifo "$RHT_FIFO"
+    # Non-interactive shells don't put background jobs in their own
+    # process group, so setsid execs in place and $! is the helper itself.
     setsid ./test/render_hook_test "$@" >"$RHT_FIFO" 2>&1 &
+    RHT_BG=$!
     RHT_LINE=$(timeout 5 head -n1 "$RHT_FIFO")
     rm -f "$RHT_FIFO"
     RHT_PID=$(printf '%s' "$RHT_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
     if [ -z "$RHT_PID" ]; then
-        pkill -f "test/render_hook_test" 2>/dev/null
+        kill "$RHT_BG" 2>/dev/null
+        wait "$RHT_BG" 2>/dev/null
     fi
 }
 
