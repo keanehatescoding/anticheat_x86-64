@@ -1255,8 +1255,9 @@ static void map_files_path(char *buf, size_t len, int pid,
  * than re-resolving its d_path() string -- so it's the mapped file even
  * if that path now names something else, is shadowed by a mount, or was
  * unlinked. Needs CAP_SYS_ADMIN, which the daemon already requires for
- * the kernel device. Returns 0 and fills *id, or -1 (no such VMA any
- * more, not a regular file, no access) -- never a guess. */
+ * the kernel device. Returns 0 and fills *id, -2 if the mapping is
+ * definitely not a regular file (a device node, say), or -1 (no such
+ * VMA any more, no access) -- never a guess. */
 static int map_file_identity(int pid, unsigned long long start,
                              unsigned long long end, struct ac_map_id *id)
 {
@@ -1264,8 +1265,10 @@ static int map_file_identity(int pid, unsigned long long start,
     struct stat st;
 
     map_files_path(p, sizeof(p), pid, start, end);
-    if (stat(p, &st) != 0 || !S_ISREG(st.st_mode))
+    if (stat(p, &st) != 0)
         return -1;
+    if (!S_ISREG(st.st_mode))
+        return -2;
     id->dev = st.st_dev;
     id->ino = st.st_ino;
     return 0;
@@ -1367,51 +1370,74 @@ static int load_render_reference(int pid, const struct ac_render_map *m,
  * Takes its own VMA snapshot (only reached on a mismatch, so the
  * common clean path never pays for it). A neighbour only counts as
  * "this file" by map_files identity, not by the kernel's inode number
- * alone. Returns 1 if addr is in the load, 0 otherwise -- including any
- * snapshot or identity failure, which the caller treats as "this
- * mapping predicts nothing", never as a hook. */
+ * alone. Returns 1 if addr is in the load, 0 if it is not, and -1 if
+ * the snapshot can't tell (SCAN_BEGIN/GET failure, a file VMA whose
+ * identity can't be read where it would decide the answer, or a
+ * truncated snapshot that ran out undecided) -- which the caller must
+ * treat as inconclusive: never
+ * as a hook, but never as "predicts nothing" either, or a failure
+ * next to a clean decoy would read as clean. */
 static int render_addr_in_load(int pid, const struct ac_map_id *id,
                                unsigned long long delta, unsigned long long addr)
 {
     struct ac_scan_begin b;
     unsigned long long prev_end = 0;
-    int left_ok = 0, in_hole = 0, ret = 0;
+    /* left_ok / in_hole's right side: 1 yes, 0 no, -1 can't tell (a
+     * file VMA in the run whose identity couldn't be read). */
+    int left_ok = 0, right_unknown = 0, in_hole = 0, ret = -2;
+    int complete;
     unsigned int v;
 
     memset(&b, 0, sizeof(b));
     b.pid = pid;
     b.emit_events = 0;
     if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) < 0)
-        return 0;
+        return -1;
+    /* Running off the end of the list decides anything only if the list
+     * is complete; a truncated tail may hold the answer. */
+    complete = !b.truncated && b.n_vmas <= AC_MAX_VMAS;
     b.n_vmas = clamp_vma_count(b.n_vmas);
     for (v = 0; v < b.n_vmas; v++) {
         struct ac_scan_get g;
         struct ac_vma_info *vi;
         struct ac_map_id vid;
-        int same_file;
+        int same_file = 0;
 
         memset(&g, 0, sizeof(g));
         g.pid = pid;
         g.index = v;
-        if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0)
+        if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0) {
+            ret = -1;
             break;
+        }
         vi = &g.vma;
         /* Identity only via map_files, not the kernel's i_ino: on
          * overlayfs the mapped (real) inode's number isn't what stat()
-         * reports. Only reached on a mismatch, so the stat()s are rare. */
-        same_file = vi->is_file &&
-                    map_file_identity(pid, vi->start, vi->end, &vid) == 0 &&
-                    vid.dev == id->dev && vid.ino == id->ino;
+         * reports. Only reached on a mismatch, so the stat()s are rare.
+         * -1 when it can't be read: that VMA might be this file. A
+         * non-regular file (a GPU device node) can't be. */
+        if (vi->is_file) {
+            int idr = map_file_identity(pid, vi->start, vi->end, &vid);
+
+            if (idr == 0)
+                same_file = vid.dev == id->dev && vid.ino == id->ino;
+            else if (idr == -1)
+                same_file = -1;
+        }
 
         if (in_hole) {
             /* Walking right from the hole: contiguous VMAs until one of
              * this file closes it; any gap leaves it open. */
-            if (vi->start != prev_end)
+            if (vi->start != prev_end) {
+                ret = right_unknown ? -1 : 0;
                 break;
-            if (same_file) {
+            }
+            if (same_file == 1) {
                 ret = 1;
                 break;
             }
+            if (same_file < 0)
+                right_unknown = 1;
             prev_end = vi->end;
             continue;
         }
@@ -1420,23 +1446,36 @@ static int render_addr_in_load(int pid, const struct ac_map_id *id,
              * back to a mapping of this file with no gap in between. */
             if (vi->start != prev_end)
                 left_ok = 0;
-            if (same_file)
+            if (same_file == 1)
                 left_ok = 1;
+            else if (same_file < 0 && left_ok == 0)
+                left_ok = -1;
             prev_end = vi->end;
             continue;
         }
-        if (vi->start > addr)
-            break;                /* addr itself is unmapped */
-        if (same_file && vi->start - vi->offset == delta) {
-            ret = 1;              /* the library's own text */
+        if (vi->start > addr) {
+            ret = 0;              /* addr itself is unmapped */
             break;
         }
-        if (vi->start != prev_end || !left_ok)
+        if (same_file && vi->start - vi->offset == delta) {
+            /* the library's own text -- or, unidentified, maybe */
+            ret = same_file == 1 ? 1 : -1;
             break;
+        }
+        if (vi->start != prev_end || !left_ok) {
+            ret = 0;
+            break;
+        }
+        if (left_ok < 0) {
+            ret = -1;
+            break;
+        }
         in_hole = 1;
         prev_end = vi->end;
     }
     (void)ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+    if (ret == -2)                /* ran off the end undecided */
+        ret = complete && !right_unknown ? 0 : -1;
     return ret;
 }
 
@@ -1457,7 +1496,8 @@ static int render_addr_in_load(int pid, const struct ac_map_id *id,
  * A mapping whose file range doesn't overlap the symbol's segment at
  * all (some other segment of the file), or whose mismatching prediction
  * lands outside the load, predicts nothing and returns -2. Returns 1 if
- * hooked, 0 if clean, -1 if inconclusive (nothing readable there). */
+ * hooked, 0 if clean, -1 if inconclusive (nothing readable there, or
+ * the in-load confirmation itself failed). */
 static int compare_render_map(int pid, int memfd, const struct ac_render_map *m,
                                const struct ac_map_id *id,
                                const struct ac_elf_loc *loc,
@@ -1466,6 +1506,7 @@ static int compare_render_map(int pid, int memfd, const struct ac_render_map *m,
     unsigned char actual[AC_HOOK_CHECK_MAX_BYTES];
     unsigned long long delta, addr;
     ssize_t r;
+    int in_load;
 
     if (m->end <= m->start || m->offset >= loc->seg_end ||
         m->end - m->start > UINT64_MAX - m->offset ||
@@ -1480,10 +1521,12 @@ static int compare_render_map(int pid, int memfd, const struct ac_render_map *m,
         return -1;
     if (memcmp(expected, actual, checklen) == 0)
         return 0;
-    if (!render_addr_in_load(pid, id, delta, addr) ||
-        !render_addr_in_load(pid, id, delta, addr + checklen - 1))
-        return -2;
-    return 1;
+    in_load = render_addr_in_load(pid, id, delta, addr);
+    if (in_load == 1)
+        in_load = render_addr_in_load(pid, id, delta, addr + checklen - 1);
+    if (in_load < 0)
+        return -1;
+    return in_load ? 1 : -2;
 }
 
 struct ac_lib_result {
