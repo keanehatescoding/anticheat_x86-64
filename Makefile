@@ -126,6 +126,17 @@ render-hook-test: test/render_hook_test
 test/render_hook_test: test/render_hook_test.c src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ $< -ldl $(LDFLAGS)
 
+# lld-linked stand-in for libEGL.so.1 (#85): lld lays the executable
+# PT_LOAD out at p_vaddr != p_offset, which the render-hook check has to
+# translate through rather than treat st_value as a file offset. Needs
+# clang + ld.lld; test.sh skips the fixture's checks if it can't build.
+# Output keeps the real soname as its basename so the check matches it.
+lld-render-lib: test/lld/libEGL.so.1
+
+test/lld/libEGL.so.1: test/lld_render_lib.c
+	@mkdir -p test/lld
+	clang -O2 -fPIC -shared -fuse-ld=lld -Wl,-soname,libEGL.so.1 -o $@ $<
+
 # mount-namespace live test helper: dlopen()s an explicit path inside a
 # private mount namespace test.sh sets up, so the render-hook check's
 # /proc/<pid>/root/ resolution can be proven against a real target whose
@@ -268,6 +279,7 @@ ci:
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
 	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/clone_vm_exec_test test/process_vm_test test/pagination_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/daemon_robustness_test test/libwaitpid_eintr_fault.so
+	rm -rf test/lld
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat
 	install -D -m 0644 anticheat.ko /lib/modules/$(KVER)/extra/anticheat.ko
@@ -295,4 +307,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf $(DECK_PREFIX)
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test clone-vm-exec-test process-vm-test pagination-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test daemon-robustness-test ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test lld-render-lib mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test clone-vm-exec-test process-vm-test pagination-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test daemon-robustness-test ci clean install uninstall install-deck uninstall-deck

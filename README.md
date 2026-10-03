@@ -212,12 +212,20 @@ have one mapped.
 This needs no signature database and can't go stale across distros or
 driver/loader versions: the daemon reads the *exact same on-disk file*
 the target process has mapped, parses its ELF section headers directly to
-find the target symbol's file-relative offset, and compares its bytes
-against the same offset read from the target's memory (`/proc/<pid>/mem`,
-the same mechanism `--hash` already uses — see
-`compare_render_symbol()`/`elf_find_symbol_offset()` in the daemon, and
-`render_hook_status_for()`/`find_lib_by_basename()` for the
-library/symbol-parameterized lookup all three APIs share). A classic
+find the target symbol, translates its address through the executable
+`PT_LOAD` segment that contains it into a file offset (so lld/mold-style
+layouts where a segment's vaddr differs from its file offset compare the
+right bytes), and compares those bytes against every *executable* mapping
+of that file in the target's memory (`/proc/<pid>/mem`, the same mechanism
+`--hash` already uses — see `load_render_reference()`/
+`elf_find_symbol_offset()` in the daemon, and
+`render_hook_statuses_for()`/`find_render_lib_maps()` for the
+library/symbol-parameterized lookup all three APIs share). Only exact
+soname matches (`libvulkan.so`, `libvulkan.so.1`, `libvulkan.so.1.4.357`,
+…) count, only `PROT_EXEC` mappings are compared, and the reference file
+must have the inode the kernel reports for the mapping — so a clean decoy
+copy mapped next to a hooked library (read-only or executable) can't stand
+in for it. A classic
 inline/trampoline hook — patching the function's bytes to jump into
 injected code — changes those bytes; an unmodified process matches
 byte-for-byte. The reference copy is whatever the target itself is
@@ -242,10 +250,9 @@ attacker-influenceable file as everything else this check reads, so it's
 bounded, never trusted as authoritative on its own.
 
 Deliberately never `dlopen()`s that file, and this isn't a style
-preference: the path is resolved through the *target's own* mount
-namespace (see below), which isn't a trusted input — a process can be set
-up so an attacker controls what's mounted at the path the kernel reports
-for it. `dlopen()` would run that file's constructors as root. The ELF
+preference: the file is whatever the target chose to map (see below),
+which isn't a trusted input — a process can map any file it likes under a
+library's name. `dlopen()` would run that file's constructors as root. The ELF
 symbol table is parsed with plain `pread()` instead, so no code from an
 untrusted file is ever executed — verified directly, not just reasoned
 about: a constructor planted in a file at an attacker-controlled
@@ -267,23 +274,25 @@ bytes. A symbol with no size info in the ELF symbol table (stripped or
 unusual builds) falls back to the old 32-byte default window, so a
 sufficiently deep detour into an unsized symbol could still be missed.
 
-**Mount-namespace aware.** The kernel-side VMA scan reports a path
-string for the target's library; opening that string directly from the
-daemon's own (host) mount namespace would trust that whatever exists
-there is the same file the target actually has mapped, which isn't
-guaranteed for a process in a container/sandbox with a private
-bind-mount at that path (Flatpak, Steam Runtime). The daemon instead
-opens it through `/proc/<pid>/root/<path>`, which the kernel resolves
-exactly as the target process itself sees it — for a target sharing the
-daemon's own namespace (the common case), `/proc/<pid>/root` is just
-`/`, so this is a strict correctness fix with no downside there. Verified
-empirically, not assumed: without this, a private bind-mount shadowing
-an otherwise-identical host path silently produced the wrong reference
-bytes (or an unopenable file) and the check could only report
-"inconclusive"; through `/proc/<pid>/root/` it correctly loads the real,
-target-visible library and compares it properly. `test/mount_ns_probe.c`
-+ a real `unshare --mount` namespace in `test.sh` exercise this directly
-against a real loaded module, not just in theory.
+**Reads the file actually mapped.** The kernel-side VMA scan reports a
+path string for the target's library, and that string doesn't reliably
+name the mapped file: in a container/sandbox (Flatpak, Steam Runtime) a
+private bind-mount can put a different file at that path, and matching on
+inode number alone isn't enough either, since another filesystem can hold
+a file with the same inode number. The daemon instead opens the reference
+through `/proc/<pid>/map_files/<start>-<end>`, which follows the VMA's own
+file — same device *and* inode, whatever namespace, mount or unlink state
+its path is in. `test/mount_ns_probe.c` + a real `unshare --mount`
+namespace in `test.sh` exercise the bind-mount case directly against a
+real loaded module.
+
+A mismatch only counts as a hook once the address it was read from is
+confirmed to belong to the library load: either a mapping of the same
+file at the same load offset (the text itself, patched in place), or a
+hole inside the library's mapped span bounded on both sides by its own
+mappings (a page swapped for an anonymous copy). A stray mapping of one
+later page of the library elsewhere predicts the symbol in unrelated
+memory; that prediction is ignored rather than reported as a hook.
 
 `scan --check-hooks` is the on-demand, human-facing form; the same
 detection also runs automatically every 30 s against every protected

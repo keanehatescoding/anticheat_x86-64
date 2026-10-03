@@ -27,6 +27,9 @@ cleanup() {
     [ -n "$MIGTEST_PID" ] && kill -9 "$MIGTEST_PID" 2>/dev/null
     [ -n "$SPAWNTEST_PID" ] && kill -9 "$SPAWNTEST_PID" 2>/dev/null
     [ -n "$CLONEVMTEST_PID" ] && kill -9 "$CLONEVMTEST_PID" 2>/dev/null
+    # render_hook_test sleeps forever after READY; an interrupted run
+    # must not leave it behind.
+    [ -n "$RHT_BG" ] && kill -9 "$RHT_BG" 2>/dev/null
     if [ -n "$CLONEVM_CHILD" ]; then
         ./anticheat unprotect --pid "$CLONEVM_CHILD" >/dev/null 2>&1
         kill -9 "$CLONEVM_CHILD" 2>/dev/null
@@ -435,6 +438,7 @@ if [ -n "$VK_PID" ]; then
     FIFO=$(mktemp -u)
     mkfifo "$FIFO"
     setsid ./test/render_hook_test >"$FIFO" 2>&1 &
+    HOOK_BG=$!
     HOOK_LINE=$(timeout 5 head -n1 "$FIFO")
     rm -f "$FIFO"
     HOOK_PID=$(printf '%s' "$HOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
@@ -472,16 +476,14 @@ if [ -n "$VK_PID" ]; then
         wait "$HOOK_PID" 2>/dev/null
     else
         bad "render_hook_test did not report READY (output: $HOOK_LINE)"
-        # HOOK_PID was never captured (empty/timed-out READY line), so it
-        # can't be killed by pid -- if the harness is just slow rather than
-        # dead, it would otherwise leak as an orphan for the rest of the run.
-        pkill -f "test/render_hook_test" 2>/dev/null
+        kill "$HOOK_BG" 2>/dev/null
+        wait "$HOOK_BG" 2>/dev/null
     fi
 
     say "render-hook check: catches a hook past the old fixed 32-byte window"
     # The check used to compare a fixed first-32-bytes window; it now
     # compares the symbol's whole ELF-declared size instead (see
-    # compare_render_symbol()). vkQueuePresentKHR is 81 bytes on real
+    # load_render_reference()). vkQueuePresentKHR is 81 bytes on real
     # systems -- patch offset 40 is comfortably past the old window and
     # comfortably inside the real function, so this specifically proves
     # the new capability, not just that hooks at byte 0 are still caught
@@ -489,6 +491,7 @@ if [ -n "$VK_PID" ]; then
     OFFFIFO=$(mktemp -u)
     mkfifo "$OFFFIFO"
     setsid ./test/render_hook_test libvulkan.so.1 vkQueuePresentKHR 40 >"$OFFFIFO" 2>&1 &
+    OFFHOOK_BG=$!
     OFFHOOK_LINE=$(timeout 5 head -n1 "$OFFFIFO")
     rm -f "$OFFFIFO"
     OFFHOOK_PID=$(printf '%s' "$OFFHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
@@ -503,7 +506,8 @@ if [ -n "$VK_PID" ]; then
         wait "$OFFHOOK_PID" 2>/dev/null
     else
         bad "offset-40 render_hook_test did not report READY (output: $OFFHOOK_LINE)"
-        pkill -f "test/render_hook_test" 2>/dev/null
+        kill "$OFFHOOK_BG" 2>/dev/null
+        wait "$OFFHOOK_BG" 2>/dev/null
     fi
 else
     say "no process with libvulkan loaded found on this machine, skipping both render-hook checks"
@@ -532,6 +536,7 @@ if [ -n "$GL_PID" ]; then
     GLFIFO=$(mktemp -u)
     mkfifo "$GLFIFO"
     setsid ./test/render_hook_test libGL.so.1 glXSwapBuffers >"$GLFIFO" 2>&1 &
+    GLHOOK_BG=$!
     GLHOOK_LINE=$(timeout 5 head -n1 "$GLFIFO")
     rm -f "$GLFIFO"
     GLHOOK_PID=$(printf '%s' "$GLHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
@@ -565,7 +570,8 @@ if [ -n "$GL_PID" ]; then
         wait "$GLHOOK_PID" 2>/dev/null
     else
         bad "GL render_hook_test did not report READY (output: $GLHOOK_LINE)"
-        pkill -f "test/render_hook_test" 2>/dev/null
+        kill "$GLHOOK_BG" 2>/dev/null
+        wait "$GLHOOK_BG" 2>/dev/null
     fi
 else
     say "no process with libGL loaded found on this machine, skipping both GLX render-hook checks"
@@ -594,6 +600,7 @@ if [ -n "$EGL_PID" ]; then
     EGLFIFO=$(mktemp -u)
     mkfifo "$EGLFIFO"
     setsid ./test/render_hook_test libEGL.so.1 eglSwapBuffers >"$EGLFIFO" 2>&1 &
+    EGLHOOK_BG=$!
     EGLHOOK_LINE=$(timeout 5 head -n1 "$EGLFIFO")
     rm -f "$EGLFIFO"
     EGLHOOK_PID=$(printf '%s' "$EGLHOOK_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
@@ -627,22 +634,147 @@ if [ -n "$EGL_PID" ]; then
         wait "$EGLHOOK_PID" 2>/dev/null
     else
         bad "EGL render_hook_test did not report READY (output: $EGLHOOK_LINE)"
-        pkill -f "test/render_hook_test" 2>/dev/null
+        kill "$EGLHOOK_BG" 2>/dev/null
+        wait "$EGLHOOK_BG" 2>/dev/null
     fi
 else
     say "no process with libEGL loaded found on this machine, skipping both EGL render-hook checks"
 fi
 
+# Launches render_hook_test with the given args. Sets RHT_PID (empty if it
+# never reported READY) and RHT_LINE (its first output line -- READY, or
+# the diagnostic it failed with). Called directly, not via $(...), so both
+# stay visible to the caller and the helper is this shell's own child.
+start_render_hook_test() {
+    RHT_FIFO=$(mktemp -u)
+    mkfifo "$RHT_FIFO"
+    # Non-interactive shells don't put background jobs in their own
+    # process group, so setsid execs in place and $! is the helper itself.
+    setsid ./test/render_hook_test "$@" >"$RHT_FIFO" 2>&1 &
+    RHT_BG=$!
+    RHT_LINE=$(timeout 5 head -n1 "$RHT_FIFO")
+    rm -f "$RHT_FIFO"
+    RHT_PID=$(printf '%s' "$RHT_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
+    if [ -z "$RHT_PID" ]; then
+        stop_render_hook_test
+    fi
+}
+
+# Kills and reaps the helper start_render_hook_test() launched, and
+# clears RHT_BG so cleanup() doesn't target a since-reused pid.
+stop_render_hook_test() {
+    [ -n "$RHT_BG" ] || return 0
+    kill "$RHT_BG" 2>/dev/null
+    wait "$RHT_BG" 2>/dev/null
+    RHT_BG=
+}
+
+say "render-hook check: a lower-addressed decoy mapping can't hide a hook (#84)"
+# The check used to take the lowest-addressed VMA whose basename merely
+# *started with* libvulkan.so as the library's base. A cheat could hook
+# the real vkQueuePresentKHR, then map a clean copy of the library below
+# it: the check parsed and read the decoy and compared clean against
+# clean. Now only executable mappings count, and every one is compared.
+# remap-anon covers the flip side: the symbol's page swapped for an
+# anonymous copy, so no file-backed mapping contains it any more.
+if ! make render-hook-test >/dev/null 2>&1; then
+    bad "could not build test/render_hook_test for the decoy checks"
+    DECOY_MODES=""
+else
+    DECOY_MODES="decoy-ro decoy-x remap-anon"
+fi
+for DECOY_MODE in $DECOY_MODES; do
+    start_render_hook_test libvulkan.so.1 vkQueuePresentKHR 0 "$DECOY_MODE"
+    DECOY_PID=$RHT_PID
+    if [ -z "$DECOY_PID" ]; then
+        # Only a missing Vulkan loader is an environment skip; a decoy
+        # mmap/dlinfo/mprotect failure is the test itself breaking.
+        if printf '%s' "$RHT_LINE" | grep -q '^render_hook_test: dlopen libvulkan\.so\.1:'; then
+            say "libvulkan.so.1 not loadable here, skipping $DECOY_MODE check"
+        else
+            bad "render_hook_test $DECOY_MODE did not start: $RHT_LINE"
+        fi
+        continue
+    fi
+    DECOY_OUT=$(./anticheat scan --pid "$DECOY_PID" --check-hooks 2>&1)
+    if printf '%s' "$DECOY_OUT" | grep -q "render hook (Vulkan)"; then
+        ok "hook with a $DECOY_MODE mapping correctly flagged (pid $DECOY_PID)"
+    else
+        bad "hook with a $DECOY_MODE mapping was NOT flagged (pid $DECOY_PID): $DECOY_OUT"
+    fi
+    stop_render_hook_test
+done
+
+say "render-hook check: a stray text page predicting into unrelated memory isn't a hook"
+# Every executable mapping predicts where the symbol is, including one
+# that maps only another page of the library's text by itself. That
+# prediction lands outside the library load -- here on an anonymous page
+# of 0xCC -- and a mismatch there must not override the clean real copy.
+if [ -x ./test/render_hook_test ]; then
+    start_render_hook_test libvulkan.so.1 vkQueuePresentKHR 0 stray-x
+    if [ -n "$RHT_PID" ]; then
+        STRAY_OUT=$(./anticheat scan --pid "$RHT_PID" --check-hooks 2>&1)
+        if printf '%s' "$STRAY_OUT" | grep -q "vkQueuePresentKHR clean"; then
+            ok "stray text page next to unrelated memory reads as clean (pid $RHT_PID)"
+        else
+            bad "stray text page made a clean library not clean (pid $RHT_PID): $STRAY_OUT"
+        fi
+        stop_render_hook_test
+    elif printf '%s' "$RHT_LINE" | grep -q '^render_hook_test: dlopen libvulkan\.so\.1:'; then
+        say "libvulkan.so.1 not loadable here, skipping stray-x check"
+    else
+        bad "render_hook_test stray-x did not start: $RHT_LINE"
+    fi
+fi
+
+say "render-hook check: lld layout (p_vaddr != p_offset) reads the right bytes (#85)"
+# st_value is a vaddr; it's only the file offset when the containing
+# PT_LOAD has p_vaddr == p_offset, which GNU ld's layout happens to give
+# and lld's does not. An untouched lld-linked library used to read as
+# hooked (a CRIT false positive fed to the ban pipeline). The fixture is
+# a stand-in libEGL.so.1 exporting eglSwapBuffers, linked with lld.
+if ! command -v clang >/dev/null 2>&1 || ! command -v ld.lld >/dev/null 2>&1; then
+    say "clang/ld.lld not available, skipping lld-layout render-hook checks"
+elif ! make lld-render-lib >/dev/null 2>&1; then
+    bad "clang and ld.lld are installed but test/lld/libEGL.so.1 failed to build"
+else
+    start_render_hook_test ./test/lld/libEGL.so.1 eglSwapBuffers 0 clean
+    LLD_PID=$RHT_PID
+    if [ -n "$LLD_PID" ]; then
+        LLD_OUT=$(./anticheat scan --pid "$LLD_PID" --check-hooks 2>&1)
+        if printf '%s' "$LLD_OUT" | grep -q "eglSwapBuffers clean"; then
+            ok "untouched lld-linked library reads as clean (pid $LLD_PID)"
+        else
+            bad "untouched lld-linked library not clean (pid $LLD_PID): $LLD_OUT"
+        fi
+        stop_render_hook_test
+    else
+        bad "lld render_hook_test (clean) did not start: $RHT_LINE"
+    fi
+    start_render_hook_test ./test/lld/libEGL.so.1 eglSwapBuffers 0
+    LLD_PID=$RHT_PID
+    if [ -n "$LLD_PID" ]; then
+        LLD_OUT=$(./anticheat scan --pid "$LLD_PID" --check-hooks 2>&1)
+        if printf '%s' "$LLD_OUT" | grep -q "render hook (EGL)"; then
+            ok "hooked lld-linked library correctly flagged (pid $LLD_PID)"
+        else
+            bad "hooked lld-linked library was NOT flagged (pid $LLD_PID): $LLD_OUT"
+        fi
+        stop_render_hook_test
+    else
+        bad "lld render_hook_test (hook) did not start: $RHT_LINE"
+    fi
+fi
+
 say "render-hook check: resolves a target-namespaced path correctly (not the host's)"
-# Proves the /proc/<pid>/root/ fix in compare_render_symbol(): create a
-# private mount namespace where a *different* (empty) file sits at the
-# same path the daemon would naively try to open from its own (host)
-# namespace, bind-mount the real libvulkan.so.1 over that path -- but
-# only inside the new namespace. A daemon that opens the raw path string
-# gets the wrong (empty, unopenable) file and can only report
-# "inconclusive"; one that resolves through /proc/<pid>/root/ gets the
-# real library the target process actually has mapped, and reports
-# clean. This needs `unshare --mount`, so skip gracefully if that fails
+# Proves load_render_reference() reads the file the target actually has
+# mapped: create a private mount namespace where a *different* (empty)
+# file sits at the same path the daemon would naively try to open from
+# its own (host) namespace, bind-mount the real libvulkan.so.1 over that
+# path -- but only inside the new namespace. A daemon that opens the raw
+# path string gets the wrong (empty, unopenable) file and can only report
+# "inconclusive"; one that opens /proc/<pid>/map_files/ gets the real
+# library the target process actually has mapped, and reports clean. This needs `unshare --mount`, so skip gracefully if that fails
 # rather than treating an unrelated environment gap as a real failure.
 NS_DIR="/tmp/ac_mount_ns_test_$$"
 make mount-ns-test >/dev/null 2>&1
