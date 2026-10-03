@@ -208,7 +208,9 @@ test/ioctl_fuzz: test/ioctl_fuzz.c src/anticheat.h
 # kernel/mock scan involved -- baseline_save_record()/baseline_load_records()/
 # baseline_find_record() are pure file I/O) and proves a second (inode,
 # offset) segment saved to the same path's baseline file doesn't clobber
-# the first. See test/baseline_test.c.
+# the first, and (#86) that a baselined mapping split with madvise() is
+# still verified as one run -- patched-then-split is a mismatch, a hole
+# in the baselined range is unverifiable/CRIT. See test/baseline_test.c.
 baseline-test: test/baseline_test
 	./test/baseline_test
 

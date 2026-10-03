@@ -794,48 +794,6 @@ static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out
     return n;
 }
 
-/* size must be the same capped hash length the caller is about to hash
- * (or already hashed) -- a mapping that keeps the same (inode, offset)
- * but changes size (e.g. a rebuilt library at the same install path,
- * loaded before its updated baseline was saved) would otherwise have its
- * *old* record matched by inode/offset alone and hashed over a different
- * byte range than what was saved, reporting a content-mismatch ALERT for
- * what is really just a stale/incompatible baseline.
- *
- * out_size_mismatch (may be NULL) is set to 1 on a "not found" return if
- * some record at this exact (inode, offset) exists but none of them match
- * `size` -- as opposed to no record at this (inode, offset) at all.
- * Without this, "never baselined" and "baselined, but for a size that no
- * longer matches (rebuilt/remapped since)" would be indistinguishable to
- * the caller, silently dropping integrity coverage after a rebuild
- * without ever telling the operator to re-run --save. */
-static int baseline_find_record(const struct ac_baseline_rec *recs, int n,
-                                 unsigned long long inode, unsigned long long offset,
-                                 unsigned long long size, char hex_out[65],
-                                 int *out_size_mismatch)
-{
-    int i;
-    int saw_offset_match = 0;
-
-    if (out_size_mismatch)
-        *out_size_mismatch = 0;
-    for (i = 0; i < n; i++) {
-        if (recs[i].inode != inode || recs[i].offset != offset)
-            continue;
-        if (recs[i].size != size) {
-            saw_offset_match = 1;  /* keep looking -- a same-(inode,offset)
-                                     * different-sized segment's record is
-                                     * not this segment's, just stale */
-            continue;
-        }
-        snprintf(hex_out, 65, "%s", recs[i].hex);
-        return 1;
-    }
-    if (out_size_mismatch)
-        *out_size_mismatch = saw_offset_match;
-    return 0;
-}
-
 /* baseline_save_record()'s "file already holds AC_BASELINE_MAX_RECORDS
  * *other* segments' records" case -- distinct from a plain I/O failure
  * (errno-bearing, return -1) so cmd_scan can tell the operator what
@@ -976,6 +934,156 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
     flock(lock_fd, LOCK_UN);
     close(lock_fd);
     return 0;
+}
+
+/* Verifying baselines per *run*, not per VMA (#86).
+ *
+ * A baseline record covers the (inode, file-offset range) one executable
+ * VMA had at --save time. Matching it only against a VMA with that exact
+ * (inode, offset, size) let a cheat patch text and then split the VMA
+ * with madvise(MADV_DONTFORK) on one page (the differing VM_DONTCOPY flag
+ * keeps the pieces from re-merging, and they all stay R-X): the first
+ * fragment hit the "different mapping size" WARNING path and every later
+ * fragment had no record at its offset at all, so a baselined mapping
+ * went from CRIT to WARNING/silence.
+ *
+ * A split doesn't move anything, though: the fragments stay virtually
+ * adjacent with contiguous file offsets. So executable file-backed VMAs
+ * are first coalesced back into maximal runs of that shape, and each
+ * record is checked against the run that contains its file range,
+ * hashing across the fragment boundaries (/proc/<pid>/mem doesn't care
+ * about VMA edges). Splitting therefore changes nothing about the
+ * verdict. A record that overlaps a run but isn't fully inside it (a
+ * fragment was unmapped, remapped elsewhere or made non-executable)
+ * can no longer be verified, and is reported as such at CRIT, not
+ * quietly downgraded. */
+struct ac_bl_vma {
+    unsigned long long start;
+    unsigned long long end;
+    unsigned long long offset;
+    unsigned long long inode;
+    char path[AC_VMA_PATH];
+};
+
+/* The executable file-backed VMAs of the process being checked, gathered
+ * from the scan snapshot before any run is verified. Static for the same
+ * reason as hash_proc_mem()'s buffer: ~650 KiB is too much stack, and
+ * the daemon is single-threaded. */
+static struct ac_bl_vma g_bl_vmas[AC_MAX_VMAS];
+
+/* Index one past the last VMA of the run starting at v[i]: the following
+ * entries extend it while they map the same file, start exactly where
+ * the previous one ended, and continue its file offsets. Callers only
+ * pass executable file-backed VMAs, in address order, so a fragment
+ * made non-executable (or unmapped) shows up here as a gap that ends
+ * the run. */
+static int baseline_run_end(const struct ac_bl_vma *v, int nv, int i)
+{
+    int j = i + 1;
+
+    while (j < nv && v[j].inode == v[i].inode &&
+           strcmp(v[j].path, v[i].path) == 0 &&
+           v[j].start == v[j - 1].end &&
+           v[j].offset == v[j - 1].offset + (v[j - 1].end - v[j - 1].start))
+        j++;
+    return j;
+}
+
+enum {
+    AC_BL_UNBASELINED,  /* no record overlaps this run */
+    AC_BL_LEGACY,       /* none, but the file holds pre-#51 records */
+    AC_BL_OK,           /* every record inside the run matched */
+    AC_BL_HASH_FAILED,  /* a record's range couldn't be read */
+    AC_BL_PARTIAL,      /* records overlap the run, none fit inside it */
+    AC_BL_MISMATCH,     /* a record's content differs */
+};
+
+struct ac_bl_run_result {
+    int verdict;
+    /* The record `verdict` is about (MISMATCH, PARTIAL, HASH_FAILED). */
+    unsigned long long off, size;
+    /* MISMATCH only: no record has exactly this run's (capped) extent,
+     * i.e. the mapping is also a different size than when it was saved
+     * -- worth a "rebuilt in place? re-run --save" hint on the CRIT. */
+    int len_changed;
+};
+
+/* Check every baseline record for the run v[i..j) against memory.
+ * *mem_fd is opened lazily from /proc/<pid>/mem the first time a record
+ * actually needs hashing (most runs have none), and left open for the
+ * caller to reuse and close; -1 means "not opened yet", -2 "open failed,
+ * don't retry". The worst verdict wins (enum order above). */
+static void baseline_check_run(const struct ac_bl_vma *v, int i, int j,
+                               int pid, int *mem_fd,
+                               struct ac_bl_run_result *res)
+{
+    static struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
+    unsigned long long rs = v[i].offset;
+    unsigned long long re = v[j - 1].offset + (v[j - 1].end - v[j - 1].start);
+    unsigned long long run_len = re - rs;
+    char blpath[PATH_MAX], hex[65];
+    int k, n, legacy = 0, covered = 0, partial = -1;
+
+    memset(res, 0, sizeof(*res));
+    res->verdict = AC_BL_UNBASELINED;
+    if (run_len > AC_HASH_CAP)
+        run_len = AC_HASH_CAP;
+    res->len_changed = 1;
+
+    baseline_path_for(v[i].path, blpath);
+    n = baseline_load_records(blpath, recs, &legacy);
+    for (k = 0; k < n; k++) {
+        const struct ac_baseline_rec *r = &recs[k];
+        int verdict;
+
+        if (r->inode != v[i].inode || r->size == 0 ||
+            r->offset + r->size < r->offset)
+            continue;
+        if (r->offset + r->size <= rs || r->offset >= re)
+            continue;                       /* another segment's record */
+        if (r->offset < rs || r->offset + r->size > re) {
+            if (partial < 0)
+                partial = k;
+            continue;
+        }
+
+        covered++;
+        if (r->offset == rs && r->size == run_len)
+            res->len_changed = 0;
+        if (*mem_fd == -1) {
+            char mem_path[64];
+
+            snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+            *mem_fd = open(mem_path, O_RDONLY);
+            if (*mem_fd < 0)
+                *mem_fd = -2;
+        }
+        if (*mem_fd < 0 ||
+            hash_proc_mem(*mem_fd, v[i].start + (r->offset - rs), r->size,
+                          hex) < 0)
+            verdict = AC_BL_HASH_FAILED;
+        else if (strcmp(hex, r->hex) != 0)
+            verdict = AC_BL_MISMATCH;
+        else
+            verdict = AC_BL_OK;
+        if (verdict > res->verdict) {
+            res->verdict = verdict;
+            res->off = r->offset;
+            res->size = r->size;
+        }
+    }
+
+    /* A partly-overlapping record only matters if nothing fits the run:
+     * two records can legitimately share an offset at different sizes
+     * (see baseline_save_record()), and the one this mapping was saved
+     * as is the one that fits. */
+    if (!covered && partial >= 0) {
+        res->verdict = AC_BL_PARTIAL;
+        res->off = recs[partial].offset;
+        res->size = recs[partial].size;
+    } else if (res->verdict == AC_BL_UNBASELINED && legacy) {
+        res->verdict = AC_BL_LEGACY;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1972,8 +2080,9 @@ static int cmd_scan(int argc, char **argv)
     int do_vklayers = 0, do_implicit = 0;
     char exe[PATH_MAX] = "";
     char *exe_link;
-    unsigned int v;
-    int mem_fd = -1;
+    unsigned int v, scanned = 0;
+    int mem_fd = -1, nv = 0;
+    struct ac_bl_vma *vmas = g_bl_vmas;
 
     for (i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--pid") == 0) {
@@ -2059,6 +2168,7 @@ static int cmd_scan(int argc, char **argv)
         if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0)
             break;
         vi = &g.vma;
+        scanned++;
 
         if ((vi->flags & AC_VM_EXEC) && (vi->flags & AC_VM_WRITE))
             printf("  [!] RWX [%#llx-%#llx] %s\n",
@@ -2068,6 +2178,15 @@ static int cmd_scan(int argc, char **argv)
         else if ((vi->flags & AC_VM_EXEC) && g_verbose)
             printf("  exec [%#llx-%#llx] %s\n",
                    vi->start, vi->end, vi->path[0] ? vi->path : "(anonymous)");
+
+        if (do_hash && do_check && (vi->flags & AC_VM_EXEC) && vi->is_file) {
+            vmas[nv].start = vi->start;
+            vmas[nv].end = vi->end;
+            vmas[nv].offset = vi->offset;
+            vmas[nv].inode = vi->inode;
+            snprintf(vmas[nv].path, sizeof(vmas[nv].path), "%s", vi->path);
+            nv++;
+        }
 
         if (do_hash && (vi->flags & AC_VM_EXEC) && vi->is_file) {
             char hex[65], blpath[PATH_MAX];
@@ -2100,36 +2219,64 @@ static int cmd_scan(int argc, char **argv)
                 else
                     printf("    baseline saved: %s\n", blpath);
             }
-            if (do_check) {
-                struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
-                char bhex[65];
-                int legacy = 0, size_mismatch = 0;
-                int n = baseline_load_records(blpath, recs, &legacy);
-
-                if (!baseline_find_record(recs, n, vi->inode, vi->offset, size,
-                                           bhex, &size_mismatch)) {
-                    if (legacy)
-                        printf("    legacy-format baseline for %s"
-                               " -- re-run --save to regenerate\n", vi->path);
-                    else if (size_mismatch)
-                        printf("    baseline for %s at offset %#llx was saved"
-                               " for a different mapping size (rebuilt or"
-                               " remapped?) -- re-run --save\n",
-                               vi->path, vi->offset);
-                    else
-                        printf("    no baseline for %s at offset %#llx"
-                               " (run with --save first)\n", vi->path, vi->offset);
-                    continue;
-                }
-                if (strcmp(bhex, hex) != 0)
-                    printf("    [ALERT] memory content differs from baseline"
-                           " (possible runtime patching)\n");
-                else
-                    printf("    ok: matches baseline\n");
-            }
         }
     }
     (void)ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL); /* END only frees snapshot; failure is non-fatal */
+
+    /* --check verifies per run of executable file-backed VMAs, not per
+     * VMA, so a split mapping is checked against the record it was saved
+     * as (#86) -- see baseline_check_run(). */
+    if (do_hash && do_check) {
+        int complete = !b.truncated && scanned == b.n_vmas;
+        int r, rend;
+
+        if (mem_fd < 0)
+            mem_fd = -2;   /* already reported above; don't retry */
+        for (r = 0; r < nv; r = rend) {
+            struct ac_bl_run_result res;
+            unsigned long long rs = vmas[r].offset;
+
+            rend = baseline_run_end(vmas, nv, r);
+            baseline_check_run(vmas, r, rend, host_pid, &mem_fd, &res);
+            switch (res.verdict) {
+            case AC_BL_UNBASELINED:
+                printf("  %s (offset %#llx): no baseline"
+                       " (run with --save first)\n", vmas[r].path, rs);
+                break;
+            case AC_BL_LEGACY:
+                printf("  %s: legacy-format baseline"
+                       " -- re-run --save to regenerate\n", vmas[r].path);
+                break;
+            case AC_BL_OK:
+                printf("  %s (offset %#llx): ok: matches baseline\n",
+                       vmas[r].path, rs);
+                break;
+            case AC_BL_HASH_FAILED:
+                printf("  %s (offset %#llx): hash failed -- cannot check"
+                       " against baseline\n", vmas[r].path, res.off);
+                break;
+            case AC_BL_PARTIAL:
+                if (!complete && rend == nv) {
+                    printf("  %s: VMA snapshot incomplete -- cannot check"
+                           " against baseline\n", vmas[r].path);
+                    break;
+                }
+                printf("  [ALERT] %s: baselined range %#llx..%#llx is only"
+                       " partly mapped executable -- cannot verify (split and"
+                       " unmapped/remapped since --save? if rebuilt in place,"
+                       " re-run --save)\n",
+                       vmas[r].path, res.off, res.off + res.size);
+                break;
+            case AC_BL_MISMATCH:
+                printf("  [ALERT] %s (offset %#llx): memory content differs"
+                       " from baseline (possible runtime patching)%s\n",
+                       vmas[r].path, res.off,
+                       res.len_changed ? "; mapping size also changed since"
+                       " --save (rebuilt in place? re-run --save)" : "");
+                break;
+            }
+        }
+    }
     if (mem_fd >= 0)
         close(mem_fd);
 
@@ -3528,6 +3675,7 @@ static int scan_protected_periodic(void)
  * clean -- this only re-checks what someone already vouched for. */
 static int check_baselines_periodic(void)
 {
+    struct ac_bl_vma *vmas = g_bl_vmas;
     struct ac_prot_list pl;
     unsigned int i;
 
@@ -3538,92 +3686,91 @@ static int check_baselines_periodic(void)
     for (i = 0; i < pl.count; i++) {
         struct ac_scan_begin b;
         unsigned int v;
+        int nv, r, rend, complete;
         int mem_fd = -1;
-        int mem_open_failed = 0;
 
         memset(&b, 0, sizeof(b));
         b.pid = pl.items[i].pid;
         if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) != 0)
             continue;
         b.n_vmas = clamp_vma_count(b.n_vmas);
+        nv = 0;
+        complete = !b.truncated;
         for (v = 0; v < b.n_vmas; v++) {
             struct ac_scan_get g;
             struct ac_vma_info *vi;
-            char blpath[PATH_MAX], hex[65], bhex[65];
-            struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
-            uint64_t size;
-            int n, legacy = 0, size_mismatch = 0;
 
             memset(&g, 0, sizeof(g));
             g.pid = pl.items[i].pid;
             g.index = v;
-            if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0)
+            if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0) {
+                complete = 0;
                 break;
+            }
             vi = &g.vma;
             if (!(vi->flags & AC_VM_EXEC) || !vi->is_file)
                 continue;
+            vmas[nv].start = vi->start;
+            vmas[nv].end = vi->end;
+            vmas[nv].offset = vi->offset;
+            vmas[nv].inode = vi->inode;
+            snprintf(vmas[nv].path, sizeof(vmas[nv].path), "%s", vi->path);
+            nv++;
+        }
+        (void)ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL); /* END only frees snapshot; failure is non-fatal */
 
-            size = vi->end - vi->start;
-            if (size > AC_HASH_CAP)
-                size = AC_HASH_CAP;
+        for (r = 0; r < nv; r = rend) {
+            struct ac_bl_run_result res;
 
-            baseline_path_for(vi->path, blpath);
-            n = baseline_load_records(blpath, recs, &legacy);
-            if (!baseline_find_record(recs, n, vi->inode, vi->offset, size,
-                                       bhex, &size_mismatch)) {
-                if (legacy)
-                    logmsg(LOG_WARNING, "pid %d (%s): legacy-format baseline"
-                           " for %s -- run `scan --hash --save` to regenerate",
-                           pl.items[i].pid, pl.items[i].comm, vi->path);
-                else if (size_mismatch)
-                    logmsg(LOG_WARNING, "pid %d (%s): baseline for %s was"
-                           " saved for a different mapping size (rebuilt or"
-                           " remapped?) -- run `scan --hash --save` to regenerate",
-                           pl.items[i].pid, pl.items[i].comm, vi->path);
-                continue; /* nothing (compatible) saved for this segment */
-            }
-
-            /* Opened lazily on the first VMA that actually has a saved
-             * baseline, and reused for the rest of this pid's VMAs --
-             * most protected processes have at most a handful of
-             * baselined mappings out of possibly many VMAs, so this
-             * avoids an open() for every single one. mem_open_failed
-             * distinguishes "not tried yet" from "tried and failed" so a
-             * permission/ENOENT failure (the pid is gone, or raced past
-             * yama ptrace_scope) isn't retried on every remaining VMA of
-             * this same pid. */
-            if (mem_fd < 0) {
-                char mem_path[64];
-
-                if (mem_open_failed)
-                    continue;
-                snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem",
-                         pl.items[i].pid);
-                mem_fd = open(mem_path, O_RDONLY);
-                if (mem_fd < 0) {
-                    mem_open_failed = 1;
-                    continue;
-                }
-            }
-
-            if (hash_proc_mem(mem_fd, vi->start, size, hex) < 0) {
+            rend = baseline_run_end(vmas, nv, r);
+            baseline_check_run(vmas, r, rend, pl.items[i].pid, &mem_fd, &res);
+            switch (res.verdict) {
+            case AC_BL_LEGACY:
+                logmsg(LOG_WARNING, "pid %d (%s): legacy-format baseline"
+                       " for %s -- run `scan --hash --save` to regenerate",
+                       pl.items[i].pid, pl.items[i].comm, vmas[r].path);
+                break;
+            case AC_BL_HASH_FAILED:
                 /* Fail inconclusive, not silent: an unreadable segment is
                  * exactly the signal this checker exists to produce, and a
                  * deliberately-unreadable mapping must not vanish without a
                  * trace (see #23). */
                 logmsg(LOG_WARNING, "pid %d (%s): could not hash %s "
                        "-- skipping baseline check for this segment this cycle",
-                       pl.items[i].pid, pl.items[i].comm, vi->path);
-                continue;
-            }
-            if (strcmp(bhex, hex) != 0)
+                       pl.items[i].pid, pl.items[i].comm, vmas[r].path);
+                break;
+            case AC_BL_PARTIAL:
+                /* The snapshot stopped early (truncated, or a GET failed),
+                 * so the last run may just be cut off by that rather than
+                 * by anything the process did. */
+                if (!complete && rend == nv) {
+                    logmsg(LOG_WARNING, "pid %d (%s): VMA snapshot "
+                           "incomplete -- skipping baseline check for %s "
+                           "this cycle", pl.items[i].pid, pl.items[i].comm,
+                           vmas[r].path);
+                    break;
+                }
+                logmsg(LOG_CRIT, "pid %d (%s): baselined range of %s (file "
+                       "offset %#llx..%#llx) is only partly mapped executable"
+                       " -- cannot verify it against the saved baseline "
+                       "(split and unmapped/remapped since --save; if the "
+                       "library was rebuilt in place, run `scan --hash "
+                       "--save` to regenerate)",
+                       pl.items[i].pid, pl.items[i].comm, vmas[r].path,
+                       res.off, res.off + res.size);
+                break;
+            case AC_BL_MISMATCH:
                 logmsg(LOG_CRIT, "pid %d (%s): memory content of %s differs "
-                       "from saved baseline (possible runtime patching)",
-                       pl.items[i].pid, pl.items[i].comm, vi->path);
+                       "from saved baseline (possible runtime patching)%s",
+                       pl.items[i].pid, pl.items[i].comm, vmas[r].path,
+                       res.len_changed ? "; the mapping's size also changed"
+                       " since --save -- if the library was rebuilt in place,"
+                       " run `scan --hash --save` to regenerate" : "");
+                break;
+            }
         }
         if (mem_fd >= 0)
             close(mem_fd);
-        (void)ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL); /* END only frees snapshot; failure is non-fatal */
     }
     return 0;
 }
