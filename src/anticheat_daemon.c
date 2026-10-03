@@ -1003,11 +1003,11 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
 /* go stale across distros or loader versions since it's whatever the  */
 /* target itself is using, read fresh at check time.                   */
 /*                                                                      */
-/* Deliberately never dlopen()s that file: it's resolved through the   */
-/* *target's own* mount namespace (see load_render_reference() below), */
-/* which is not a trusted input -- a process can be set up so an       */
-/* attacker controls what's mounted at the path the kernel reports for */
-/* it. dlopen()ing an attacker-chosen file means running its           */
+/* Deliberately never dlopen()s that file: it's opened through the    */
+/* target's /proc/<pid>/map_files/ (see load_render_reference() below),*/
+/* i.e. whatever file the target chose to map, which is not a trusted  */
+/* input -- a process can map any file it likes under a library's     */
+/* name. dlopen()ing an attacker-chosen file means running its         */
 /* constructors (DT_INIT/.init_array) as root. The ELF section headers */
 /* and symbol table are parsed directly with plain pread() instead --  */
 /* pure data reads, no code from that file is ever executed.           */
@@ -1236,78 +1236,93 @@ struct ac_render_map {
  * decoy mappings can't push the real one out of view. */
 #define AC_RENDER_MAX_MAPS 16
 
-/* Reads `symbol`'s reference bytes from libpath, resolved via the
- * target's own /proc/<pid>/root/ (see below), into expected[] (at least
- * AC_HOOK_CHECK_MAX_BYTES). Compares the symbol's *entire* declared
- * length (its ELF st_size, clamped to [AC_HOOK_CHECK_MIN_BYTES,
- * AC_HOOK_CHECK_MAX_BYTES], or AC_HOOK_CHECK_DEFAULT_BYTES if the symbol
- * table has no usable size for it) rather than a fixed guess -- a
- * "detour"-style hook patching further into the function body than a
- * small fixed window would still be inside the function's own real
- * bytes, and would still be caught. Empirically, real present-call
- * functions are tiny (glXSwapBuffers is 17 bytes on a real system,
- * smaller than the old fixed 32-byte window -- meaning that window used
- * to read a few bytes *past* the real function into whatever follows
- * it, which this also fixes). The length is further clamped to what's
- * left of the symbol's file-backed segment. Refuses a file whose inode
- * isn't the one the kernel reported for the mapping: the path is just a
- * d_path() string, and whatever sits there now (a replaced file, a
- * truncated-path collision) isn't necessarily what's mapped. Fills
- * *loc and *checklen_out. Returns 0 on success, -1 if inconclusive. */
-static int load_render_reference(int pid, const char *libpath,
-                                  unsigned long long inode, const char *symbol,
-                                  struct ac_elf_loc *loc, unsigned char *expected,
-                                  size_t *checklen_out)
+/* Identity of the file one of the target's VMAs actually maps: device
+ * *and* inode, the pair that names a file (an inode number alone is only
+ * unique within one filesystem). */
+struct ac_map_id {
+    dev_t dev;
+    ino_t ino;
+};
+
+static void map_files_path(char *buf, size_t len, int pid,
+                           unsigned long long start, unsigned long long end)
 {
-    char nspath[AC_VMA_PATH + 32];
+    snprintf(buf, len, "/proc/%d/map_files/%llx-%llx", pid, start, end);
+}
+
+/* stat()s the file mapped at exactly [start, end) in pid through
+ * /proc/<pid>/map_files/, which follows the VMA's own struct file rather
+ * than re-resolving its d_path() string -- so it's the mapped file even
+ * if that path now names something else, is shadowed by a mount, or was
+ * unlinked. Needs CAP_SYS_ADMIN, which the daemon already requires for
+ * the kernel device. Returns 0 and fills *id, or -1 (no such VMA any
+ * more, not a regular file, no access) -- never a guess. */
+static int map_file_identity(int pid, unsigned long long start,
+                             unsigned long long end, struct ac_map_id *id)
+{
+    char p[64];
+    struct stat st;
+
+    map_files_path(p, sizeof(p), pid, start, end);
+    if (stat(p, &st) != 0 || !S_ISREG(st.st_mode))
+        return -1;
+    id->dev = st.st_dev;
+    id->ino = st.st_ino;
+    return 0;
+}
+
+/* Reads `symbol`'s reference bytes from the file mapped at m, opened
+ * through /proc/<pid>/map_files/ (see map_file_identity()), into
+ * expected[] (at least AC_HOOK_CHECK_MAX_BYTES). Compares the symbol's
+ * *entire* declared length (its ELF st_size, clamped to
+ * [AC_HOOK_CHECK_MIN_BYTES, AC_HOOK_CHECK_MAX_BYTES], or
+ * AC_HOOK_CHECK_DEFAULT_BYTES if the symbol table has no usable size for
+ * it) rather than a fixed guess -- a "detour"-style hook patching
+ * further into the function body than a small fixed window would still
+ * be inside the function's own real bytes, and would still be caught.
+ * Empirically, real present-call functions are tiny (glXSwapBuffers is
+ * 17 bytes on a real system, smaller than the old fixed 32-byte window
+ * -- meaning that window used to read a few bytes *past* the real
+ * function into whatever follows it, which this also fixes). The length
+ * is further clamped to what's left of the symbol's file-backed segment.
+ * Refuses the file unless it is still the one `id` names (the VMA may
+ * have been replaced since it was identified). Fills *loc and
+ * *checklen_out. Returns 0 on success, -1 if inconclusive. */
+static int load_render_reference(int pid, const struct ac_render_map *m,
+                                  const struct ac_map_id *id,
+                                  const char *symbol, struct ac_elf_loc *loc,
+                                  unsigned char *expected, size_t *checklen_out)
+{
+    char p[64];
+    struct stat st;
     uint64_t size;
     size_t checklen;
     int fd;
     ssize_t r;
 
-    /* libpath came from the kernel's d_path() on the target's VMA, which
-     * is just a string -- opening it directly from the daemon's own
-     * mount namespace trusts that whatever exists at that path here is
-     * the same file the target actually has mapped. For a process in a
-     * container/sandbox with a private bind-mount at that path, it can
-     * be a different file entirely (or nothing), and reading it as the
-     * reference would compare against the wrong bytes. Going through
-     * /proc/<pid>/root/ instead resolves the path exactly as the target
-     * process itself sees it -- for the common case of a target sharing
-     * the daemon's own namespace, /proc/<pid>/root is just "/", so this
-     * is a strict correctness fix with no downside there. Verified
-     * empirically (not assumed): a plain path collides with an unrelated
-     * host-side file across a private bind mount and silently returns
-     * the wrong content, while /proc/<pid>/root/<path> resolves to the
-     * real target-visible file, as root, via ordinary open()+read() --
-     * no setns() or any persistent namespace switch needed. */
-    snprintf(nspath, sizeof(nspath), "/proc/%d/root%s", pid, libpath);
-
-    /* nspath resolves through /proc/<pid>/root/, i.e. attacker-influenced
-     * content (see above): a FIFO with no writer would hang a plain
-     * O_RDONLY open() forever, stalling the whole periodic scan. Same
-     * pattern as the manifest scan -- open O_NONBLOCK so FIFOs return
-     * immediately, reject anything that isn't a regular file, then clear
-     * O_NONBLOCK so the subsequent pread() has plain blocking semantics.
-     * O_NOFOLLOW (already here) stays: unlike the loader manifests, a
-     * symlinked library reference is not something to follow into. */
-    fd = open(nspath, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    /* Not the d_path() string resolved through /proc/<pid>/root/ (the
+     * previous approach): that still only matched the file by inode
+     * number, so a same-numbered inode on another filesystem mounted at
+     * that path was accepted as the reference -- different bytes there
+     * fake a hook, matching attacker-chosen bytes hide one. map_files
+     * hands back the mapped file itself, whatever namespace, mount or
+     * unlink state its path is in. O_NONBLOCK and the S_ISREG check are
+     * belt-and-braces: a VMA can't map a FIFO, but this must never block
+     * the periodic scan on anything it opens. */
+    map_files_path(p, sizeof(p), pid, m->start, m->end);
+    fd = open(p, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0)
         return -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_dev != id->dev || st.st_ino != id->ino) {
+        close(fd);
+        return -1;
+    }
     {
-        struct stat st;
+        int fl = fcntl(fd, F_GETFL);
 
-        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-            (unsigned long long)st.st_ino != inode) {
-            close(fd);
-            return -1;
-        }
-        {
-            int fl = fcntl(fd, F_GETFL);
-
-            if (fl >= 0)
-                (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-        }
+        if (fl >= 0)
+            (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
     }
     if (elf_find_symbol_offset(fd, symbol, loc, &size) != 0) {
         close(fd);
@@ -1332,6 +1347,99 @@ static int load_render_reference(int pid, const char *libpath,
     return 0;
 }
 
+/* Decides whether `addr`, predicted from a mapping of file `id` whose
+ * vaddr-minus-file-offset is `delta`, really belongs to that library
+ * load -- not to unrelated memory that merely happens to sit where a
+ * stray mapping of the file points. A mismatch at an address outside
+ * the load is no evidence of a hook: a process that maps one later
+ * page of the library's text by itself predicts the symbol below that
+ * page, and whatever readable memory is there differs from the
+ * reference. Two shapes count as "in the load":
+ *
+ *   - the VMA holding addr maps this same file with the same delta:
+ *     the library's own text (patched in place, or clean);
+ *   - the VMA holding addr is something else (an anonymous RWX page
+ *     MAP_FIXED over the symbol's page, say), but it sits in a run of
+ *     contiguous VMAs bounded on *both* sides by mappings of this same
+ *     file: a hole punched inside the library's own mapped span, which
+ *     is what a page-replacing hook leaves behind.
+ *
+ * Takes its own VMA snapshot (only reached on a mismatch, so the
+ * common clean path never pays for it). A neighbour only counts as
+ * "this file" by map_files identity, not by the kernel's inode number
+ * alone. Returns 1 if addr is in the load, 0 otherwise -- including any
+ * snapshot or identity failure, which the caller treats as "this
+ * mapping predicts nothing", never as a hook. */
+static int render_addr_in_load(int pid, const struct ac_map_id *id,
+                               unsigned long long delta, unsigned long long addr)
+{
+    struct ac_scan_begin b;
+    unsigned long long prev_end = 0;
+    int left_ok = 0, in_hole = 0, ret = 0;
+    unsigned int v;
+
+    memset(&b, 0, sizeof(b));
+    b.pid = pid;
+    b.emit_events = 0;
+    if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) < 0)
+        return 0;
+    b.n_vmas = clamp_vma_count(b.n_vmas);
+    for (v = 0; v < b.n_vmas; v++) {
+        struct ac_scan_get g;
+        struct ac_vma_info *vi;
+        struct ac_map_id vid;
+        int same_file;
+
+        memset(&g, 0, sizeof(g));
+        g.pid = pid;
+        g.index = v;
+        if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0)
+            break;
+        vi = &g.vma;
+        /* Identity only via map_files, not the kernel's i_ino: on
+         * overlayfs the mapped (real) inode's number isn't what stat()
+         * reports. Only reached on a mismatch, so the stat()s are rare. */
+        same_file = vi->is_file &&
+                    map_file_identity(pid, vi->start, vi->end, &vid) == 0 &&
+                    vid.dev == id->dev && vid.ino == id->ino;
+
+        if (in_hole) {
+            /* Walking right from the hole: contiguous VMAs until one of
+             * this file closes it; any gap leaves it open. */
+            if (vi->start != prev_end)
+                break;
+            if (same_file) {
+                ret = 1;
+                break;
+            }
+            prev_end = vi->end;
+            continue;
+        }
+        if (vi->end <= addr) {
+            /* left_ok: the contiguous run ending at this VMA reaches
+             * back to a mapping of this file with no gap in between. */
+            if (vi->start != prev_end)
+                left_ok = 0;
+            if (same_file)
+                left_ok = 1;
+            prev_end = vi->end;
+            continue;
+        }
+        if (vi->start > addr)
+            break;                /* addr itself is unmapped */
+        if (same_file && vi->start - vi->offset == delta) {
+            ret = 1;              /* the library's own text */
+            break;
+        }
+        if (vi->start != prev_end || !left_ok)
+            break;
+        in_hole = 1;
+        prev_end = vi->end;
+    }
+    (void)ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+    return ret;
+}
+
 /* Compares the symbol's live bytes (via the target's /proc/<pid>/mem,
  * memfd) at the address one executable mapping says it's at, against
  * the reference. That address is start + (file_off - offset): every
@@ -1342,15 +1450,21 @@ static int load_render_reference(int pid, const char *libpath,
  * with patched code over just the page holding the function, leaving
  * the file-backed text split around a hole; the neighbouring pieces
  * still point into the hole, so the hook is read and caught instead of
- * the check finding "no mapping contains the symbol". A mapping whose
- * file range doesn't overlap the symbol's segment at all (some other
- * segment of the file) predicts nothing and returns -2. Returns 1 if
+ * the check finding "no mapping contains the symbol". The flip side is
+ * that a prediction is only that: a mismatch counts as a hook only once
+ * render_addr_in_load() confirms the address (start and end of the
+ * compared range) is the library's own text or a hole inside its span.
+ * A mapping whose file range doesn't overlap the symbol's segment at
+ * all (some other segment of the file), or whose mismatching prediction
+ * lands outside the load, predicts nothing and returns -2. Returns 1 if
  * hooked, 0 if clean, -1 if inconclusive (nothing readable there). */
-static int compare_render_map(int memfd, const struct ac_render_map *m,
+static int compare_render_map(int pid, int memfd, const struct ac_render_map *m,
+                               const struct ac_map_id *id,
                                const struct ac_elf_loc *loc,
                                const unsigned char *expected, size_t checklen)
 {
     unsigned char actual[AC_HOOK_CHECK_MAX_BYTES];
+    unsigned long long delta, addr;
     ssize_t r;
 
     if (m->end <= m->start || m->offset >= loc->seg_end ||
@@ -1359,11 +1473,17 @@ static int compare_render_map(int memfd, const struct ac_render_map *m,
         return -2;
     /* Unsigned wraparound is intended if file_off < offset; a garbage
      * address just fails the pread() below and reads as inconclusive. */
-    r = pread(memfd, actual, checklen,
-              (off_t)(m->start + (loc->file_off - m->offset)));
+    delta = m->start - m->offset;
+    addr = delta + loc->file_off;
+    r = pread(memfd, actual, checklen, (off_t)addr);
     if (r != (ssize_t)checklen)
         return -1;
-    return memcmp(expected, actual, checklen) != 0 ? 1 : 0;
+    if (memcmp(expected, actual, checklen) == 0)
+        return 0;
+    if (!render_addr_in_load(pid, id, delta, addr) ||
+        !render_addr_in_load(pid, id, delta, addr + checklen - 1))
+        return -2;
+    return 1;
 }
 
 struct ac_lib_result {
@@ -1375,21 +1495,24 @@ struct ac_lib_result {
 };
 
 /* Checks `symbol` in every executable mapping in res, grouping mappings
- * of the same file (inode + path) so each file's ELF is parsed once.
- * Returns 1 if the symbol's bytes at any mapping's predicted address
- * differ from the reference (hooked beats everything: a clean decoy
- * next to a hooked real mapping must not hide it), else -1 if any
+ * of the same file (map_files device + inode) so each file's ELF is
+ * parsed once. Returns 1 if the symbol's bytes at any mapping's
+ * predicted address differ from the reference and that address is
+ * confirmed to be in the library load (hooked beats everything: a clean
+ * decoy next to a hooked real mapping must not hide it), else -1 if any
  * comparison was inconclusive, the candidate list is incomplete, or no
- * mapping covered the symbol's segment, else 0. Silent by design -- callers
- * decide how (or whether) to surface the result, since the CLI's
- * one-shot `scan --check-hooks` and the daemon's silent-unless-hooked
- * periodic check want very different presentation of the same
- * underlying check. libpath_out (AC_VMA_PATH bytes) gets the path of
- * the hooked mapping, or the first mapping's otherwise. */
+ * mapping covered the symbol's segment, else 0. Silent by design --
+ * callers decide how (or whether) to surface the result, since the
+ * CLI's one-shot `scan --check-hooks` and the daemon's
+ * silent-unless-hooked periodic check want very different presentation
+ * of the same underlying check. libpath_out (AC_VMA_PATH bytes) gets
+ * the path of the hooked mapping, or the first mapping's otherwise. */
 static int check_render_lib(int pid, const struct ac_lib_result *res,
                              const char *symbol, char *libpath_out)
 {
     unsigned char expected[AC_HOOK_CHECK_MAX_BYTES];
+    struct ac_map_id ids[AC_RENDER_MAX_MAPS];
+    int id_ok[AC_RENDER_MAX_MAPS];
     char memp[64];
     int hooked = 0, inconclusive = res->incomplete, clean = 0;
     unsigned int i, j;
@@ -1408,28 +1531,37 @@ static int check_render_lib(int pid, const struct ac_lib_result *res,
         return -1;
 
     for (i = 0; i < res->n; i++) {
-        const struct ac_render_map *mi = &res->maps[i];
+        id_ok[i] = map_file_identity(pid, res->maps[i].start,
+                                     res->maps[i].end, &ids[i]) == 0;
+        if (!id_ok[i])
+            inconclusive = 1;
+    }
+
+    for (i = 0; i < res->n; i++) {
         struct ac_elf_loc loc = { 0, 0, 0 };
         size_t checklen = 0;
-        int ref_ok = 1;
+        int ref_ok;
 
+        if (!id_ok[i])
+            continue;
         for (j = 0; j < i; j++)
-            if (res->maps[j].inode == mi->inode &&
-                strcmp(res->maps[j].path, mi->path) == 0)
+            if (id_ok[j] && ids[j].dev == ids[i].dev &&
+                ids[j].ino == ids[i].ino)
                 break;
         if (j < i)
             continue;             /* already checked with its group */
 
-        if (load_render_reference(pid, mi->path, mi->inode, symbol,
-                                  &loc, expected, &checklen) != 0)
-            ref_ok = 0;
+        ref_ok = load_render_reference(pid, &res->maps[i], &ids[i], symbol,
+                                       &loc, expected, &checklen) == 0;
         for (j = i; j < res->n; j++) {
             const struct ac_render_map *mj = &res->maps[j];
             int r;
 
-            if (mj->inode != mi->inode || strcmp(mj->path, mi->path) != 0)
+            if (!id_ok[j] || ids[j].dev != ids[i].dev ||
+                ids[j].ino != ids[i].ino)
                 continue;
-            r = ref_ok ? compare_render_map(memfd, mj, &loc, expected, checklen)
+            r = ref_ok ? compare_render_map(pid, memfd, mj, &ids[i], &loc,
+                                            expected, checklen)
                        : -1;
             if (r == 1 && !hooked) {
                 hooked = 1;
@@ -1474,8 +1606,8 @@ static const struct {
 /* Exact soname match (#84): `base` must be `soname` itself or `soname`
  * followed by a numeric version (".1", ".1.3.275"), optionally with the
  * " (deleted)" suffix d_path() appends to an unlinked file -- that case
- * stays a candidate so it reads as inconclusive (reference can't be
- * opened) rather than as "not loaded". A plain prefix match let any
+ * stays a candidate rather than reading as "not loaded"; map_files
+ * still opens the unlinked file, so it is checked like any other. A plain prefix match let any
  * file named e.g. libvulkan.so.evil stand in for the library. */
 static int render_lib_name_matches(const char *base, const char *soname,
                                     size_t soname_len)

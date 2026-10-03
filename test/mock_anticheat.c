@@ -14,6 +14,8 @@
  *   geteuid/getuid               — returns 0 while AC_MOCK_ROOT=1
  *   process_vm_readv/writev      — denies protected pids (AC_EV_PROCESS_VM)
  *   pread/pread64                — fakes /proc/<pid>/mem for hook mock
+ *   stat/stat64 (+ the opens)    — resolves the hook mock's synthetic
+ *                                  VMA's /proc/<pid>/map_files/ entry
  *   opendir/readdir/closedir     — fakes implicit_layer.d for manifest mock
  *
  * State (protected list, lock, event queue) persists across CLI
@@ -800,9 +802,10 @@ static int do_ioctl(unsigned long req, void *arg)
                     vi.start = g_hook_base;
                     vi.end = g_hook_base + 0x100000;
                     vi.offset = 0;
-                    /* The daemon only trusts a reference file whose inode
-                     * matches the mapping's (#84), so report the real
-                     * inode of the /tmp copy it will open. */
+                    /* The daemon identifies the mapped file through
+                     * /proc/<pid>/map_files/ (redirected to the /tmp copy,
+                     * see map_files_redirect()); report the same inode
+                     * here so the snapshot is self-consistent. */
                     vi.inode = stat(tmp, &hst) == 0 ? (unsigned long long)hst.st_ino
                                                     : 0x12345;
                     vi.flags = 0x1 | AC_VM_EXEC; /* R+X */
@@ -810,7 +813,16 @@ static int do_ioctl(unsigned long req, void *arg)
                     { size_t _l = strlen(tmp); if (_l >= sizeof(vi.path)) _l = sizeof(vi.path)-1; memcpy(vi.path, tmp, _l); vi.path[_l]='\0'; }
                     snap = realloc(snap, (snap_n + 1) * sizeof(*snap));
                     if (snap) {
-                        snap[snap_n++] = vi;
+                        unsigned int at = 0;
+
+                        /* Keep the snapshot in address order, as the
+                         * kernel's VMA walk is. */
+                        while (at < snap_n && snap[at].start < vi.start)
+                            at++;
+                        memmove(&snap[at + 1], &snap[at],
+                                (snap_n - at) * sizeof(*snap));
+                        snap[at] = vi;
+                        snap_n++;
                         g_hook = hc;
                         snprintf(g_hook_tmp_path, sizeof(g_hook_tmp_path), "%s", tmp);
                     }
@@ -1057,6 +1069,43 @@ static int is_mock_path(const char *path)
     return strcmp(path, AC_DEV_PATH) == 0;
 }
 
+/* The hook mock's synthetic VMA maps nothing for real, so its
+ * /proc/<pid>/map_files/<start>-<end> entry doesn't exist; point it at
+ * the /tmp copy the VMA claims to map. Returns the path to use. */
+static const char *map_files_redirect(const char *path)
+{
+    char want[64];
+    const char *p;
+
+    if (!g_hook_tmp_path[0] || !getenv("AC_MOCK_HOOK_LIB") ||
+        strncmp(path, "/proc/", 6) != 0)
+        return path;
+    p = strstr(path, "/map_files/");
+    if (!p)
+        return path;
+    snprintf(want, sizeof(want), "%llx-%llx", g_hook_base,
+             g_hook_base + 0x100000);
+    return strcmp(p + 11, want) == 0 ? g_hook_tmp_path : path;
+}
+
+int stat(const char *path, struct stat *st)
+{
+    static int (*real)(const char *, struct stat *);
+
+    if (!real)
+        real = dlsym(RTLD_NEXT, "stat");
+    return real(map_files_redirect(path), st);
+}
+
+int stat64(const char *path, struct stat64 *st)
+{
+    static int (*real)(const char *, struct stat64 *);
+
+    if (!real)
+        real = dlsym(RTLD_NEXT, "stat64");
+    return real(map_files_redirect(path), st);
+}
+
 static int mock_open_common(void)
 {
     load_state();
@@ -1076,6 +1125,7 @@ int open(const char *path, int flags, ...)
         real = dlsym(RTLD_NEXT, "open");
     if (is_mock_path(path))
         return mock_open_common();
+    path = map_files_redirect(path);
     /* environ mock */
     if (getenv("AC_MOCK_ENVIRON") && is_environ_path(path)) {
         int fd = make_fake_environ_fd();
@@ -1110,6 +1160,7 @@ int open64(const char *path, int flags, ...)
         real = dlsym(RTLD_NEXT, "open64");
     if (is_mock_path(path))
         return mock_open_common();
+    path = map_files_redirect(path);
     if (getenv("AC_MOCK_ENVIRON") && is_environ_path(path)) {
         int fd = make_fake_environ_fd();
         if (fd >= 0) return fd;
@@ -1143,6 +1194,7 @@ int openat(int dirfd, const char *path, int flags, ...)
         real = dlsym(RTLD_NEXT, "openat");
     if (is_mock_path(path))
         return mock_open_common();
+    path = map_files_redirect(path);
     if (getenv("AC_MOCK_ENVIRON") && is_environ_path(path)) {
         int fd = make_fake_environ_fd();
         if (fd >= 0) return fd;
@@ -1176,6 +1228,7 @@ int openat64(int dirfd, const char *path, int flags, ...)
         real = dlsym(RTLD_NEXT, "openat64");
     if (is_mock_path(path))
         return mock_open_common();
+    path = map_files_redirect(path);
     if (getenv("AC_MOCK_ENVIRON") && is_environ_path(path)) {
         int fd = make_fake_environ_fd();
         if (fd >= 0) return fd;

@@ -27,6 +27,9 @@ cleanup() {
     [ -n "$MIGTEST_PID" ] && kill -9 "$MIGTEST_PID" 2>/dev/null
     [ -n "$SPAWNTEST_PID" ] && kill -9 "$SPAWNTEST_PID" 2>/dev/null
     [ -n "$CLONEVMTEST_PID" ] && kill -9 "$CLONEVMTEST_PID" 2>/dev/null
+    # render_hook_test sleeps forever after READY; an interrupted run
+    # must not leave it behind.
+    [ -n "$RHT_BG" ] && kill -9 "$RHT_BG" 2>/dev/null
     if [ -n "$CLONEVM_CHILD" ]; then
         ./anticheat unprotect --pid "$CLONEVM_CHILD" >/dev/null 2>&1
         kill -9 "$CLONEVM_CHILD" 2>/dev/null
@@ -653,9 +656,17 @@ start_render_hook_test() {
     rm -f "$RHT_FIFO"
     RHT_PID=$(printf '%s' "$RHT_LINE" | sed -n 's/^READY pid=\([0-9]*\)$/\1/p')
     if [ -z "$RHT_PID" ]; then
-        kill "$RHT_BG" 2>/dev/null
-        wait "$RHT_BG" 2>/dev/null
+        stop_render_hook_test
     fi
+}
+
+# Kills and reaps the helper start_render_hook_test() launched, and
+# clears RHT_BG so cleanup() doesn't target a since-reused pid.
+stop_render_hook_test() {
+    [ -n "$RHT_BG" ] || return 0
+    kill "$RHT_BG" 2>/dev/null
+    wait "$RHT_BG" 2>/dev/null
+    RHT_BG=
 }
 
 say "render-hook check: a lower-addressed decoy mapping can't hide a hook (#84)"
@@ -691,9 +702,30 @@ for DECOY_MODE in $DECOY_MODES; do
     else
         bad "hook with a $DECOY_MODE mapping was NOT flagged (pid $DECOY_PID): $DECOY_OUT"
     fi
-    kill "$DECOY_PID" 2>/dev/null
-    wait "$DECOY_PID" 2>/dev/null
+    stop_render_hook_test
 done
+
+say "render-hook check: a stray text page predicting into unrelated memory isn't a hook"
+# Every executable mapping predicts where the symbol is, including one
+# that maps only another page of the library's text by itself. That
+# prediction lands outside the library load -- here on an anonymous page
+# of 0xCC -- and a mismatch there must not override the clean real copy.
+if [ -x ./test/render_hook_test ]; then
+    start_render_hook_test libvulkan.so.1 vkQueuePresentKHR 0 stray-x
+    if [ -n "$RHT_PID" ]; then
+        STRAY_OUT=$(./anticheat scan --pid "$RHT_PID" --check-hooks 2>&1)
+        if printf '%s' "$STRAY_OUT" | grep -q "vkQueuePresentKHR clean"; then
+            ok "stray text page next to unrelated memory reads as clean (pid $RHT_PID)"
+        else
+            bad "stray text page made a clean library not clean (pid $RHT_PID): $STRAY_OUT"
+        fi
+        stop_render_hook_test
+    elif printf '%s' "$RHT_LINE" | grep -q '^render_hook_test: dlopen libvulkan\.so\.1:'; then
+        say "libvulkan.so.1 not loadable here, skipping stray-x check"
+    else
+        bad "render_hook_test stray-x did not start: $RHT_LINE"
+    fi
+fi
 
 say "render-hook check: lld layout (p_vaddr != p_offset) reads the right bytes (#85)"
 # st_value is a vaddr; it's only the file offset when the containing
@@ -715,8 +747,7 @@ else
         else
             bad "untouched lld-linked library not clean (pid $LLD_PID): $LLD_OUT"
         fi
-        kill "$LLD_PID" 2>/dev/null
-        wait "$LLD_PID" 2>/dev/null
+        stop_render_hook_test
     else
         bad "lld render_hook_test (clean) did not start: $RHT_LINE"
     fi
@@ -729,23 +760,21 @@ else
         else
             bad "hooked lld-linked library was NOT flagged (pid $LLD_PID): $LLD_OUT"
         fi
-        kill "$LLD_PID" 2>/dev/null
-        wait "$LLD_PID" 2>/dev/null
+        stop_render_hook_test
     else
         bad "lld render_hook_test (hook) did not start: $RHT_LINE"
     fi
 fi
 
 say "render-hook check: resolves a target-namespaced path correctly (not the host's)"
-# Proves the /proc/<pid>/root/ fix in load_render_reference(): create a
-# private mount namespace where a *different* (empty) file sits at the
-# same path the daemon would naively try to open from its own (host)
-# namespace, bind-mount the real libvulkan.so.1 over that path -- but
-# only inside the new namespace. A daemon that opens the raw path string
-# gets the wrong (empty, unopenable) file and can only report
-# "inconclusive"; one that resolves through /proc/<pid>/root/ gets the
-# real library the target process actually has mapped, and reports
-# clean. This needs `unshare --mount`, so skip gracefully if that fails
+# Proves load_render_reference() reads the file the target actually has
+# mapped: create a private mount namespace where a *different* (empty)
+# file sits at the same path the daemon would naively try to open from
+# its own (host) namespace, bind-mount the real libvulkan.so.1 over that
+# path -- but only inside the new namespace. A daemon that opens the raw
+# path string gets the wrong (empty, unopenable) file and can only report
+# "inconclusive"; one that opens /proc/<pid>/map_files/ gets the real
+# library the target process actually has mapped, and reports clean. This needs `unshare --mount`, so skip gracefully if that fails
 # rather than treating an unrelated environment gap as a real failure.
 NS_DIR="/tmp/ac_mount_ns_test_$$"
 make mount-ns-test >/dev/null 2>&1
