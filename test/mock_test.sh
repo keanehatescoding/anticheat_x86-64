@@ -281,6 +281,38 @@ else
     fail "start: expected exactly 1 SYSCALL-REDIRECT log line, got $redirect_crit_count"
 fi
 
+# Ring overflow (#89): AC_MOCK_FLOOD evicts the rising-edge SYSCALL-HOOK
+# event before the drain sees it, as a ptrace-denial flood would on the
+# real 256-entry overwrite-oldest ring. The daemon must log the drops and
+# then, one check period later, the still-hooked table level-triggered.
+# A 7s run crosses the second check (t=0, t=5).
+flood_out=$(timeout -k 2 --preserve-status 7 \
+    env AC_MOCK_HOOKED=1 AC_MOCK_REDIRECT=1 AC_MOCK_FLOOD=1 \
+    ./anticheat start --foreground 2>&1)
+if printf '%s' "$flood_out" | grep -q "event ring overflow"; then
+    pass "start: ring drops logged"
+else
+    fail "start: ring drops not logged"
+fi
+if [ "$(printf '%s' "$flood_out" | grep -c "SYSCALL-HOOK")" -eq 0 ] &&
+   [ "$(printf '%s' "$flood_out" | grep -c "still hooked")" -eq 1 ]; then
+    pass "start: evicted syscall hook logged level-triggered once"
+else
+    fail "start: evicted syscall hook not logged level-triggered exactly once"
+fi
+if [ "$(printf '%s' "$flood_out" | grep -c "still redirected")" -eq 1 ]; then
+    pass "start: evicted syscall redirect logged level-triggered once"
+else
+    fail "start: evicted syscall redirect not logged level-triggered exactly once"
+fi
+# ...and without a flood the ring event alone covers it: the hook and
+# redirect runs above must not also produce the level-triggered line.
+if printf '%s%s' "$hooked_out" "$redirect_out" | grep -q "still hooked\|still redirected"; then
+    fail "start: level-triggered syscall line fired without a lost event"
+else
+    pass "start: no level-triggered syscall line when the ring event arrived"
+fi
+
 # checksum_mismatch has no matching kernel event (see #63 review fix), so
 # unlike the two cases above this dedup is entirely daemon-side, in
 # check_syscalls_periodic()'s own rising-edge state -- a distinct code

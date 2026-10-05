@@ -2747,6 +2747,48 @@ static void sig_handler(int sig)
     g_stop = 1;
 }
 
+/* Level-triggered backstop for the ring's rising-edge syscall events
+ * (#89). The kernel emits AC_EV_SYSCALL_HOOK / AC_EV_SYSCALL_REDIRECT
+ * exactly once per slot transition, from inside AC_IOCTL_CHECK_SYSCALLS,
+ * and the ring overwrites its oldest entry when full -- so a flood of
+ * other events right after the hook goes in (repeated denied ptrace
+ * attaches, fork/exec churn) evicts the only record of it. An event
+ * already drained by someone else (`anticheat events`) or emitted before
+ * this daemon started is equally gone. *_accounted counts the slots the
+ * ring drain has actually logged; any excess the periodic check reports
+ * is a hook nobody logged. */
+struct ac_sys_level {
+    unsigned int accounted;   /* slots logged via the ring or by us */
+    unsigned int prev_excess; /* excess at the previous check */
+};
+static struct ac_sys_level g_hook_level, g_redirect_level;
+
+/* Returns 1 if the caller should log `cur` level-triggered now. The excess
+ * has to survive one full check period before it counts as lost: the
+ * event for a hook first seen by *this* check was only just pushed into
+ * the ring and the drain hasn't had a chance to log it yet. Waiting one
+ * period (with the drain running in between) keeps the normal case at
+ * exactly one log line, rising edge only (#52). Clamping on a decrease
+ * keeps a hook that is removed and later reinstalled countable again.
+ * Counts only, not slots: a hook moving from one slot to another between
+ * two checks keeps the count unchanged and is only covered by its ring
+ * event -- the kernel doesn't hand per-slot state to userspace. */
+static int sys_level_check(struct ac_sys_level *lv, unsigned int cur)
+{
+    unsigned int excess;
+
+    if (lv->accounted > cur)
+        lv->accounted = cur;
+    excess = cur - lv->accounted;
+    if (excess && lv->prev_excess) {
+        lv->accounted = cur;
+        lv->prev_excess = 0;
+        return 1;
+    }
+    lv->prev_excess = excess;
+    return 0;
+}
+
 static int check_syscalls_periodic(void)
 {
     /* Rising-edge state for a checksum-only compromise -- see below. */
@@ -2756,14 +2798,20 @@ static int check_syscalls_periodic(void)
     memset(&c, 0, sizeof(c));
     if (ioctl(dev_fd, AC_IOCTL_CHECK_SYSCALLS, &c) < 0)
         return -1;
-    /* Don't log hooked/redirected here: the kernel only emits
-     * AC_EV_SYSCALL_HOOK / AC_EV_SYSCALL_REDIRECT into the event ring on
-     * a rising edge (a new hook or in-text handler swap, not one already
-     * reported), and the main loop's ring drain already logs both at
-     * LOG_CRIT. Logging them here too would re-report the same
-     * persistent hook/redirect at CRIT on every poll (see #52).
-     *
-     * checksum_mismatch has no matching kernel event, though: it exists
+    /* hooked/redirected are normally logged by the main loop's ring
+     * drain, once per rising edge (see #52) -- logging them here on
+     * every poll would re-report the same persistent hook at CRIT every
+     * 5s. sys_level_check() only fires when that ring event never got
+     * logged at all (#89). */
+    if (sys_level_check(&g_hook_level, c.hooked))
+        logmsg(LOG_CRIT, "syscall table: %u slot(s) still hooked outside "
+               "core kernel text with no matching ring event logged "
+               "(event ring overflow?)", c.hooked);
+    if (sys_level_check(&g_redirect_level, c.redirected))
+        logmsg(LOG_CRIT, "syscall table: %u slot(s) still redirected "
+               "within core kernel text with no matching ring event "
+               "logged (event ring overflow?)", c.redirected);
+    /* checksum_mismatch has no matching kernel event at all: it exists
      * specifically to catch handler churn the per-slot walk (and so
      * those two events) didn't individually flag -- see anticheat.h's
      * comment on the field. Without a report here, that case is
@@ -2781,6 +2829,58 @@ static int check_syscalls_periodic(void)
         checksum_only_reported = 0;
     }
     return c.hooked;
+}
+
+/* Seconds on CLOCK_MONOTONIC, for scheduling the monitor loop's
+ * periodic checks (#88). time(NULL) is the realtime clock: a backwards
+ * step (NTP correcting an RTC that held local time on a dual-boot box,
+ * or anyone who can set the clock) after the next_* deadlines were set
+ * would keep `now >= next_*` false for the size of the step, silently
+ * halting every periodic check. CLOCK_MONOTONIC never steps; wall-clock
+ * time stays for log/report timestamps only. */
+static time_t monotonic_seconds(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
+}
+
+/* el.dropped is the kernel's cumulative overwrite-oldest count (#89).
+ * Every increase is events this daemon never saw -- possibly a deliberate
+ * flood to push a detection out of the ring -- so it is logged at
+ * LOG_CRIT and reported. Increases are batched to one line per
+ * AC_RING_DROP_LOG_SECS: during the flood itself, a line (and its
+ * synchronous ac_report()) per drain would slow the drain further. The
+ * hook/redirect events a flood evicts are recovered separately by
+ * sys_level_check(). */
+#define AC_RING_DROP_LOG_SECS 10
+
+static void note_ring_drops(unsigned int dropped)
+{
+    static int have_seen;
+    static unsigned int seen, pending;
+    static time_t next_log;
+    time_t now = monotonic_seconds();
+
+    if (!have_seen) {
+        /* Drops before this daemon started aren't ours to report as a
+         * flood; note them and take the count as the baseline. */
+        if (dropped)
+            logmsg(LOG_WARNING, "event ring dropped %u event(s) before "
+                   "the daemon started", dropped);
+        seen = dropped;
+        have_seen = 1;
+        return;
+    }
+    pending += dropped - seen;   /* unsigned: wrap-safe */
+    seen = dropped;
+    if (pending && now >= next_log) {
+        logmsg(LOG_CRIT, "event ring overflow: %u event(s) dropped before "
+               "the daemon could read them", pending);
+        pending = 0;
+        next_log = now + AC_RING_DROP_LOG_SECS;
+    }
 }
 
 static int check_modules_periodic(void)
@@ -3975,21 +4075,6 @@ static void ac_close_extra_fds(int keep_fd)
     }
 }
 
-/* Seconds on CLOCK_MONOTONIC, for scheduling the monitor loop's
- * periodic checks (#88). time(NULL) is the realtime clock: a backwards
- * step (NTP correcting an RTC that held local time on a dual-boot box,
- * or anyone who can set the clock) after the next_* deadlines were set
- * would keep `now >= next_*` false for the size of the step, silently
- * halting every periodic check. CLOCK_MONOTONIC never steps; wall-clock
- * time stays for log/report timestamps only. */
-static time_t monotonic_seconds(void)
-{
-    struct timespec ts;
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec;
-}
-
 /* Bounded reap for a child we just SIGKILLed (see ac_resolve_timeout()
  * below): waitpid(pid, NULL, 0) blocks indefinitely if the child is stuck
  * in uninterruptible sleep (D state) -- SIGKILL can't touch it there --
@@ -5030,6 +5115,7 @@ static int cmd_start(int argc, char **argv)
         time_t next_sys = 0, next_mod = 0, next_scan = 0, next_baseline = 0;
         time_t next_render = 0, next_preload = 0, next_vklayer = 0;
         time_t next_implicit = 0;
+        int sys_check_failing = 0;
 
         while (!g_stop) {
             struct ac_event_list el;
@@ -5072,11 +5158,27 @@ static int cmd_start(int argc, char **argv)
                     else
                         logmsg(LOG_INFO, "%s pid=%d comm=%s %s",
                                ev_type_str(e->type), e->pid, e->comm, e->data);
+                    if (e->type == AC_EV_SYSCALL_HOOK)
+                        g_hook_level.accounted++;
+                    else if (e->type == AC_EV_SYSCALL_REDIRECT)
+                        g_redirect_level.accounted++;
                 }
+                note_ring_drops(el.dropped);
             }
             now = monotonic_seconds();
             if (now >= next_sys) {
-                check_syscalls_periodic();
+                int rc = check_syscalls_periodic();
+
+                /* Log a failing check once per transition, not every 5s;
+                 * a check that can't run is a blind spot, not a clean
+                 * table. */
+                if (rc < 0 && !sys_check_failing)
+                    logmsg(LOG_WARNING, "periodic syscall table check "
+                           "failed: %s", strerror(errno));
+                else if (rc >= 0 && sys_check_failing)
+                    logmsg(LOG_INFO, "periodic syscall table check "
+                           "recovered");
+                sys_check_failing = rc < 0;
                 next_sys = now + 5;
             }
             if (now >= next_mod) {
