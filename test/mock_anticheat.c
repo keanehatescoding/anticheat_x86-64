@@ -17,6 +17,8 @@
  *   stat/stat64 (+ the opens)    — resolves the hook mock's synthetic
  *                                  VMA's /proc/<pid>/map_files/ entry
  *   opendir/readdir/closedir     — fakes implicit_layer.d for manifest mock
+ *   time                         — steps the realtime clock back while
+ *                                  AC_MOCK_CLOCK_STEP=1
  *
  * State (protected list, lock, event queue) persists across CLI
  * invocations in $AC_MOCK_STATE (default /tmp/ac_mock_state), mirroring
@@ -50,6 +52,12 @@
  *                       override anon_exec_count for SCAN_BEGIN; when set
  *                       the mock increments per-pid on each scan to
  *                       simulate growth for --jit downgrade tests
+ *   AC_MOCK_CLOCK_STEP=1
+ *                       once the first CHECK_SYSCALLS has run (so the
+ *                       daemon has set its next deadline), time() steps
+ *                       one hour backwards, and every CHECK_SYSCALLS
+ *                       prints "mock: CHECK_SYSCALLS" to stderr so a test
+ *                       can count periodic checks across the step (#88)
  */
 #define _GNU_SOURCE
 
@@ -89,6 +97,9 @@ struct mock_state {
 static struct mock_state S;
 static char state_path[PATH_MAX] = "/tmp/ac_mock_state";
 static int drain_count;
+/* Set by the first CHECK_SYSCALLS under AC_MOCK_CLOCK_STEP; time() then
+ * reports an hour in the past (see the time() interposer below). */
+static int clock_stepped;
 
 static void load_state(void)
 {
@@ -949,6 +960,10 @@ static int do_ioctl(unsigned long req, void *arg)
                        "mock: syscall[0] handler changed 0x1111 -> 0x2222 (still core text)");
         last_hook_count = c->hooked;
         last_redirect_count = c->redirected;
+        if (getenv("AC_MOCK_CLOCK_STEP")) {
+            fprintf(stderr, "mock: CHECK_SYSCALLS\n");
+            clock_stepped = 1;
+        }
         return 0;
     }
     case AC_IOCTL_GET_EVENTS: {
@@ -1431,6 +1446,24 @@ uid_t geteuid(void)
     if (!real)
         real = dlsym(RTLD_NEXT, "geteuid");
     return getenv("AC_MOCK_ROOT") ? 0 : real();
+}
+
+/* Realtime clock stepped backwards by an hour (#88): models NTP
+ * correcting an RTC that held local time, after the daemon's periodic
+ * deadlines were already set from the pre-step clock. */
+time_t time(time_t *tloc)
+{
+    static time_t (*real)(time_t *);
+    time_t t;
+
+    if (!real)
+        real = dlsym(RTLD_NEXT, "time");
+    t = real(NULL);
+    if (clock_stepped)
+        t -= 3600;
+    if (tloc)
+        *tloc = t;
+    return t;
 }
 
 uid_t getuid(void)

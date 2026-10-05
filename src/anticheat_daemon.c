@@ -3975,6 +3975,21 @@ static void ac_close_extra_fds(int keep_fd)
     }
 }
 
+/* Seconds on CLOCK_MONOTONIC, for scheduling the monitor loop's
+ * periodic checks (#88). time(NULL) is the realtime clock: a backwards
+ * step (NTP correcting an RTC that held local time on a dual-boot box,
+ * or anyone who can set the clock) after the next_* deadlines were set
+ * would keep `now >= next_*` false for the size of the step, silently
+ * halting every periodic check. CLOCK_MONOTONIC never steps; wall-clock
+ * time stays for log/report timestamps only. */
+static time_t monotonic_seconds(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
+}
+
 /* Bounded reap for a child we just SIGKILLed (see ac_resolve_timeout()
  * below): waitpid(pid, NULL, 0) blocks indefinitely if the child is stuck
  * in uninterruptible sleep (D state) -- SIGKILL can't touch it there --
@@ -5059,7 +5074,7 @@ static int cmd_start(int argc, char **argv)
                                ev_type_str(e->type), e->pid, e->comm, e->data);
                 }
             }
-            now = time(NULL);
+            now = monotonic_seconds();
             if (now >= next_sys) {
                 check_syscalls_periodic();
                 next_sys = now + 5;
