@@ -994,7 +994,7 @@ enum {
     AC_BL_LEGACY,       /* none, but the file holds pre-#51 records */
     AC_BL_OK,           /* every record inside the run matched */
     AC_BL_HASH_FAILED,  /* a record's range couldn't be read */
-    AC_BL_PARTIAL,      /* records overlap the run, none fit inside it */
+    AC_BL_PARTIAL,      /* a record overlaps the run where no fitting one covers it */
     AC_BL_MISMATCH,     /* a record's content differs */
 };
 
@@ -1021,8 +1021,11 @@ static void baseline_check_run(const struct ac_bl_vma *v, int i, int j,
     unsigned long long rs = v[i].offset;
     unsigned long long re = v[j - 1].offset + (v[j - 1].end - v[j - 1].start);
     unsigned long long run_len = re - rs;
+    /* What each record is to this run: 0 = elsewhere, 1 = fits, 2 = partly
+     * overlaps it. */
+    static unsigned char kind[AC_BASELINE_MAX_RECORDS];
     char blpath[PATH_MAX], hex[65];
-    int k, n, legacy = 0, covered = 0, partial = -1;
+    int k, n, legacy = 0;
 
     memset(res, 0, sizeof(*res));
     res->verdict = AC_BL_UNBASELINED;
@@ -1036,18 +1039,18 @@ static void baseline_check_run(const struct ac_bl_vma *v, int i, int j,
         const struct ac_baseline_rec *r = &recs[k];
         int verdict;
 
+        kind[k] = 0;
         if (r->inode != v[i].inode || r->size == 0 ||
             r->offset + r->size < r->offset)
             continue;
         if (r->offset + r->size <= rs || r->offset >= re)
             continue;                       /* another segment's record */
         if (r->offset < rs || r->offset + r->size > re) {
-            if (partial < 0)
-                partial = k;
+            kind[k] = 2;
             continue;
         }
 
-        covered++;
+        kind[k] = 1;
         if (r->offset == rs && r->size == run_len)
             res->len_changed = 0;
         if (*mem_fd == -1) {
@@ -1073,17 +1076,42 @@ static void baseline_check_run(const struct ac_bl_vma *v, int i, int j,
         }
     }
 
-    /* A partly-overlapping record only matters if nothing fits the run:
-     * two records can legitimately share an offset at different sizes
-     * (see baseline_save_record()), and the one this mapping was saved
-     * as is the one that fits. */
-    if (!covered && partial >= 0) {
-        res->verdict = AC_BL_PARTIAL;
-        res->off = recs[partial].offset;
-        res->size = recs[partial].size;
-    } else if (res->verdict == AC_BL_UNBASELINED && legacy) {
-        res->verdict = AC_BL_LEGACY;
+    /* A partly-overlapping record is excused only where records that fit
+     * the run cover its whole overlap with it: two records can
+     * legitimately share an offset at different sizes (see
+     * baseline_save_record()), and the one this mapping was saved as is
+     * the one that fits. Any byte of the overlap no fitting record hashed
+     * -- e.g. a patched page past a smaller same-offset record, with the
+     * larger record's tail unmapped -- leaves it PARTIAL. */
+    for (k = 0; k < n && res->verdict < AC_BL_PARTIAL; k++) {
+        unsigned long long lo, hi;
+        int m, grew = 1;
+
+        if (kind[k] != 2)
+            continue;
+        lo = recs[k].offset > rs ? recs[k].offset : rs;
+        hi = recs[k].offset + recs[k].size < re ?
+             recs[k].offset + recs[k].size : re;
+        /* Advance lo across fitting records until it reaches hi or
+         * nothing starts at or before it. */
+        while (lo < hi && grew) {
+            grew = 0;
+            for (m = 0; m < n; m++) {
+                if (kind[m] == 1 && recs[m].offset <= lo &&
+                    recs[m].offset + recs[m].size > lo) {
+                    lo = recs[m].offset + recs[m].size;
+                    grew = 1;
+                }
+            }
+        }
+        if (lo < hi) {
+            res->verdict = AC_BL_PARTIAL;
+            res->off = recs[k].offset;
+            res->size = recs[k].size;
+        }
     }
+    if (res->verdict == AC_BL_UNBASELINED && legacy)
+        res->verdict = AC_BL_LEGACY;
 }
 
 /* ------------------------------------------------------------------ */

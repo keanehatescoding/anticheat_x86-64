@@ -633,6 +633,38 @@ int main(void)
             verdict = check_self(st.st_ino, &nv, &nruns, &res);
             CHECK(verdict == AC_BL_OK, "#86: restored mapping matches again");
 
+            /* A smaller same-offset record that fits must not excuse the
+             * bytes only the larger, partly mapped record covered: save
+             * one for the first page alone, patch the second page, unmap
+             * the last. The first-page record still matches, but the
+             * patched page is executable and nothing verifies it. */
+            mfd = open("/proc/self/mem", O_RDONLY);
+            CHECK(mfd >= 0 &&
+                  hash_proc_mem(mfd, (uintptr_t)m, (uint64_t)pg, shex) == 0 &&
+                  baseline_save_record(sblpath, st.st_ino,
+                                       (unsigned long long)pg,
+                                       (unsigned long long)pg, shex) == 0,
+                  "#86: save a first-page-only record at the same offset");
+            if (mfd >= 0)
+                close(mfd);
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(verdict == AC_BL_OK,
+                  "#86: a smaller fitting record alongside the full one matches");
+            CHECK(mprotect(m + pg, (size_t)pg, PROT_READ | PROT_WRITE) == 0 &&
+                  (m[pg + 16] ^= 0xff, 1) &&
+                  mprotect(m + pg, (size_t)pg, PROT_READ | PROT_EXEC) == 0,
+                  "#86: patch the second page");
+            CHECK(munmap(m + pg * 3, (size_t)pg) == 0,
+                  "#86: munmap the last page");
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(nruns == 1, "#86: the shortened mapping is one run");
+            CHECK(verdict == AC_BL_PARTIAL,
+                  "#86: a fitting smaller record doesn't hide a patched page"
+                  " only the partly mapped record covers");
+            CHECK(res.off == (unsigned long long)pg &&
+                  res.size != (unsigned long long)pg,
+                  "#86: PARTIAL names the larger record, not the fitting one");
+
             /* Middle page unmapped: two runs, neither holds the record. */
             CHECK(munmap(m + pg, (size_t)pg) == 0, "#86: munmap a middle page");
             verdict = check_self(st.st_ino, &nv, &nruns, &res);
