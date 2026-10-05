@@ -484,20 +484,20 @@ static int make_fake_environ_fd(void)
     char *p, *save;
     if (!e || !*e) return -1;
     snprintf(tmp, sizeof(tmp), "%s", e);
-    /* entries separated by ';' or '\n' */
-    p = strtok_r(tmp, ";\n", &save);
-    while (p) {
+    /* entries separated by ';' or '\n'; an empty field (";;" or a
+     * leading ';') is kept as an empty envp entry -- a bare NUL, as
+     * execve() would leave it -- so tests can exercise that (#87) */
+    save = tmp;
+    while ((p = strsep(&save, ";\n")) != NULL) {
+        size_t l;
         /* trim leading spaces */
         while (*p == ' ' || *p == '\t') p++;
-        if (*p) {
-            size_t l = strlen(p);
-            if (off + l + 1 < sizeof(buf)) {
-                memcpy(buf + off, p, l);
-                off += l;
-                buf[off++] = '\0';
-            }
+        l = strlen(p);
+        if (off + l + 1 < sizeof(buf)) {
+            memcpy(buf + off, p, l);
+            off += l;
+            buf[off++] = '\0';
         }
-        p = strtok_r(NULL, ";\n", &save);
     }
     if (off == 0) return -1;
     return make_temp_fd_with_content(buf, off);
