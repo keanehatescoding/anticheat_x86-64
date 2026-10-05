@@ -294,6 +294,19 @@ if [ "$checksum_crit_count" -eq 1 ]; then
 else
     fail "start: expected exactly 1 checksum mismatch log line, got $checksum_crit_count"
 fi
+# Periodic scheduler on CLOCK_MONOTONIC (#88): AC_MOCK_CLOCK_STEP steps
+# time() an hour backwards right after the first syscall check sets its
+# 5s deadline. On wall-clock scheduling that deadline would sit an hour
+# in the future and the second check would never come; a 7s run must
+# still see both.
+step_out=$(timeout -k 2 --preserve-status 7 \
+    env AC_MOCK_CLOCK_STEP=1 ./anticheat start --foreground 2>&1)
+step_check_count=$(printf '%s' "$step_out" | grep -c "mock: CHECK_SYSCALLS")
+if [ "$step_check_count" -ge 2 ]; then
+    pass "start: periodic checks survive a backwards clock step ($step_check_count syscall checks)"
+else
+    fail "start: expected >=2 syscall checks across a backwards clock step, got $step_check_count"
+fi
 echo "== scan --check-hooks (mock) =="
 # shellcheck disable=SC2016 # $BASHPID is intentional: it must expand inside the inner bash -c, not the outer
 expect_out "scan --check-hooks hooked" "render hook" bash -c 'AC_MOCK_HOOK_LIB="libvulkan.so.1:vkQueuePresentKHR:hooked" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-hooks'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
