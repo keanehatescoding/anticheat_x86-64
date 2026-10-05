@@ -965,6 +965,54 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
     wake_up_interruptible(&ac_event_wq);
 }
 
+/* Per-type rate limit for denial events (#89). Each denied ptrace or
+ * process_vm_* call costs the caller nothing but a failed syscall, so a
+ * loop of them (from many processes, so kill-on-deny doesn't stop it)
+ * can fill the 256-entry ring and evict whatever else is in it -- the
+ * once-per-transition AC_EV_SYSCALL_HOOK above all. Only the *event* is
+ * limited: every call is still denied and the kill policy still
+ * applies. The limit is global per type, not per caller, since an
+ * attacker controls how many callers there are. Events suppressed in a
+ * window are counted into one summary event, pushed when the next one
+ * gets through; a flood that just stops leaves that summary unsent,
+ * which is fine -- the burst that did get through already shows it. */
+#define AC_DENY_EV_BURST  8     /* events per type per window */
+#define AC_DENY_EV_WINDOW HZ
+
+struct ac_deny_rl {
+    unsigned long window_start;
+    unsigned int  n;
+    unsigned int  suppressed;
+};
+static struct ac_deny_rl ac_deny_rl_ptrace, ac_deny_rl_vm;
+static DEFINE_SPINLOCK(ac_deny_rl_lock);
+
+/* Returns true if the caller may emit its event. *suppressed is set to
+ * the number of events dropped in the window that just closed (0 if
+ * none, or if the window hasn't closed), for the caller to report. */
+static bool ac_deny_event_allowed(struct ac_deny_rl *rl,
+                                  unsigned int *suppressed)
+{
+    unsigned long flags;
+    bool ok;
+
+    *suppressed = 0;
+    spin_lock_irqsave(&ac_deny_rl_lock, flags);
+    if (!rl->n || time_after(jiffies, rl->window_start + AC_DENY_EV_WINDOW)) {
+        *suppressed = rl->suppressed;
+        rl->suppressed = 0;
+        rl->n = 0;
+        rl->window_start = jiffies;
+    }
+    ok = rl->n < AC_DENY_EV_BURST;
+    if (ok)
+        rl->n++;
+    else
+        rl->suppressed++;
+    spin_unlock_irqrestore(&ac_deny_rl_lock, flags);
+    return ok;
+}
+
 static int ac_drain_events(struct ac_event_list *out)
 {
     unsigned long flags;
@@ -2114,6 +2162,7 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
     char tcomm[AC_MAX_COMM] = "?";
     char ccomm[AC_MAX_COMM];
     bool deny = false, kill = false, killed = false;
+    unsigned int suppressed;
     int rc;
 
     /* `args` is trusted only as far as regs->di actually points at a real
@@ -2157,9 +2206,15 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
      * twice, potentially tearing against a concurrent rename between the
      * two reads. */
     get_task_comm(ccomm, current);
-    ac_emit(AC_EV_PTRACE, (int)target, tcomm,
-            "ptrace req %ld by pid %d (%s) DENIED",
-            request, current->pid, ccomm);
+    if (ac_deny_event_allowed(&ac_deny_rl_ptrace, &suppressed)) {
+        if (suppressed)
+            ac_emit(AC_EV_PTRACE, (int)target, tcomm,
+                    "%u further ptrace denial(s) not logged (rate limit)",
+                    suppressed);
+        ac_emit(AC_EV_PTRACE, (int)target, tcomm,
+                "ptrace req %ld by pid %d (%s) DENIED",
+                request, current->pid, ccomm);
+    }
 
     killed = kill && (READ_ONCE(ac_policy) & 0x1);
     if (killed)
@@ -2230,6 +2285,7 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
     char tcomm[AC_MAX_COMM] = "?";
     char ccomm[AC_MAX_COMM];
     bool protected_target, killed;
+    unsigned int suppressed;
     int rc;
 
     /* Same nofault requirement as ac_ptrace_pre() above: `args` is only
@@ -2275,11 +2331,17 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
         return 0;
 
     get_task_comm(ccomm, current);
-    ac_emit(AC_EV_PROCESS_VM, target, tcomm,
-            "process_vm_%s by pid %d (%s) DENIED",
-            (p == &ac_kp_process_vm_readv32 ||
-             p == &ac_kp_process_vm_readv) ? "readv" : "writev",
-            current->pid, ccomm);
+    if (ac_deny_event_allowed(&ac_deny_rl_vm, &suppressed)) {
+        if (suppressed)
+            ac_emit(AC_EV_PROCESS_VM, target, tcomm,
+                    "%u further process_vm denial(s) not logged (rate limit)",
+                    suppressed);
+        ac_emit(AC_EV_PROCESS_VM, target, tcomm,
+                "process_vm_%s by pid %d (%s) DENIED",
+                (p == &ac_kp_process_vm_readv32 ||
+                 p == &ac_kp_process_vm_readv) ? "readv" : "writev",
+                current->pid, ccomm);
+    }
 
     killed = READ_ONCE(ac_policy) & 0x1;
     if (killed)

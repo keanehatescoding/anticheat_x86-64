@@ -58,6 +58,10 @@
  *                       one hour backwards, and every CHECK_SYSCALLS
  *                       prints "mock: CHECK_SYSCALLS" to stderr so a test
  *                       can count periodic checks across the step (#88)
+ *   AC_MOCK_FLOOD=1     every CHECK_SYSCALLS ends with a simulated event
+ *                       flood that overwrites the whole ring, evicting
+ *                       anything it just pushed (e.g. the rising-edge
+ *                       SYSCALL_HOOK) and bumping the drop count (#89)
  */
 #define _GNU_SOURCE
 
@@ -960,6 +964,13 @@ static int do_ioctl(unsigned long req, void *arg)
                        "mock: syscall[0] handler changed 0x1111 -> 0x2222 (still core text)");
         last_hook_count = c->hooked;
         last_redirect_count = c->redirected;
+        if (getenv("AC_MOCK_FLOOD")) {
+            /* The real ring overwrites oldest-first, so a flood of
+             * AC_MAX_EVENTS+ newer events leaves none of these behind. */
+            S.events_dropped_total += S.n_evq + AC_MAX_EVENTS;
+            S.n_evq = 0;
+            save_state();
+        }
         if (getenv("AC_MOCK_CLOCK_STEP")) {
             fprintf(stderr, "mock: CHECK_SYSCALLS\n");
             clock_stepped = 1;
