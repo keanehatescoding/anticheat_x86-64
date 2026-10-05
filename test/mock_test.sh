@@ -309,6 +309,12 @@ echo "== scan --check-preload / --check-vklayers / --check-implicit-layers (mock
 expect_out "scan --check-preload detects LD_PRELOAD" "LD_PRELOAD check: /tmp/evil.so" bash -c 'AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/evil.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 # shellcheck disable=SC2016
 expect_out "scan --check-preload not set" "not set" bash -c 'AC_MOCK_ENVIRON="EMPTY=1" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# An empty envp entry (a bare NUL in /proc/<pid>/environ) is valid and must
+# not end the scan -- a leading "" used to hide everything after it (#87).
+# shellcheck disable=SC2016
+expect_out "scan --check-preload sees past an empty environ entry" "LD_PRELOAD check: /tmp/evil.so" bash -c 'AC_MOCK_ENVIRON=";LD_PRELOAD=/tmp/evil.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# shellcheck disable=SC2016
+expect_out "scan --check-vklayers sees past empty environ entries" "VK_INSTANCE_LAYERS=VK_LAYER_test" bash -c 'AC_MOCK_ENVIRON="A=1;;;VK_INSTANCE_LAYERS=VK_LAYER_test" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-vklayers'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 # shellcheck disable=SC2016
 expect_out "scan --check-vklayers detects" "VK_INSTANCE_LAYERS=VK_LAYER_test" bash -c 'AC_MOCK_ENVIRON="VK_INSTANCE_LAYERS=VK_LAYER_test" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-vklayers'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 # shellcheck disable=SC2016

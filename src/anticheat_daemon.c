@@ -2957,8 +2957,14 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
         const char *entry = buf + pos;
         size_t entry_len = strlen(entry);
 
-        if (entry_len == 0)
-            break;   /* malformed/truncated read -- stop rather than misread */
+        /* An empty entry is a valid envp element (execve() passes ""
+         * through as a bare NUL), not end-of-data -- skip it and keep
+         * scanning, or a leading "" hides every variable after it
+         * (#87). The loop bound and `truncated` are what end the scan. */
+        if (entry_len == 0) {
+            pos++;
+            continue;
+        }
         for (i = 0; i < nvars; i++) {
             size_t nlen = strlen(vars[i].name);
 
