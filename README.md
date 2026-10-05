@@ -179,14 +179,21 @@ own record, keyed by `(inode, file offset, size)` rather than path alone
 independently-tracked record per segment instead of the last `--save`
 silently overwriting the others, and two mappings that happen to share a
 starting file offset at different lengths don't evict each other either.
-A mapping at a known `(inode, offset)` whose size no longer matches (e.g.
-the file was rebuilt at the same path) is treated as having no
-compatible baseline rather than hashed against a stale digest, and
-reported as such so an operator knows to re-run `--save`, same treatment
-given to a baseline saved by a daemon build predating per-segment
-records (pre-#51) and detected as a legacy, unreadable format. `--check`
-reports mappings whose runtime content differs from their segment's
-baseline — a strong signal of runtime code patching. `--save` itself is
+Records are verified against *runs*, not individual VMAs: executable
+mappings of the same file that are adjacent in memory with contiguous
+file offsets are coalesced first, and each record is hashed across
+whatever run holds its file range (#86). Splitting a mapping (e.g.
+`madvise(MADV_DONTFORK)` on one page of patched text, which keeps the
+pieces from re-merging) therefore changes nothing about the verdict. A
+record whose range is only partly mapped executable — a piece was
+unmapped, remapped elsewhere or made non-executable, or the file was
+rebuilt in place to a different size — can't be verified, and is
+reported at `LOG_CRIT` rather than downgraded to a warning or skipped. A
+baseline saved by a daemon build predating per-segment records (pre-#51)
+is detected as a legacy, unreadable format and reported so an operator
+knows to re-run `--save`. `--check` reports mappings whose runtime
+content differs from their segment's baseline — a strong signal of
+runtime code patching. `--save` itself is
 written via a same-directory temp file + `rename()` under an `flock()`
 held on the target file, so a write error, a killed process, or two
 concurrent `--save` runs against the same path can't corrupt or drop

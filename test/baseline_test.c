@@ -7,12 +7,7 @@
  * PT_LOAD segments: same inode/path, two different file offsets.
  *
  * Also covers coderabbit findings on the #51 fix itself:
- *   - baseline_find_record() must treat a size mismatch at the same
- *     (inode, offset) as an incompatible baseline, not a content diff.
- *   - ...and must report that distinctly (out_size_mismatch) from "no
- *     record at this (inode, offset) at all", so callers can tell the
- *     operator to re-run --save instead of silently dropping coverage.
- *   - baseline_save_record()/baseline_find_record() must key on the full
+ *   - baseline_save_record() must key on the full
  *     (inode, offset, size), not (inode, offset) alone, since two
  *     distinct VMAs can share a starting file offset at different sizes.
  *   - baseline_load_records() must tell a legacy pre-#51 3-field record
@@ -27,6 +22,12 @@
  *     baseline_load_records() (covers the atomic-rename path, though
  *     not the concurrent-writer locking itself).
  *
+ * #86: baseline_check_run() verifies a record across a *run* of adjacent,
+ * file-contiguous executable VMAs, so splitting a baselined mapping
+ * (madvise(MADV_DONTFORK)) after patching it can't downgrade the CRIT.
+ * Exercised against a real mmap(PROT_EXEC) of a temp file in this
+ * process, read back through /proc/self/mem.
+ *
  * Pulls anticheat_daemon.c in as-is (renaming its main() out of the way)
  * rather than re-implementing the record format, so this test breaks if
  * the real functions regress, not just if a duplicated copy does.
@@ -38,6 +39,7 @@
 #undef main
 
 #include <assert.h>
+#include <sys/mman.h>
 
 static int failures;
 
@@ -50,13 +52,92 @@ static int failures;
     } \
 } while (0)
 
+/* Exact (inode, offset, size) lookup, for checking what
+ * baseline_save_record() wrote. */
+static int find_rec(const struct ac_baseline_rec *recs, int n,
+                    unsigned long long inode, unsigned long long offset,
+                    unsigned long long size, char hex_out[65])
+{
+    int i;
+
+    for (i = 0; i < n; i++) {
+        if (recs[i].inode == inode && recs[i].offset == offset &&
+            recs[i].size == size) {
+            snprintf(hex_out, 65, "%s", recs[i].hex);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* This process's executable file-backed VMAs of `inode`, from
+ * /proc/self/maps -- the same shape check_baselines_periodic() builds
+ * from the module's scan snapshot. */
+static int collect_self(unsigned long long inode, struct ac_bl_vma *out,
+                        int max)
+{
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[512];
+    int nv = 0;
+
+    if (!f)
+        return 0;
+    while (nv < max && fgets(line, sizeof(line), f)) {
+        unsigned long long start, end, off, ino;
+        char perms[8], dev[16], path[AC_VMA_PATH] = "";
+
+        if (sscanf(line, "%llx-%llx %7s %llx %15s %llu %127s", &start, &end,
+                   perms, &off, dev, &ino, path) < 7)
+            continue;
+        if (ino != inode || !strchr(perms, 'x'))
+            continue;
+        out[nv].start = start;
+        out[nv].end = end;
+        out[nv].offset = off;
+        out[nv].inode = ino;
+        snprintf(out[nv].path, sizeof(out[nv].path), "%s", path);
+        nv++;
+    }
+    fclose(f);
+    return nv;
+}
+
+/* Verdict for this process's mapping(s) of `inode`, all expected to form
+ * the single run starting at the first one. */
+static int check_self(unsigned long long inode, int *nv_out, int *nruns_out,
+                      struct ac_bl_run_result *res)
+{
+    struct ac_bl_vma v[16];
+    int nv = collect_self(inode, v, 16);
+    int mem_fd = -1, r, nruns = 0, worst = AC_BL_UNBASELINED;
+
+    memset(res, 0, sizeof(*res));
+    for (r = 0; r < nv; ) {
+        struct ac_bl_run_result one;
+        int rend = baseline_run_end(v, nv, r);
+
+        baseline_check_run(v, r, rend, getpid(), &mem_fd, &one);
+        if (nruns == 0 || one.verdict > worst) {
+            worst = one.verdict;
+            *res = one;
+        }
+        nruns++;
+        r = rend;
+    }
+    if (mem_fd >= 0)
+        close(mem_fd);
+    *nv_out = nv;
+    *nruns_out = nruns;
+    return nv ? worst : -1;
+}
+
 int main(void)
 {
     char tmpdir[] = "/tmp/ac_baseline_test_XXXXXX";
     char blpath[PATH_MAX];
     struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
     char hex[65];
-    int n, i, legacy, size_mismatch;
+    int n, i, legacy;
 
     if (!mkdtemp(tmpdir)) {
         perror("mkdtemp");
@@ -83,23 +164,12 @@ int main(void)
     CHECK(n == 2, "both segments' records survive in the baseline file");
     CHECK(!legacy, "no legacy-format lines flagged for a fresh file");
 
-    CHECK(baseline_find_record(recs, n, 42, 0x1000, 0x2000, hex, NULL) &&
+    CHECK(find_rec(recs, n, 42, 0x1000, 0x2000, hex) &&
           strncmp(hex, "1111", 4) == 0,
           "segment 1's record is still intact after segment 2 was saved");
-    CHECK(baseline_find_record(recs, n, 42, 0x5000, 0x1000, hex, NULL) &&
+    CHECK(find_rec(recs, n, 42, 0x5000, 0x1000, hex) &&
           strncmp(hex, "2222", 4) == 0,
           "segment 2's record is present");
-
-    /* Same (inode, offset) as segment 1, but a different size (e.g. the
-     * file at this path was rebuilt) -- must NOT match segment 1's
-     * record and be hashed against a stale digest, and must be reported
-     * distinctly (out_size_mismatch) from "nothing saved for this
-     * (inode, offset) at all", so a caller can tell the operator to
-     * re-run --save instead of silently dropping coverage. */
-    size_mismatch = 0;
-    CHECK(!baseline_find_record(recs, n, 42, 0x1000, 0x9999, hex, &size_mismatch),
-          "a size mismatch at a known (inode, offset) is not treated as a match");
-    CHECK(size_mismatch, "the size mismatch is reported via out_size_mismatch");
 
     /* Re-saving segment 1 (e.g. after a legitimate update) replaces only
      * its own record, still without touching segment 2's. */
@@ -108,21 +178,12 @@ int main(void)
           "re-save segment 1");
     n = baseline_load_records(blpath, recs, &legacy);
     CHECK(n == 2, "record count unchanged after re-saving an existing segment");
-    CHECK(baseline_find_record(recs, n, 42, 0x1000, 0x2000, hex, NULL) &&
+    CHECK(find_rec(recs, n, 42, 0x1000, 0x2000, hex) &&
           strncmp(hex, "3333", 4) == 0,
           "segment 1's record was updated in place");
-    CHECK(baseline_find_record(recs, n, 42, 0x5000, 0x1000, hex, NULL) &&
+    CHECK(find_rec(recs, n, 42, 0x5000, 0x1000, hex) &&
           strncmp(hex, "2222", 4) == 0,
           "segment 2's record is untouched by re-saving segment 1");
-
-    /* A segment nobody ever saved a baseline for is correctly reported
-     * as absent (no size mismatch flagged -- there's no record at this
-     * offset at all to have mismatched), not confused with an unrelated
-     * offset's record. */
-    size_mismatch = 1;
-    CHECK(!baseline_find_record(recs, n, 42, 0x9000, 0x1000, hex, &size_mismatch),
-          "an offset with no saved record is not found");
-    CHECK(!size_mismatch, "no size-mismatch flagged when the offset itself is unknown");
 
     /* Two distinct file-backed VMAs can legitimately share a starting
      * file offset while covering different lengths (the same region
@@ -137,10 +198,10 @@ int main(void)
           "save a same-(inode,offset), size-0x3000 mapping");
     n = baseline_load_records(blpath, recs, &legacy);
     CHECK(n == 4, "both same-(inode,offset) different-size records are kept");
-    CHECK(baseline_find_record(recs, n, 99, 0x2000, 0x1000, hex, NULL) &&
+    CHECK(find_rec(recs, n, 99, 0x2000, 0x1000, hex) &&
           strncmp(hex, "5555", 4) == 0,
           "the size-0x1000 mapping's own record is found");
-    CHECK(baseline_find_record(recs, n, 99, 0x2000, 0x3000, hex, NULL) &&
+    CHECK(find_rec(recs, n, 99, 0x2000, 0x3000, hex) &&
           strncmp(hex, "6666", 4) == 0,
           "the size-0x3000 mapping's own record is found, not evicted by the other");
 
@@ -241,10 +302,10 @@ int main(void)
 
         n = baseline_load_records(conc_path, recs, &legacy);
         CHECK(n == 2, "concurrent writers: both segments survive");
-        CHECK(baseline_find_record(recs, n, 111, 0x1000, 0x1000, hex, NULL) &&
+        CHECK(find_rec(recs, n, 111, 0x1000, 0x1000, hex) &&
               strncmp(hex, "aaaa", 4) == 0,
               "concurrent writer 1's record intact");
-        CHECK(baseline_find_record(recs, n, 111, 0x2000, 0x1000, hex, NULL) &&
+        CHECK(find_rec(recs, n, 111, 0x2000, 0x1000, hex) &&
               strncmp(hex, "bbbb", 4) == 0,
               "concurrent writer 2's record intact");
     }
@@ -327,7 +388,7 @@ int main(void)
         CHECK(n == 1, "legacy line ignored, valid 4-field record loaded");
         CHECK(legacy, "legacy flag set when file contains a 3-field line");
         if (n == 1)
-            CHECK(baseline_find_record(recs, n, 0x2a, 0x1000, 0x2000, hex, NULL) &&
+            CHECK(find_rec(recs, n, 0x2a, 0x1000, 0x2000, hex) &&
                   strncmp(hex, "bbbb", 4) == 0,
                   "valid record after legacy line is retrievable");
 
@@ -468,6 +529,170 @@ int main(void)
         unlink(pathtmp);
         if (!ok)
             CHECK(0, "AC_HASH_CAP test: setup failed");
+    }
+
+
+    /* #86: a baselined mapping must stay verified when the process splits
+     * its VMA. Real file, real mmap(PROT_EXEC), real madvise()/mprotect(),
+     * checked through /proc/self/mem with the daemon's own run logic. */
+    {
+        long pg = sysconf(_SC_PAGESIZE);
+        char fpath[] = "./ac_split_test_XXXXXX";
+        int fd = mkstemp(fpath);
+        unsigned char *m = MAP_FAILED, *buf = NULL;
+        struct stat st;
+        struct ac_bl_vma v[16];
+        struct ac_bl_run_result res;
+        char sblpath[PATH_MAX], shex[65];
+        int nv, nruns, verdict, mfd, ok = 0;
+
+        /* Five pages on disk, mapped from file offset 1 page, so the
+         * record's offset isn't trivially 0. */
+        if (fd >= 0 && (buf = malloc((size_t)pg * 5)) != NULL) {
+            for (i = 0; i < pg * 5; i++)
+                buf[i] = (unsigned char)(i * 7 + i / pg);
+            if (write(fd, buf, (size_t)pg * 5) == pg * 5 && fstat(fd, &st) == 0)
+                m = mmap(NULL, (size_t)pg * 4, PROT_READ | PROT_EXEC,
+                         MAP_PRIVATE, fd, pg);
+        }
+        if (m != MAP_FAILED) {
+            nv = collect_self(st.st_ino, v, 16);
+            mfd = open("/proc/self/mem", O_RDONLY);
+            if (nv == 1 && mfd >= 0 &&
+                hash_proc_mem(mfd, v[0].start, v[0].end - v[0].start, shex) == 0) {
+                baseline_path_for(v[0].path, sblpath);
+                ok = baseline_save_record(sblpath, v[0].inode, v[0].offset,
+                                          v[0].end - v[0].start, shex) == 0;
+            }
+            if (mfd >= 0)
+                close(mfd);
+        }
+        CHECK(ok, "#86 split test: map a file executable and save its baseline");
+
+        if (ok) {
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(verdict == AC_BL_OK, "#86: unsplit, untouched mapping matches");
+
+            /* Clean split: no false positive. */
+            CHECK(madvise(m + pg * 2, (size_t)pg, MADV_DONTFORK) == 0,
+                  "#86: madvise(MADV_DONTFORK) one page");
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(nv >= 2, "#86: the madvise really split the VMA");
+            CHECK(nruns == 1, "#86: the fragments coalesce into one run");
+            CHECK(verdict == AC_BL_OK,
+                  "#86: a split but unpatched mapping still matches its baseline");
+
+            /* Patch a page, then leave it split: the bypass from #86 --
+             * this used to be a WARNING (first fragment) plus silence. */
+            CHECK(mprotect(m, (size_t)pg, PROT_READ | PROT_WRITE) == 0,
+                  "#86: mprotect a text page writable");
+            m[16] ^= 0xff;
+            CHECK(mprotect(m, (size_t)pg, PROT_READ | PROT_EXEC) == 0,
+                  "#86: mprotect it back to R-X");
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(nv >= 2 && nruns == 1,
+                  "#86: patched mapping is still split, still one run");
+            CHECK(verdict == AC_BL_MISMATCH,
+                  "#86: patched-then-split mapping is a content MISMATCH (CRIT)");
+            CHECK(!res.len_changed,
+                  "#86: no 'size changed' hint, the run still has the saved extent");
+
+            /* Undo the patch: the hash spans every fragment, so this
+             * proves it compares the right bytes, not just "differs". */
+            CHECK(mprotect(m, (size_t)pg, PROT_READ | PROT_WRITE) == 0 &&
+                  (m[16] ^= 0xff, 1) &&
+                  mprotect(m, (size_t)pg, PROT_READ | PROT_EXEC) == 0,
+                  "#86: undo the patch");
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(verdict == AC_BL_OK,
+                  "#86: unpatched split mapping matches again");
+
+            /* A same-offset record of a different size (the #51 case
+             * above) doesn't fit this run; the record that does fit is
+             * the one checked, so this is not PARTIAL. */
+            CHECK(baseline_save_record(sblpath, st.st_ino, (unsigned long long)pg,
+                                       (unsigned long long)pg * 8,
+                                       "7777777777777777777777777777777777777777777777777777777777777777") == 0,
+                  "#86: save an oversized same-offset record");
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(verdict == AC_BL_OK,
+                  "#86: an oversized same-offset record doesn't mask the fitting one");
+
+            /* Last page made non-executable: the saved range is no
+             * longer fully mapped executable, so it can't be verified --
+             * CRIT (PARTIAL), not the old size-mismatch WARNING. */
+            CHECK(mprotect(m + pg * 3, (size_t)pg, PROT_READ) == 0,
+                  "#86: mprotect the last page non-executable");
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(verdict == AC_BL_PARTIAL,
+                  "#86: a fragment made non-executable leaves the range PARTIAL");
+            CHECK(res.off == (unsigned long long)pg,
+                  "#86: PARTIAL names the baselined range's file offset");
+            CHECK(mprotect(m + pg * 3, (size_t)pg, PROT_READ | PROT_EXEC) == 0,
+                  "#86: restore the last page");
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(verdict == AC_BL_OK, "#86: restored mapping matches again");
+
+            /* A smaller same-offset record that fits must not excuse the
+             * bytes only the larger, partly mapped record covered: save
+             * one for the first page alone, patch the second page, unmap
+             * the last. The first-page record still matches, but the
+             * patched page is executable and nothing verifies it. */
+            mfd = open("/proc/self/mem", O_RDONLY);
+            CHECK(mfd >= 0 &&
+                  hash_proc_mem(mfd, (uintptr_t)m, (uint64_t)pg, shex) == 0 &&
+                  baseline_save_record(sblpath, st.st_ino,
+                                       (unsigned long long)pg,
+                                       (unsigned long long)pg, shex) == 0,
+                  "#86: save a first-page-only record at the same offset");
+            if (mfd >= 0)
+                close(mfd);
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(verdict == AC_BL_OK,
+                  "#86: a smaller fitting record alongside the full one matches");
+            CHECK(mprotect(m + pg, (size_t)pg, PROT_READ | PROT_WRITE) == 0 &&
+                  (m[pg + 16] ^= 0xff, 1) &&
+                  mprotect(m + pg, (size_t)pg, PROT_READ | PROT_EXEC) == 0,
+                  "#86: patch the second page");
+            CHECK(munmap(m + pg * 3, (size_t)pg) == 0,
+                  "#86: munmap the last page");
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(nruns == 1, "#86: the shortened mapping is one run");
+            CHECK(verdict == AC_BL_PARTIAL,
+                  "#86: a fitting smaller record doesn't hide a patched page"
+                  " only the partly mapped record covers");
+            CHECK(res.off == (unsigned long long)pg &&
+                  res.size != (unsigned long long)pg,
+                  "#86: PARTIAL names the larger record, not the fitting one");
+
+            /* Middle page unmapped: two runs, neither holds the record. */
+            CHECK(munmap(m + pg, (size_t)pg) == 0, "#86: munmap a middle page");
+            verdict = check_self(st.st_ino, &nv, &nruns, &res);
+            CHECK(nruns == 2, "#86: an unmapped page breaks the run in two");
+            CHECK(verdict == AC_BL_PARTIAL,
+                  "#86: a hole in the baselined range is PARTIAL, not silence");
+
+            /* A different inode's record is never consulted. */
+            {
+                struct ac_bl_vma w = v[0];
+                int mem_fd = -1;
+
+                w.inode = st.st_ino + 1;
+                baseline_check_run(&w, 0, 1, getpid(), &mem_fd, &res);
+                CHECK(res.verdict == AC_BL_UNBASELINED,
+                      "#86: a mapping of another inode is unbaselined");
+                CHECK(mem_fd == -1,
+                      "#86: /proc/<pid>/mem isn't opened when nothing needs hashing");
+            }
+            unlink(sblpath);
+        }
+        if (fd >= 0) {
+            close(fd);
+            unlink(fpath);
+        }
+        free(buf);
+        if (m != MAP_FAILED)
+            munmap(m, (size_t)pg * 4);
     }
 
     if (failures) {
