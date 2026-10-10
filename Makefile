@@ -171,6 +171,7 @@ test/thread_exit_migration_test: test/thread_exit_migration_test.c src/anticheat
 # already-protected thread must not get its own registry slot -- exercises
 # ac_clone_ret()'s CLONE_THREAD dedup (guards against duplicate registry
 # entries / AC_PROT_MAX exhaustion). Needs root and the module loaded --
+# see test.sh.
 thread-spawn-after-protect-test: test/thread_spawn_after_protect_test
 
 test/thread_spawn_after_protect_test: test/thread_spawn_after_protect_test.c src/anticheat.h
@@ -195,6 +196,9 @@ process-vm-test: test/process_vm_test
 
 test/process_vm_test: test/process_vm_test.c src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# ioctl fuzz harness: hammers every AC_IOCTL_* with malformed sizes,
+# boundary values, and null/wild/unmapped pointers -- the actual attack
 # surface any local process holding an open fd can reach. Against the
 # mock this only proves the harness itself doesn't crash (see its own
 # header comment); the real run is against a loaded module, as root,
@@ -234,6 +238,10 @@ test/ac_report_status_test: test/ac_report_status_test.c src/anticheat_daemon.c 
 # AF_UNIX form, and rejects a malformed/oversized one. See
 # test/ac_report_url_test.c; the real AF_UNIX connect()/send()/recv()
 # path this feeds is exercised against a real server in
+# server/test_server.sh's --unix-socket block instead.
+ac-report-url-test: test/ac_report_url_test
+	./test/ac_report_url_test
+
 test/ac_report_url_test: test/ac_report_url_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ test/ac_report_url_test.c src/sha256.c $(LDFLAGS)
 
@@ -266,6 +274,7 @@ pagination-test: test/pagination_test
 
 test/pagination_test: test/pagination_test.c src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 # run the daemon CLI against the userspace mock (no kernel module, no root)
 test-mock: mock daemon
 	./test/mock_test.sh
@@ -273,15 +282,26 @@ test-mock: mock daemon
 # CI entry point: rebuild all userspace with warnings-as-errors and run the
 # full no-root test suite.  (The kernel module build needs real kernel
 # headers and is exercised separately in CI against a prepared kernel tree.)
+#
+# Every name in CI_TARGETS must resolve to something to do on a clean tree:
+# a .PHONY name whose rule got deleted is "Nothing to be done" and exits 0,
+# which is how ac-report-url-test went unbuilt and unrun (#91).
+CI_TARGETS := daemon mock baseline-test ac-report-status-test ac-report-url-test daemon-robustness-test
+
 ci:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test daemon-robustness-test
+	@for t in $(CI_TARGETS); do \
+		$(MAKE) --no-print-directory -sn $$t | grep -q . || \
+			{ echo "ci: target '$$t' has no recipe -- nothing would be built or run" >&2; exit 1; }; \
+	done
+	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" $(CI_TARGETS)
 	./test/mock_test.sh
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
 	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/clone_vm_exec_test test/process_vm_test test/pagination_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/daemon_robustness_test test/libwaitpid_eintr_fault.so
 	rm -rf test/lld
+
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat
 	install -D -m 0644 anticheat.ko /lib/modules/$(KVER)/extra/anticheat.ko
