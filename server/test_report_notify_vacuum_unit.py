@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT OR GPL-2.0-only
 """test_report_notify_vacuum_unit.py -- fast, deterministic test of the
 two remaining #39 pieces (new-report notifier + VACUUM cadence), without
 any network or server process.

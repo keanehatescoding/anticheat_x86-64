@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: MIT OR GPL-2.0-only
  * sha256.c — compact SHA-256 (FIPS 180-4).
  */
 #include "sha256.h"

@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: MIT OR GPL-2.0-only
  *
  * test/clone_vm_exec_test.c -- live test helper for #83 (exec from a
  * non-vfork CLONE_VM child must not unregister the still-running

@@ -1130,7 +1130,8 @@ README.md                this file
 THREAT_MODEL.md          adversary, explicit non-goals, production-readiness status
 TROUBLESHOOTING.md       crash/panic recovery, blacklisting, filing a bug report
 RELEASING.md             versioning scheme + release checklist
-LICENSE                  GPL-2.0
+LICENSE-MIT              MIT license text (project is dual-licensed: MIT OR GPL-2.0-only)
+LICENSE-GPL              GPL-2.0 license text
 packaging/aur/           AUR PKGBUILD (hypranticheat + hypranticheat-dkms split package)
 packaging/debian/        debian/ control dir for a .deb (same split package)
 packaging/fedora/        rpmbuild .spec for an .rpm (same split package)

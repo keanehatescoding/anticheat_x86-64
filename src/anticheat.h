@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: MIT OR GPL-2.0-only
  *
  * anticheat.h — shared ABI between the kernel module and the userspace
  * daemon/CLI.  Plain C types only so the header can be included both by

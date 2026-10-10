@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT OR GPL-2.0-only
 """
 ac_server.py -- minimal report-ingestion + ban-lookup server for the
 hypranticheat daemon's ban pipeline.

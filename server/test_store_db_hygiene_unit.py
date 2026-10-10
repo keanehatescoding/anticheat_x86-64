@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT OR GPL-2.0-only
 """test_store_db_hygiene_unit.py -- Store SQLite hygiene from #30.
 
 Three related checklist items, one file, no server/network:

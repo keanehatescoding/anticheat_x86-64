@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT OR GPL-2.0-only
 """test_store_retention_unit.py -- fast, deterministic test of
 Store.add_report()'s per-client_id row cap.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT OR GPL-2.0-only
 """test_logging_hygiene_unit.py -- fast, deterministic test of two
 server logging-hygiene fixes (both from the consolidated server audit
 checklist, issue #30):
