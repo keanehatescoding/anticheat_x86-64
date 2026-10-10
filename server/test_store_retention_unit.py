@@ -76,6 +76,27 @@ with tempfile.TemporaryDirectory() as tmp:
         row_count(other_db, "client-a") == 1 and row_count(other_db, "client-b") == 5,
     )
 
+    # Interleaved ids: client-quiet stays under its cap but owns rows both
+    # older and newer than client-noisy's cutoff id, so a trim that lost
+    # its client_id filter on either the DELETE or the cutoff subquery
+    # would take some of them.
+    mixed_db = str(pathlib.Path(tmp) / "interleaved.db")
+    mixed = ac_server.Store(mixed_db, max_reports_per_client=5)
+    for i in range(20):
+        mixed.add_report("client-noisy", "AC_EV_PTRACE", f"n{i}", None, "127.0.0.1")
+        if i % 5 == 0:
+            mixed.add_report("client-quiet", "AC_EV_PTRACE", f"q{i}", None, "127.0.0.1")
+    check(
+        "over-cap client loses only its own oldest rows (interleaved ids)",
+        [r["detail"] for r in mixed.list_reports("client-noisy", limit=10)]
+        == [f"n{i}" for i in range(19, 14, -1)],
+    )
+    check(
+        "under-cap client's interleaved rows are all preserved",
+        [r["detail"] for r in mixed.list_reports("client-quiet", limit=10)]
+        == ["q15", "q10", "q5", "q0"],
+    )
+
     uncapped_db = str(pathlib.Path(tmp) / "uncapped.db")
     uncapped = ac_server.Store(uncapped_db, max_reports_per_client=0)
     for i in range(20):
