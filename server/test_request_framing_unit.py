@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT OR GPL-2.0-only
 """test_request_framing_unit.py -- fast, deterministic test of three related
 issue-#30 request-framing findings in server/ac_server.py: oversized bodies
 must get a clean 413 (not a generic 400), chunked Transfer-Encoding must be

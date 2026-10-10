@@ -13,7 +13,7 @@ pkgrel=1
 pkgdesc="Kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection"
 arch=('x86_64')
 url="https://github.com/keanehatescoding/anticheat_x86-64"
-license=('GPL-2.0-only')
+license=('MIT OR GPL-2.0-only')
 makedepends=('dkms')
 # A git+#tag= VCS source is always sha256sums=('SKIP') by design (there's
 # no meaningful checksum for a mutable ref) -- which also means a moved
@@ -57,7 +57,7 @@ package_hypranticheat() {
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 THREAT_MODEL.md "$pkgdir/usr/share/doc/$pkgname/THREAT_MODEL.md"
     install -Dm644 TROUBLESHOOTING.md "$pkgdir/usr/share/doc/$pkgname/TROUBLESHOOTING.md"
-    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 LICENSE-MIT LICENSE-GPL -t "$pkgdir/usr/share/licenses/$pkgname/"
     # Owned by root here -- the daemon itself creates/chmods per-file
     # baselines under this at runtime as root; nothing needs write access
     # to the directory itself except the daemon, which already runs as
@@ -84,7 +84,7 @@ package_hypranticheat-dkms() {
     install -Dm644 Makefile "$_dkmsdir/Makefile"
     install -Dm644 dkms.conf "$_dkmsdir/dkms.conf"
     cp -a src "$_dkmsdir/"
-    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 LICENSE-MIT LICENSE-GPL -t "$pkgdir/usr/share/licenses/$pkgname/"
 
     install -Dm644 /dev/stdin \
         "$pkgdir/etc/dkms/framework.conf.d/anticheat.conf" <<-EOF

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT OR GPL-2.0-only
 /*
  * anticheat_module.c — kernel-mode anticheat engine.
  *
@@ -3854,7 +3854,7 @@ static void __exit ac_exit(void)
 module_init(ac_init);
 module_exit(ac_exit);
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("kernel-anticheat project");
 MODULE_DESCRIPTION("Kernel-mode anticheat: syscall/module integrity, "
                    "process protection, ptrace denial, RWX scan");

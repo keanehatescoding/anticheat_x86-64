@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: MIT OR GPL-2.0-only
  *
  * test/mock_anticheat.c — a userspace stand-in for the anticheat kernel
  * module.  Loaded with LD_PRELOAD it makes the daemon CLI run end-to-end

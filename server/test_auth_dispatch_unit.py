@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT OR GPL-2.0-only
 """test_auth_dispatch_unit.py -- fast, deterministic test of the server's
 two request-trust boundaries (#13, #14), without any network or root.
 

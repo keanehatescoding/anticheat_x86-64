@@ -68,7 +68,7 @@ nightly KASAN/lockdep job, not on every PR.
 
 ## Code conventions
 
-- New C files: `SPDX-License-Identifier: GPL-2.0` plus a short comment
+- New C files: `SPDX-License-Identifier: MIT OR GPL-2.0-only` plus a short comment
   describing the file's purpose, matching the existing files in `src/`.
 - Kernel-side changes should stay sparse-clean — `make module` currently
   has zero sparse warnings; keep it that way.
@@ -99,5 +99,6 @@ That determines whether `AC_IOCTL_VERSION` needs to bump — see
 
 ## License
 
-GPL-2.0, same as the rest of the project (see `LICENSE`). By submitting a
-PR you agree your contribution is under the same license.
+Dual-licensed MIT OR GPL-2.0-only, same as the rest of the project (see
+`LICENSE-MIT` and `LICENSE-GPL`). By submitting a PR you agree your
+contribution is under the same dual license.

@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: MIT OR GPL-2.0-only
  *
  * test/pagination_test.c — pagination / cap smoke test (Phase 5.4)
  *

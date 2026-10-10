@@ -3,7 +3,7 @@ Version:        1.0.0
 Release:        1%{?dist}
 Summary:        Kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection
 
-License:        GPL-2.0-only
+License:        MIT OR GPL-2.0-only
 URL:            https://github.com/keanehatescoding/anticheat_x86-64
 # Same immutable, tag-pinned release tarball the AUR PKGBUILD uses (see
 # packaging/aur/PKGBUILD). GitHub names the directory inside it after the
@@ -92,14 +92,14 @@ install -Dm644 /dev/stdin \
 install -dm700 %{buildroot}%{_localstatedir}/lib/anticheat/mok
 
 %files
-%license LICENSE
+%license LICENSE-MIT LICENSE-GPL
 %doc README.md THREAT_MODEL.md TROUBLESHOOTING.md
 %{_bindir}/anticheat
 %dir %attr(0755,root,root) %{_localstatedir}/lib/anticheat
 %dir %{_localstatedir}/lib/anticheat/baselines
 
 %files dkms
-%license LICENSE
+%license LICENSE-MIT LICENSE-GPL
 %dir %{_usrsrc}/anticheat-%{version}
 %{_usrsrc}/anticheat-%{version}/Makefile
 %{_usrsrc}/anticheat-%{version}/dkms.conf

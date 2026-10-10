@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: MIT OR GPL-2.0-only
  *
  * anticheat_daemon.c — userspace front-end for the kernel anticheat module.
  *

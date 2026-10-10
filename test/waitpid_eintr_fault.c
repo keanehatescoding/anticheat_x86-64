@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: MIT OR GPL-2.0-only
  *
  * waitpid_eintr_fault.c -- LD_PRELOAD fault injector for
  * daemon_robustness_test.c. While AC_WAITPID_FAULT_ARMED=1, every

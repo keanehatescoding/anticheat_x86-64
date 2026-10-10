@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: MIT OR GPL-2.0-only
  *
  * daemon_robustness_test.c -- regression tests for three related #29
  * daemon robustness gaps:

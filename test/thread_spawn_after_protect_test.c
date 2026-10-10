@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: MIT OR GPL-2.0-only
  *
  * test/thread_spawn_after_protect_test.c -- live test helper for
  * ac_clone_ret()'s CLONE_THREAD dedup (guards against the duplicate

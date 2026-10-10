@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: MIT OR GPL-2.0-only
  *
  * test/thread_exit_migration_test.c -- live test helper for the
  * mm_struct-keyed protected-process registry's leader-only-exit case
