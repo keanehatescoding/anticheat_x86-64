@@ -137,20 +137,24 @@ with tempfile.TemporaryDirectory() as tmp:
         # The plan is the deterministic half of the check: the DELETE
         # itself (the top-level plan rows, parent 0) must be an index
         # SEARCH. A SCAN there is the visit-every-row walk this guards
-        # against; the subquery's own backward walk to the cutoff is fine.
-        def scans_table(sql, params):
+        # against; the subquery's own backward walk to the cutoff is fine,
+        # as long as it reads the index in order rather than sorting every
+        # candidate row into a temp b-tree first.
+        def has_bad_plan(sql, params):
             plan = conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
             return any(
-                row[1] == 0 and row[3].startswith("SCAN") for row in plan
+                (row[1] == 0 and row[3].startswith("SCAN"))
+                or row[3].startswith("USE TEMP B-TREE")
+                for row in plan
             )
 
         check(
-            "global trim does not full-scan the reports table",
-            not scans_table(ac_server.Store._TRIM_GLOBAL_SQL, (ROWS,)),
+            "global trim neither full-scans nor temp-sorts the reports table",
+            not has_bad_plan(ac_server.Store._TRIM_GLOBAL_SQL, (ROWS,)),
         )
         check(
-            "per-client trim does not full-scan the reports table",
-            not scans_table(
+            "per-client trim neither full-scans nor temp-sorts the reports table",
+            not has_bad_plan(
                 ac_server.Store._TRIM_CLIENT_SQL, ("client-0", "client-0", 1000)
             ),
         )
