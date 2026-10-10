@@ -790,6 +790,23 @@ class Store:
             pass
         return conn
 
+    # Cap trims run under _write_lock on every insert, so they have to be
+    # cheap when there is nothing to evict (#90). Each finds the id of the
+    # newest row that is over the cap -- OFFSET <cap> from the top, walked
+    # on the rowid index (or idx_reports_client, which carries the rowid)
+    # -- and deletes at or below it. Under the cap the subquery is NULL and
+    # the DELETE matches nothing. The previous `id NOT IN (... LIMIT ?)`
+    # shape kept the same rows but scanned the whole table per insert.
+    _TRIM_CLIENT_SQL = (
+        "DELETE FROM reports WHERE client_id = ? AND id <= ("
+        "SELECT id FROM reports WHERE client_id = ? "
+        "ORDER BY id DESC LIMIT 1 OFFSET ?)"
+    )
+    _TRIM_GLOBAL_SQL = (
+        "DELETE FROM reports WHERE id <= ("
+        "SELECT id FROM reports ORDER BY id DESC LIMIT 1 OFFSET ?)"
+    )
+
     def add_report(self, client_id, event_type, detail, client_ts, source_addr):
         # Captured here so the stored row and the webhook payload (see
         # _handle_report) agree on when the report landed -- calling
@@ -806,18 +823,13 @@ class Store:
                 trimmed = 0
                 if self.max_reports_per_client:
                     cur = conn.execute(
-                        "DELETE FROM reports WHERE client_id = ? AND id NOT IN ("
-                        "SELECT id FROM reports WHERE client_id = ? "
-                        "ORDER BY id DESC LIMIT ?)",
+                        self._TRIM_CLIENT_SQL,
                         (client_id, client_id, self.max_reports_per_client),
                     )
                     trimmed += cur.rowcount
                 if self.max_total_reports:
                     cur = conn.execute(
-                        "DELETE FROM reports WHERE id NOT IN ("
-                        "SELECT id FROM reports "
-                        "ORDER BY id DESC LIMIT ?)",
-                        (self.max_total_reports,),
+                        self._TRIM_GLOBAL_SQL, (self.max_total_reports,)
                     )
                     trimmed += cur.rowcount
                 conn.commit()
