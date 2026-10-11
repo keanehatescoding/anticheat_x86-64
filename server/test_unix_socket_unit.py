@@ -159,3 +159,10 @@ with tempfile.TemporaryDirectory() as tmp:
         check("group/other-writable socket directory is refused", True)
     else:
         check("group/other-writable socket directory is refused", False)
+
+print()
+if FAIL:
+    print("\033[1;31mSOME UNIX SOCKET UNIT TESTS FAILED\033[0m")
+else:
+    print("\033[1;32mALL UNIX SOCKET UNIT TESTS PASSED\033[0m")
+sys.exit(FAIL)

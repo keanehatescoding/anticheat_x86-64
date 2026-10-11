@@ -77,6 +77,21 @@ jobs:
       - name: Store DB hygiene unit test (no root, no network)
         run: python3 server/test_store_db_hygiene_unit.py
 
+      # These scripts are plain assert-and-report: check() only sets a
+      # global, so a script that forgets its trailing sys.exit(FAIL)
+      # prints red FAIL lines and still exits 0 -- which is how
+      # test_unix_socket_unit.py gated nothing (#92).
+      - name: Verify server unit tests propagate failures
+        run: |
+          fail=0
+          for f in server/test_*_unit.py; do
+            if [ "$(tail -n 1 "$f")" != "sys.exit(FAIL)" ]; then
+              echo "::error file=$f::does not end with sys.exit(FAIL) -- failed checks would exit 0"
+              fail=1
+            fi
+          done
+          exit $fail
+
       # A rebase, auto-fix commit, or artifact re-download can silently
       # drop a script's mode from 100755 to 100644 (this happened to
       # scripts/kasan_boot_test.sh once, and only surfaced when the
