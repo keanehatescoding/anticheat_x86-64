@@ -145,9 +145,14 @@ static void push_event(int type, int pid, const char *comm,
     struct ac_event *e;
     va_list ap;
 
+    /* Mirrors the real ring (ac_emit()): when full, the oldest
+     * event is evicted to make room, so the newest is never the one lost.
+     * Tests assert on the event they just triggered, with a queue that
+     * earlier CLI runs may well have filled (#112). */
     if (S.n_evq >= AC_MAX_EVENTS) {
+        memmove(&S.evq[0], &S.evq[1], (AC_MAX_EVENTS - 1) * sizeof(S.evq[0]));
+        S.n_evq = AC_MAX_EVENTS - 1;
         S.events_dropped_total++;
-        return;
     }
     e = &S.evq[S.n_evq++];
     memset(e, 0, sizeof(*e));
@@ -983,7 +988,7 @@ static int do_ioctl(unsigned long req, void *arg)
 
         /* pagination overflow: seed 70 events on first drain after flush */
         if (is_pag && S.n_evq == 0 && S.events_dropped_total == 0) {
-            /* push 70: first 64 fill, next 6 drop */
+            /* push 70: the last 64 stay, the oldest are evicted */
             int i;
             for (i = 0; i < 70; i++) {
                 push_event(AC_EV_INFO, 1000 + i, "pag", "pagination event %d", i);
