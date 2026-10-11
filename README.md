@@ -59,8 +59,10 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    reuse). **Protection is inherited by forked children** (tracked with a
    kretprobe on `kernel_clone`).
 
-4. **ptrace denial.** A kprobe on `__x64_sys_ptrace` (and the ia32 entry)
-   intercepts attach/debug requests against protected processes. The request
+4. **ptrace denial.** A kprobe on `__x64_sys_ptrace` (and the ia32 and,
+   with `CONFIG_X86_X32_ABI`, x32 entries) intercepts attach/debug requests
+   against protected processes. A request aimed at the caller's own thread
+   group is left to the kernel, which already refuses it with `-EPERM`. The request
    argument is rewritten to an invalid value, so the syscall fails cleanly
    with `-EIO` and has **no side effects** (the attach never happens). Per
    policy (`ac_policy` bit 0, default on) the offending tracer is also
@@ -76,7 +78,10 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    events), kprobe pre-handlers on `do_exit` and `__x64_sys_execve[at]`/
    `__ia32_compat_sys_execve[at]` (execve/execveat have distinct compat
    syscall definitions, so the ia32 syscall table entry is the compat
-   wrapper, not the generic ia32 stub). Fork inheritance and exec tracing
+   wrapper, not the generic ia32 stub), plus the x32
+   `__x64_compat_sys_execve[at]` stubs on kernels built with
+   `CONFIG_X86_X32_ABI` — where a missing x32 probe is reported as a
+   degraded load. Fork inheritance and exec tracing
    key off thread-group membership, not the exact registered `task_struct`,
    so a worker thread of a protected process that calls `fork()`/`execve()`
    is covered too.
@@ -1071,7 +1076,8 @@ design).
   the fd open, and confirms the next ioctl is rejected with `-EPERM`
   (`sudo ./test.sh` runs it as part of the live suite).
 - ptrace denial works on the standard `__x64_sys_ptrace` /
-  `__ia32_compat_sys_ptrace` entries; `process_vm_readv`/`process_vm_writev`
+  `__ia32_compat_sys_ptrace` entries (and `__x64_compat_sys_ptrace` for
+  the x32 ABI); `process_vm_readv`/`process_vm_writev`
   are covered too, via their
   own native/ia32 kprobes (see "ptrace denial" above). A cheat reaching
   process memory through some other kernel path entirely (not `ptrace(2)`

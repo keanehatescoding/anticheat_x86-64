@@ -69,6 +69,8 @@
 #include <linux/err.h>
 #include <linux/bitops.h>
 #include <linux/rcupdate.h>
+#include <linux/linkage.h>
+#include <asm/ibt.h>
 #include <asm/unistd.h>
 
 #include "anticheat.h"
@@ -147,30 +149,48 @@ ac_kwrite_long_fault:
  *
  * At function entry (the probed first instruction hasn't run, so no frame
  * of ours exists yet and the stack top still holds the caller's return
- * address) that is: pop the return address, stash the error in %rax, and
- * resume there with a non-zero pre-handler return so kprobes skips
- * single-stepping. From the caller's (do_syscall_64's) point of view this
- * is indistinguishable from the probed wrapper returning the error
- * itself. Uses only a nofault read and register writes, so it is safe in
- * atomic kprobe context; unlike override_function_with_return() it does
- * not depend on CONFIG_FUNCTION_ERROR_INJECTION (a no-op stub when that
- * is off). Returns 1 when the syscall was skipped, 0 when the stack slot
- * itself was unreadable (caller falls back to the queued kill alone).
+ * address) that is: stash the error in %rax, point %rip at a bare `ret`,
+ * and return non-zero from the pre-handler so kprobes skips
+ * single-stepping. The `ret` pops the caller's return address itself, so
+ * from the caller's (do_syscall_64's) point of view this is
+ * indistinguishable from the probed wrapper returning the error itself.
+ *
+ * %rsp is deliberately left alone -- the same shape as the kernel's own
+ * override_function_with_return(). Popping the return address by hand
+ * (regs->ip = *sp; regs->sp += 8) only works for an int3 kprobe, whose
+ * exception return restores the whole frame. With CONFIG_KPROBES_ON_FTRACE
+ * a probe at a function's entry sits on its __fentry__ site and runs from
+ * ftrace_regs_caller, which honours a changed regs->ip but never reloads
+ * %rsp from pt_regs: the return address would stay on the stack and the
+ * caller would resume 8 bytes off (#28). A `ret` stub is correct on both
+ * paths. Register writes only, so it is safe in atomic kprobe context;
+ * unlike override_function_with_return() it does not depend on
+ * CONFIG_FUNCTION_ERROR_INJECTION (a no-op stub when that is off).
  *
  * NOTE: kprobes ignores a regs->ip change + non-zero return while the
- * probe is jump/ftrace-optimized, so every probe whose pre-handler can
- * take this path carries the empty ac_probe_post() below: a probe with a
+ * probe is jump-optimized, so every probe whose pre-handler can take this
+ * path carries the empty ac_probe_post() below: a probe with a
  * post_handler is never optimized, keeping this override honored. */
-static int ac_skip_syscall(struct pt_regs *regs, long err)
-{
-    unsigned long ret_addr;
+void ac_ret_stub(void);
+/* Hand-written rather than an empty C function: nothing may run between
+ * the override and the `ret` that could clobber %rax (ftrace/KCOV/KCSAN
+ * entry hooks would). ASM_RET is whatever return sequence this kernel's
+ * mitigations require. */
+asm(
+"	.pushsection .text, \"ax\"\n"
+"	.type ac_ret_stub, @function\n"
+"ac_ret_stub:\n\t"
+	ASM_ENDBR
+	ASM_RET
+"\n"
+"	.size ac_ret_stub, .-ac_ret_stub\n"
+"	.popsection\n"
+);
 
-    if (ac_kread(&ret_addr, (const void *)regs->sp, sizeof(ret_addr)))
-        return 0;
+static void ac_skip_syscall(struct pt_regs *regs, long err)
+{
     regs_set_return_value(regs, (unsigned long)err);
-    regs->ip = ret_addr;
-    regs->sp += sizeof(ret_addr);
-    return 1;
+    regs->ip = (unsigned long)&ac_ret_stub;
 }
 
 /* Empty on purpose -- see ac_skip_syscall's NOTE. A post_handler never
@@ -304,14 +324,31 @@ static void ac_resolve_text_bounds(void)
 /* list_del_rcu() writers via rcu_dereference(), so the ->next         */
 /* pointers themselves are read safely too, not just the memory they   */
 /* point at.                                                            */
+/*                                                                      */
+/* The walk has to start somewhere, and the only list node this module  */
+/* can name is its own (the kernel's `modules` head isn't exported).    */
+/* list_for_each_entry_rcu(m, &THIS_MODULE->list, list) treats that     */
+/* node as the list *head*, so it visits every other module but never   */
+/* THIS_MODULE itself -- the anticheat module was missing from its own  */
+/* MODS and module-range snapshots (#28). ac_for_each_module_rcu()      */
+/* visits THIS_MODULE first and then the rest of the ring.              */
 /* ------------------------------------------------------------------ */
+static struct module *ac_next_module_rcu(struct module *m)
+{
+    m = list_entry_rcu(m->list.next, struct module, list);
+    return m == THIS_MODULE ? NULL : m;
+}
+
+#define ac_for_each_module_rcu(m) \
+    for ((m) = THIS_MODULE; (m); (m) = ac_next_module_rcu(m))
+
 static bool ac_addr_in_module(unsigned long addr)
 {
     struct module *m;
     bool found = false;
 
     rcu_read_lock();
-    list_for_each_entry_rcu(m, &THIS_MODULE->list, list) {
+    ac_for_each_module_rcu(m) {
         if (ac_module_sane(m) && within_module_core(addr, m)) {
             found = true;
             break;
@@ -361,7 +398,7 @@ static unsigned int ac_snapshot_mod_ranges(struct ac_mod_range **out)
     if (!ranges)
         return 0;
     rcu_read_lock();
-    list_for_each_entry_rcu(m, &THIS_MODULE->list, list) {
+    ac_for_each_module_rcu(m) {
         if (!ac_module_sane(m))
             continue;
         for_class_mod_mem_type(type, core) {
@@ -1628,31 +1665,6 @@ static bool ac_is_protected_task_mm(struct task_struct *t)
     return prot;
 }
 
-static bool ac_is_protected_pid(pid_t pid, char *comm_out)
-{
-    struct task_struct *t = ac_find_task(pid);
-    bool prot = false;
-
-    if (!t)
-        return false;
-    prot = ac_is_protected_task_mm(t);
-    if (prot && comm_out) {
-        /* Canonical accessor (#19) -- see ac_add_prot_pid(). The pointer
-         * destination can't go through get_task_comm() directly
-         * (BUILD_BUG_ON on non-arrays), so snapshot locally first, then
-         * pad-copy with an explicit size. put_task_struct() below stays
-         * as-is: the task_struct free path is RCU-delayed, so dropping
-         * the reference is safe in the atomic kprobe contexts this is
-         * called from. */
-        char comm[AC_MAX_COMM];
-
-        get_task_comm(comm, t);
-        strscpy_pad(comm_out, comm, AC_MAX_COMM);
-    }
-    put_task_struct(t);
-    return prot;
-}
-
 /* ------------------------------------------------------------------ */
 /* deferred mm (un)registration -- see the block comment at the top of  */
 /* the registry section above for why kprobe/kretprobe-originated        */
@@ -2193,9 +2205,25 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
             deny = true;
         }
     } else if (target > 0) {
-        if (ac_is_protected_pid((pid_t)target, tcomm)) {
-            deny = true;
-            kill = true;
+        /* Resolved task, not a pid compare -- same reasoning as
+         * ac_process_vm_pre() below. A request aimed at the caller's own
+         * thread group is left to the kernel, which already refuses it
+         * (ptrace_attach() returns -EPERM for same_thread_group(), and no
+         * other request gets past ptrace_check_attach() without a prior
+         * attach): denying it here as well would only add a SIGKILL of
+         * the protected game itself under the default ac_policy (#28).
+         * put_task_struct() is fine in this atomic context: the
+         * task_struct free path is RCU-delayed. */
+        struct task_struct *t = ac_find_task((pid_t)target);
+
+        if (t) {
+            if (!same_thread_group(t, current) &&
+                ac_is_protected_task_mm(t)) {
+                get_task_comm(tcomm, t);
+                deny = true;
+                kill = true;
+            }
+            put_task_struct(t);
         }
     }
     if (!deny)
@@ -2253,8 +2281,8 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
                 request, (int)target, tcomm, current->pid, ccomm);
         if (!killed)
             ac_schedule_kill(current);
-        if (ac_skip_syscall(regs, -EIO))
-            return 1;
+        ac_skip_syscall(regs, -EIO);
+        return 1;
     }
     return 0;
 }
@@ -2373,8 +2401,8 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
                 target, tcomm, current->pid, ccomm);
         if (!killed)
             ac_schedule_kill(current);
-        if (ac_skip_syscall(regs, -ESRCH))
-            return 1;
+        ac_skip_syscall(regs, -ESRCH);
+        return 1;
     }
     return 0;
 }
@@ -2488,6 +2516,7 @@ static struct kretprobe ac_kp_clone = {
  * leave the forked process's own mm unregistered. */
 struct ac_exec_entry_data {
     struct mm_struct *old_mm;
+    int pin_slot;          /* ac_exec_pins[] index for old_mm, or -1 */
     /* Fork-then-exec race closure (#6): current->mm matched an in-flight
      * fork-inherit request in ac_pending_forks rather than an already-
      * registered entry in ac_prots[] -- see that list's comment. The
@@ -2503,11 +2532,77 @@ struct ac_exec_entry_data {
     char parent_comm[AC_MAX_COMM];
 };
 
+/* In-flight exec pins. The mmget() ac_exec_entry() takes on a protected
+ * old_mm is only ever dropped by ac_exec_ret() (or the rekey work it
+ * queues) -- and unregister_kretprobe() discards the return handlers of
+ * instances still inside the syscall. An rmmod while a protected process
+ * sits in execve() would therefore leak an mm_users reference, i.e. its
+ * whole old address space (#28). Every pin is recorded here from entry
+ * until the ret handler takes it over, so ac_unregister_kprobes() can drop
+ * whatever is left once no handler can run any more.
+ *
+ * Sized for every exec kretprobe's instance pool at once (6 probes x
+ * AC_EXEC_MAXACTIVE), so a free slot always exists; if one somehow
+ * doesn't, the pin just goes untracked, which is the pre-#28 behavior. */
+#define AC_EXEC_MAXACTIVE 64
+#define AC_EXEC_PIN_MAX   (6 * AC_EXEC_MAXACTIVE)
+static struct mm_struct *ac_exec_pins[AC_EXEC_PIN_MAX];
+static DEFINE_SPINLOCK(ac_exec_pin_lock);
+
+static int ac_exec_pin_track(struct mm_struct *mm)
+{
+    unsigned long flags;
+    int i, slot = -1;
+
+    spin_lock_irqsave(&ac_exec_pin_lock, flags);
+    for (i = 0; i < AC_EXEC_PIN_MAX; i++) {
+        if (!ac_exec_pins[i]) {
+            ac_exec_pins[i] = mm;
+            slot = i;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&ac_exec_pin_lock, flags);
+    return slot;
+}
+
+static void ac_exec_pin_untrack(int slot)
+{
+    unsigned long flags;
+
+    if (slot < 0)
+        return;
+    spin_lock_irqsave(&ac_exec_pin_lock, flags);
+    ac_exec_pins[slot] = NULL;
+    spin_unlock_irqrestore(&ac_exec_pin_lock, flags);
+}
+
+/* Process context, after every exec kretprobe is unregistered: no entry
+ * or ret handler can touch ac_exec_pins[] any more, so whatever is still
+ * recorded belongs to an exec whose ret handler will never run. */
+static void ac_exec_pins_drop_all(void)
+{
+    unsigned int i, dropped = 0;
+
+    for (i = 0; i < AC_EXEC_PIN_MAX; i++) {
+        struct mm_struct *mm = ac_exec_pins[i];
+
+        if (!mm)
+            continue;
+        ac_exec_pins[i] = NULL;
+        mmput(mm);
+        dropped++;
+    }
+    if (dropped)
+        pr_info("dropped %u exec pin(s) still in flight at unload\n", dropped);
+}
+
 static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct ac_exec_entry_data *d = (struct ac_exec_entry_data *)ri->data;
 
     d->old_mm = NULL;
+    d->pin_slot = -1;
     d->fork_race_inherit = false;
     d->pending_req = NULL;
     d->pending_id = 0;
@@ -2517,6 +2612,7 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
     if (current->mm && ac_is_protected_mm(current->mm)) {
         d->old_mm = current->mm;
         mmget(d->old_mm);
+        d->pin_slot = ac_exec_pin_track(d->old_mm);
         /* AC_EV_INFO, not AC_EV_EXEC -- this fires on every attempt,
          * before the outcome (success/failure/rekey result) is known.
          * ac_exec_ret()/ac_prot_add_worker() emit the one authoritative
@@ -2647,6 +2743,9 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 
     if (!d->old_mm)
         return 0;
+    /* This handler owns the pin from here on: every path below either
+     * drops it or hands it to the rekey work. */
+    ac_exec_pin_untrack(d->pin_slot);
     if (rc != 0) {
         mmput_async(d->old_mm);   /* exec failed: current still owns old_mm */
         return 0;
@@ -2677,14 +2776,14 @@ static struct kretprobe ac_kp_execve = {
     .entry_handler = ac_exec_entry,
     .handler = ac_exec_ret,
     .data_size = sizeof(struct ac_exec_entry_data),
-    .maxactive = 64,
+    .maxactive = AC_EXEC_MAXACTIVE,
 };
 static struct kretprobe ac_kp_execveat = {
     .kp = { .symbol_name = "__x64_sys_execveat" },
     .entry_handler = ac_exec_entry,
     .handler = ac_exec_ret,
     .data_size = sizeof(struct ac_exec_entry_data),
-    .maxactive = 64,
+    .maxactive = AC_EXEC_MAXACTIVE,
 };
 static struct kretprobe ac_kp_execve32 = {
     /* Same reasoning as ac_kp_ptrace32 below: execve/execveat have distinct
@@ -2695,26 +2794,47 @@ static struct kretprobe ac_kp_execve32 = {
     .entry_handler = ac_exec_entry,
     .handler = ac_exec_ret,
     .data_size = sizeof(struct ac_exec_entry_data),
-    .maxactive = 64,
+    .maxactive = AC_EXEC_MAXACTIVE,
 };
 static struct kretprobe ac_kp_execveat32 = {
     .kp = { .symbol_name = "__ia32_compat_sys_execveat" },
     .entry_handler = ac_exec_entry,
     .handler = ac_exec_ret,
     .data_size = sizeof(struct ac_exec_entry_data),
-    .maxactive = 64,
+    .maxactive = AC_EXEC_MAXACTIVE,
+};
+
+/* x32 ABI (CONFIG_X86_X32_ABI): a 64-bit task making an x32 execve (520)
+ * or execveat (545) enters through the __x64_compat_sys_* stub, which
+ * neither the native nor the ia32 probe above sits on -- an x32 re-exec
+ * of a protected process would otherwise silently drop protection (#28).
+ * The symbols only exist when the config is on; see ac_kretp_essential. */
+static struct kretprobe ac_kp_execve_x32 = {
+    .kp = { .symbol_name = "__x64_compat_sys_execve" },
+    .entry_handler = ac_exec_entry,
+    .handler = ac_exec_ret,
+    .data_size = sizeof(struct ac_exec_entry_data),
+    .maxactive = AC_EXEC_MAXACTIVE,
+};
+static struct kretprobe ac_kp_execveat_x32 = {
+    .kp = { .symbol_name = "__x64_compat_sys_execveat" },
+    .entry_handler = ac_exec_entry,
+    .handler = ac_exec_ret,
+    .data_size = sizeof(struct ac_exec_entry_data),
+    .maxactive = AC_EXEC_MAXACTIVE,
 };
 
 static struct kretprobe *ac_kretprobes[] = {
     &ac_kp_clone, &ac_kp_execve, &ac_kp_execveat,
     &ac_kp_execve32, &ac_kp_execveat32,
+    &ac_kp_execve_x32, &ac_kp_execveat_x32,
 };
 static bool ac_kretp_ok[ARRAY_SIZE(ac_kretprobes)];
 static unsigned int ac_kretprobes_registered;
 
 /* kretprobe maxactive overflow tracking (#7): a kretprobe has a fixed
- * pool of `maxactive` kretprobe_instance slots (128 for kernel_clone, 64
- * for each execve/execveat variant above). Under heavy fork/exec load --
+ * pool of `maxactive` kretprobe_instance slots (128 for kernel_clone,
+ * AC_EXEC_MAXACTIVE for each execve/execveat variant above). Under heavy fork/exec load --
  * a fork bomb, or just many threads execve()'ing at once -- that pool can
  * run out; the kernel's response is to silently count the miss in
  * kretprobe.nmissed and skip calling our handler entirely, with no
@@ -2793,6 +2913,16 @@ static struct kprobe ac_kp_ptrace32 = {
     .pre_handler = ac_ptrace_pre,
     .post_handler = ac_probe_post,
 };
+static struct kprobe ac_kp_ptrace_x32 = {
+    /* x32 ptrace (521) is wired to compat_sys_ptrace through its
+     * __x64_compat_sys_ptrace stub. That stub unpacks the native register
+     * layout (di/si), so ac_ptrace_pre() treats it like the native probe,
+     * not like the ia32 one. process_vm_readv/writev need nothing extra:
+     * their x32 numbers (539/540) point at the native __x64_sys_* entry. */
+    .symbol_name = "__x64_compat_sys_ptrace",
+    .pre_handler = ac_ptrace_pre,
+    .post_handler = ac_probe_post,
+};
 static struct kprobe ac_kp_process_vm_readv = {
     .symbol_name = "__x64_sys_process_vm_readv",
     .pre_handler = ac_process_vm_pre,
@@ -2815,7 +2945,7 @@ static struct kprobe ac_kp_process_vm_writev32 = {
 };
 
 static struct kprobe *ac_kprobes[] = {
-    &ac_kp_ptrace, &ac_kp_ptrace32,
+    &ac_kp_ptrace, &ac_kp_ptrace32, &ac_kp_ptrace_x32,
     &ac_kp_process_vm_readv, &ac_kp_process_vm_readv32,
     &ac_kp_process_vm_writev, &ac_kp_process_vm_writev32,
 };
@@ -2837,12 +2967,16 @@ static unsigned int ac_kprobes_registered;     /* count, for the log line */
  * The compat (__ia32_*) entries are deliberately non-essential: they are
  * genuinely absent on a kernel built without CONFIG_IA32_EMULATION, which
  * is a normal configuration and not a degradation. Their failure stays a
- * pr_info. Everything else failing means a documented capability isn't
- * there, and is reported as such -- loudly in the kernel log, and as an
- * AC_EV_INFO event so the daemon sees it in-band rather than having to
- * scrape dmesg. */
+ * pr_info. The x32 (__x64_compat_sys_*) entries are essential exactly when
+ * CONFIG_X86_X32_ABI is on: without the config the symbols don't exist and
+ * neither does the ABI, but with it an unprobed stub is a reachable bypass
+ * and has to be reported. Everything else failing means a documented
+ * capability isn't there, and is reported as such -- loudly in the kernel
+ * log, and as an AC_EV_INFO event so the daemon sees it in-band rather
+ * than having to scrape dmesg. */
 static const bool ac_kp_essential[ARRAY_SIZE(ac_kprobes)] = {
     true, false,    /* ptrace, ptrace (compat) */
+    IS_ENABLED(CONFIG_X86_X32_ABI),     /* ptrace (x32) */
     true, false,    /* process_vm_readv, process_vm_readv (compat) */
     true, false,    /* process_vm_writev, process_vm_writev (compat) */
 };
@@ -2850,6 +2984,8 @@ static const bool ac_kretp_essential[ARRAY_SIZE(ac_kretprobes)] = {
     true,           /* kernel_clone -- fork inheritance */
     true, true,     /* execve, execveat -- exec rekey */
     false, false,   /* execve, execveat (compat) */
+    IS_ENABLED(CONFIG_X86_X32_ABI),     /* execve (x32) */
+    IS_ENABLED(CONFIG_X86_X32_ABI),     /* execveat (x32) */
 };
 
 /* Essential probes that failed to register, for the degraded-mode report
@@ -2925,6 +3061,7 @@ static void ac_unregister_kprobes(void)
             unregister_kretprobe(ac_kretprobes[i]);
     ac_kretprobes_registered = 0;
     memset(ac_kretp_ok, 0, sizeof(ac_kretp_ok));
+    ac_exec_pins_drop_all();
 }
 
 /* ------------------------------------------------------------------ */
@@ -3018,13 +3155,13 @@ static unsigned long long ac_module_size(const struct module *mod)
  * syscall plausibility filter.
  *
  * The MODULES_VADDR..MODULES_END range check guards against a subtler
- * problem than a torn entry: both walk sites below do
- * list_for_each_entry_rcu(m, &THIS_MODULE->list, list), which only stops
- * once it circles back to THIS_MODULE's own list node -- not the
- * kernel's real (unexported) `modules` list_head sentinel. A full walk
- * necessarily passes through that sentinel too, and list_for_each_entry_rcu
- * unconditionally container_of()s it into a `struct module *` as if it
- * were a real entry, even though it isn't embedded in one. Dereferencing
+ * problem than a torn entry: every walk site uses
+ * ac_for_each_module_rcu(), which only stops once it circles back to
+ * THIS_MODULE's own list node -- not the kernel's real (unexported)
+ * `modules` list_head sentinel. A full walk necessarily passes through
+ * that sentinel too, and it gets container_of()'d into a
+ * `struct module *` as if it were a real entry, even though it isn't
+ * embedded in one. Dereferencing
  * that bogus pointer reads whatever kernel global happens to sit at
  * that computed offset -- a real, reproduced KASAN global-out-of-bounds
  * (confirmed: lands inside a kernel workqueue global on one tested
@@ -3062,6 +3199,7 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
     unsigned int n = 0;
     unsigned int i;
     char *pathbuf;
+    char tcomm[AC_MAX_COMM];
 
     kvfree(st->vmas);
     st->vmas = NULL;
@@ -3080,6 +3218,7 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
      * same reference-liveness reasoning as ac_find_task_in_ns_of()'s own
      * comment. */
     st->resolved_pid = task_pid_nr(task);
+    get_task_comm(tcomm, task);
     mm = get_task_mm(task);
     put_task_struct(task);
     if (!mm)
@@ -3161,18 +3300,20 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
     st->n_vmas = n;
     /* Deferred emits (#18): same conditions as the counting loop above,
      * re-derived from the snapshot (no vma/mm access -- the target's
-     * mmap_read_lock is already released). */
+     * mmap_read_lock is already released). Attributed to the resolved
+     * host pid and its comm, like every other event: the caller-supplied
+     * `pid` is namespace-relative when ref_pid is set. */
     if (emit_events) {
         for (i = 0; i < n; i++) {
             struct ac_vma_info *e = &st->vmas[i];
 
             if ((e->flags & (VM_EXEC | VM_WRITE)) == (VM_EXEC | VM_WRITE))
-                ac_emit(AC_EV_RWX, pid, "?",
+                ac_emit(AC_EV_RWX, st->resolved_pid, tcomm,
                         "RWX mapping [0x%llx-0x%llx] %s",
                         e->start, e->end,
                         e->path[0] ? e->path : "(anonymous)");
             if (!e->is_file && (e->flags & VM_EXEC))
-                ac_emit(AC_EV_ANON_EXEC, pid, "?",
+                ac_emit(AC_EV_ANON_EXEC, st->resolved_pid, tcomm,
                         "anonymous executable mapping [0x%llx-0x%llx]",
                         e->start, e->end);
         }
@@ -3202,7 +3343,7 @@ static int ac_build_mod_snapshot(struct ac_fd_state *st)
         return -ENOMEM;
 
     rcu_read_lock();
-    list_for_each_entry_rcu(mod, &THIS_MODULE->list, list) {
+    ac_for_each_module_rcu(mod) {
         struct ac_mod_info *mi;
 
         if (!ac_module_sane(mod))
