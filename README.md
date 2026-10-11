@@ -331,7 +331,9 @@ process's environment to get loaded in the first place, with one
 exception, closed separately below: an *implicit* Vulkan layer needs no
 environment variable at all.
 
-`--check-preload` looks for `LD_PRELOAD`. `--check-vklayers` looks for
+`--check-preload` looks for `LD_PRELOAD` and `LD_AUDIT`; when a name is
+set more than once it reports the last entry, the one `ld.so` acts on.
+`--check-vklayers` looks for
 `VK_INSTANCE_LAYERS`/`VK_LOADER_LAYERS_ENABLE` (force-enabling a layer by
 name — the older and current Vulkan loader mechanisms respectively) and
 `VK_LAYER_PATH`/`VK_ADD_LAYER_PATH` (pointing the loader at additional
