@@ -4554,26 +4554,39 @@ static int ac_http_status_code(const char *resp)
  *
  * The socket's SO_RCVTIMEO only bounds each read(), so the loop as a whole
  * is held to timeout_sec too: a server trickling one byte per read would
- * otherwise stall the monitor loop for a timeout per byte. */
+ * otherwise stall the monitor loop for a timeout per byte. Each read() is
+ * given only what is left of that deadline, so a byte arriving just before
+ * it can't buy a whole further timeout either. */
 static ssize_t ac_read_status_line(int fd, char *resp, size_t respsz,
                                    int timeout_sec)
 {
     struct timespec deadline, now;
+    struct timeval remaining;
     size_t total = 0;
     ssize_t n = 0;
 
     clock_gettime(CLOCK_MONOTONIC, &deadline);
     deadline.tv_sec += timeout_sec;
     while (total < respsz - 1) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        remaining.tv_sec = deadline.tv_sec - now.tv_sec;
+        remaining.tv_usec = (deadline.tv_nsec - now.tv_nsec) / 1000;
+        if (remaining.tv_usec < 0) {
+            remaining.tv_sec--;
+            remaining.tv_usec += 1000000;
+        }
+        /* A zero timeval would mean "block forever" to SO_RCVTIMEO. */
+        if (remaining.tv_sec < 0 ||
+            (remaining.tv_sec == 0 && remaining.tv_usec == 0))
+            break;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &remaining,
+                       sizeof(remaining)) < 0)
+            break;
         n = read(fd, resp + total, respsz - 1 - total);
         if (n <= 0)
             break;
         total += (size_t)n;
         if (memchr(resp, '\n', total))
-            break;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec > deadline.tv_sec ||
-            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
             break;
     }
     resp[total] = '\0';

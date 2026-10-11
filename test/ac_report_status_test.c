@@ -126,6 +126,41 @@ int main(void)
         close(sv[0]);
         waitpid(pid, NULL, 0);
     }
+    /* a byte landing just before the deadline must not buy the next
+     * read() a whole further timeout */
+    {
+        int sv[2];
+        char resp[64];
+        struct timespec t0, t1;
+        double elapsed;
+        pid_t pid;
+
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+              "socketpair for the status line deadline test");
+        pid = fork();
+        if (pid == 0) {
+            close(sv[0]);
+            usleep(700 * 1000);
+            if (write(sv[1], "H", 1) != 1)
+                _exit(1);
+            usleep(2000 * 1000);
+            _exit(0);
+        }
+        close(sv[1]);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        CHECK(ac_read_status_line(sv[0], resp, sizeof(resp), 1) == 1 &&
+              strcmp(resp, "H") == 0,
+              "a line cut off by the deadline returns what arrived");
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        elapsed = (double)(t1.tv_sec - t0.tv_sec) +
+                  (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        CHECK(elapsed < 1.5,
+              "the read after a late byte waits only for the rest of the "
+              "deadline");
+        close(sv[0]);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+    }
     {
         int sv[2];
         char resp[8];
