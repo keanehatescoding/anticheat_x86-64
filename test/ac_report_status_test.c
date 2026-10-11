@@ -16,6 +16,10 @@
  *     only ever speaks plain HTTP/1.x, so those can't be genuine
  *     responses from the configured report server.
  *
+ * And #29: the status line must be read to its end, not assumed to have
+ * arrived whole in the first read(), and ac_json_escape() must leave the
+ * report body valid UTF-8 whatever bytes a comm or path holds.
+ *
  * Pulls anticheat_daemon.c in as-is (renaming its main() out of the way)
  * to test the real ac_http_status_code(), not a duplicated copy.
  *
@@ -93,6 +97,92 @@ int main(void)
     CHECK(ac_http_status_code("HTTP/1.1 200\r\n") == 200,
           "a status code immediately followed by CRLF (empty reason "
           "phrase) is still accepted");
+
+    /* #29: a status line split across reads is still read whole */
+    {
+        int sv[2];
+        char resp[64];
+        pid_t pid;
+
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+              "socketpair for the split status line test");
+        pid = fork();
+        CHECK(pid >= 0, "fork for the split status line test");
+        if (pid == 0) {
+            close(sv[0]);
+            if (write(sv[1], "HTTP/1.1 2", 10) != 10)
+                _exit(1);
+            usleep(100 * 1000);
+            if (write(sv[1], "01 Created\r\nX: y\r\n", 18) != 18)
+                _exit(1);
+            _exit(0);
+        }
+        close(sv[1]);
+        CHECK(ac_read_status_line(sv[0], resp, sizeof(resp), 3) > 0 &&
+              ac_http_status_code(resp) == 201,
+              "a status line split across two segments parses to 201");
+        close(sv[0]);
+        waitpid(pid, NULL, 0);
+    }
+    {
+        int sv[2];
+        char resp[8];
+
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
+              "socketpair for the status line bounds tests");
+        CHECK(write(sv[1], "HTTP/1.1 200 OK\r\n", 17) == 17,
+              "queue a status line longer than the buffer");
+        CHECK(ac_read_status_line(sv[0], resp, sizeof(resp), 3) == 7 &&
+              strcmp(resp, "HTTP/1.") == 0,
+              "a full buffer ends the read, NUL-terminated in bounds");
+        close(sv[1]);
+        CHECK(ac_read_status_line(sv[0], resp, sizeof(resp), 3) == 7 &&
+              ac_read_status_line(sv[0], resp, sizeof(resp), 3) == 3 &&
+              strcmp(resp, "K\r\n") == 0,
+              "the rest drains, ending at the line's newline");
+        CHECK(ac_read_status_line(sv[0], resp, sizeof(resp), 3) == 0 &&
+              resp[0] == '\0',
+              "a closed connection with no bytes returns 0 and an empty resp");
+        close(sv[0]);
+    }
+
+    /* #29: ac_json_escape() and bytes >= 0x80 */
+    {
+        char out[64];
+
+        ac_json_escape("caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80", out, sizeof(out));
+        CHECK(strcmp(out, "caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80") == 0,
+              "well-formed 2-, 3- and 4-byte UTF-8 passes through unchanged");
+        ac_json_escape("a\xff" "b\x80" "c", out, sizeof(out));
+        CHECK(strcmp(out, "a\\ufffdb\\ufffdc") == 0,
+              "a byte that can't start a sequence, and a stray continuation "
+              "byte, each become U+FFFD");
+        ac_json_escape("\xc0\xaf", out, sizeof(out));
+        CHECK(strcmp(out, "\\ufffd\\ufffd") == 0,
+              "an overlong encoding is not passed through");
+        ac_json_escape("\xed\xa0\x80", out, sizeof(out));
+        CHECK(strcmp(out, "\\ufffd\\ufffd\\ufffd") == 0,
+              "a UTF-16 surrogate is not passed through");
+        ac_json_escape("x\xe2\x82", out, sizeof(out));
+        CHECK(strcmp(out, "x\\ufffd\\ufffd") == 0,
+              "a sequence cut off by the end of the string is replaced "
+              "without reading past the NUL");
+        ac_json_escape("q\"\\\n\x01", out, sizeof(out));
+        CHECK(strcmp(out, "q\\\"\\\\\\n\\u0001") == 0,
+              "ASCII escaping is unchanged");
+    }
+    {
+        /* Truncation must not split a sequence: 4-byte characters into a
+         * buffer that can't hold them all. */
+        char out[16];
+        size_t n;
+
+        ac_json_escape("\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80"
+                       "\xf0\x9f\x98\x80", out, sizeof(out));
+        n = strlen(out);
+        CHECK(n > 0 && n < sizeof(out) && n % 4 == 0,
+              "a truncated escape ends on a whole UTF-8 sequence");
+    }
 
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);

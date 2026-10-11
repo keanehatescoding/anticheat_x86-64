@@ -354,6 +354,13 @@ echo "== scan --check-preload / --check-vklayers / --check-implicit-layers (mock
 expect_out "scan --check-preload detects LD_PRELOAD" "LD_PRELOAD check: /tmp/evil.so" bash -c 'AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/evil.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 # shellcheck disable=SC2016
 expect_out "scan --check-preload not set" "not set" bash -c 'AC_MOCK_ENVIRON="EMPTY=1" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# ld.so acts on the last LD_PRELOAD= entry, so that is the one to show: a
+# benign entry in front must not hide it (#29). LD_AUDIT loads libraries
+# the same way and is reported alongside.
+# shellcheck disable=SC2016
+expect_out "scan --check-preload reports the last LD_PRELOAD entry" "LD_PRELOAD check: /tmp/evil.so" bash -c 'AC_MOCK_ENVIRON="LD_PRELOAD=libMangoHud.so;A=1;LD_PRELOAD=/tmp/evil.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# shellcheck disable=SC2016
+expect_out "scan --check-preload detects LD_AUDIT" "LD_AUDIT check: /tmp/audit.so" bash -c 'AC_MOCK_ENVIRON="LD_AUDIT=/tmp/audit.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 # An empty envp entry (a bare NUL in /proc/<pid>/environ) is valid and must
 # not end the scan -- a leading "" used to hide everything after it (#87).
 # shellcheck disable=SC2016
