@@ -119,8 +119,10 @@ int main(void)
         }
         close(sv[1]);
         CHECK(ac_read_status_line(sv[0], resp, sizeof(resp), 3) > 0 &&
+              strchr(resp, '\n') != NULL &&
               ac_http_status_code(resp) == 201,
-              "a status line split across two segments parses to 201");
+              "a status line split across two segments is read through its "
+              "newline and parses to 201");
         close(sv[0]);
         waitpid(pid, NULL, 0);
     }
