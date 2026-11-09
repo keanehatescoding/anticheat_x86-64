@@ -892,10 +892,7 @@ class Store:
         except (TypeError, ValueError):
             offset = 0
         if before_id is not None:
-            try:
-                before_id = int(before_id)
-            except (TypeError, ValueError):
-                before_id = None
+            before_id = int(before_id)
         limit = min(max(limit, 0), self.MAX_LIST_LIMIT)
         offset = max(offset, 0)
         conn = self._connect()
@@ -1514,6 +1511,8 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 if not raw.isdigit():
                     raise ValueError("bad before_id")
                 before_id = int(raw)
+                if before_id > 2**63 - 1:
+                    raise ValueError("bad before_id")
             return limit, offset, before_id
 
     return Handler
