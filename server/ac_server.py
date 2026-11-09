@@ -882,7 +882,7 @@ class Store:
     MAX_LIST_LIMIT = 1000
     DEFAULT_LIST_LIMIT = 200
 
-    def list_reports(self, client_id, limit=200, offset=0):
+    def list_reports(self, client_id, limit=200, offset=0, before_id=None):
         try:
             limit = int(limit)
         except (TypeError, ValueError):
@@ -891,22 +891,40 @@ class Store:
             offset = int(offset)
         except (TypeError, ValueError):
             offset = 0
+        if before_id is not None:
+            try:
+                before_id = int(before_id)
+            except (TypeError, ValueError):
+                before_id = None
         limit = min(max(limit, 0), self.MAX_LIST_LIMIT)
         offset = max(offset, 0)
         conn = self._connect()
         try:
-            cur = conn.execute(
-                "SELECT event_type, detail, client_ts, received_at, source_addr "
-                "FROM reports WHERE client_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
-                (client_id, limit, offset),
-            )
+            if before_id is not None:
+                # Keyset pagination: stable under concurrent inserts/trims
+                # (issue #97). `id` is the monotonic rowid, so "id < before_id"
+                # names a fixed boundary instead of a shifting offset.
+                cur = conn.execute(
+                    "SELECT id, event_type, detail, client_ts, received_at, "
+                    "source_addr FROM reports WHERE client_id = ? AND id < ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (client_id, before_id, limit),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT id, event_type, detail, client_ts, received_at, "
+                    "source_addr FROM reports WHERE client_id = ? "
+                    "ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (client_id, limit, offset),
+                )
             return [
                 {
-                    "event_type": r[0],
-                    "detail": r[1],
-                    "client_ts": r[2],
-                    "received_at": r[3],
-                    "source_addr": r[4],
+                    "id": r[0],
+                    "event_type": r[1],
+                    "detail": r[2],
+                    "client_ts": r[3],
+                    "received_at": r[4],
+                    "source_addr": r[5],
                 }
                 for r in cur.fetchall()
             ]
@@ -1434,11 +1452,25 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             if not self._require_valid_client_id(client_id):
                 return
             try:
-                limit, offset = self._parse_listing_params(query)
+                limit, offset, before_id = self._parse_listing_params(query)
             except ValueError:
                 return self._send_json(400, {"error": "invalid pagination"})
-            self._send_json(200, {"reports": store.list_reports(
-                client_id, limit=limit, offset=offset)})
+            rows = store.list_reports(
+                client_id, limit=limit, offset=offset, before_id=before_id)
+            # Cursor for the next page: the smallest id in this page (rows
+            # are newest-first). None when this page was short, i.e. there
+            # are no more rows to fetch (#97).
+            next_before_id = (
+                rows[-1]["id"] if rows and limit > 0 and len(rows) == limit
+                else None
+            )
+            # If the page hit the clamp/limit exactly we can't tell whether
+            # more rows exist without an extra query; report the cursor
+            # anyway and let the client stop when it gets a short page.
+            self._send_json(200, {
+                "reports": rows,
+                "next_before_id": next_before_id,
+            })
 
         @staticmethod
         def _parse_listing_params(query):
@@ -1473,7 +1505,16 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 if not raw.isdigit():
                     raise ValueError("bad offset")
                 offset = int(raw)
-            return limit, offset
+            before_id = None
+            if "before_id" in qs:
+                vals = qs["before_id"]
+                if len(vals) != 1:
+                    raise ValueError("bad before_id")
+                raw = vals[0]
+                if not raw.isdigit():
+                    raise ValueError("bad before_id")
+                before_id = int(raw)
+            return limit, offset, before_id
 
     return Handler
 
