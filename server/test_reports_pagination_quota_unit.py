@@ -135,12 +135,16 @@ with tempfile.TemporaryDirectory() as tmp:
         ac_server.RateLimiter(10**6, 60),
     )
     check(
-        "defaults without query params (200, 0)",
-        handler_cls._parse_listing_params("") == (200, 0),
+        "defaults without query params (200, 0, None)",
+        handler_cls._parse_listing_params("") == (200, 0, None),
     )
     check(
         "explicit limit/offset parse",
-        handler_cls._parse_listing_params("limit=5&offset=10") == (5, 10),
+        handler_cls._parse_listing_params("limit=5&offset=10") == (5, 10, None),
+    )
+    check(
+        "before_id parses into the cursor slot",
+        handler_cls._parse_listing_params("before_id=7&limit=5") == (5, 0, 7),
     )
     check(
         "limit above the ceiling clamps instead of erroring",
