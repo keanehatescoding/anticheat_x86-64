@@ -1947,8 +1947,11 @@ def main():
     # request accepted just before SIGTERM/systemctl-stop would have its
     # connection torn down mid-handling with no response ever sent. Setting
     # this False makes server_close() join every still-running handler
-    # thread first; each handler's own worst-case latency is bounded by
-    # Store's 5s SQLite busy-timeout, so this can't hang indefinitely.
+    # thread first. For example, a handler's latency may include the
+    # connection deadline watchdog (CONNECTION_DEADLINE_SEC, ~30s) plus a
+    # Store SQLite busy-timeout (~5s), so clean shutdown can take on the
+    # order of ~35s, but this is not a worst-case bound: queued Store writes
+    # and SQLite busy-timeouts can make shutdown take longer.
     httpd.daemon_threads = False
 
     def _handle_sigterm(signum, frame):
