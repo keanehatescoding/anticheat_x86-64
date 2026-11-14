@@ -24,6 +24,14 @@
  *     the retry are covered by inspection plus the existing mock
  *     LD_PRELOAD tests; this file covers the two helpers above.
  *
+ * Plus the environ parsing gaps from the same checklist:
+ *
+ *   - ac_parse_environ_buf() kept the first LD_PRELOAD= entry where ld.so
+ *     acts on the last, so a benign entry in front hid the real one; and
+ *     a value longer than the buffer was cut off without saying so.
+ *   - an empty /proc/<pid>/environ (an exited process) was reported as
+ *     "nothing set" rather than inconclusive.
+ *
  * Pulls anticheat_daemon.c in as-is (renaming its main() out of the way)
  * to test the real helpers, not duplicated copies.
  *
@@ -350,6 +358,81 @@ int main(void)
                     waitpid(stuck[i], NULL, 0);
                 }
             }
+        }
+    }
+
+    /* --- environ: a repeated name resolves the way its consumer does --- */
+    {
+        static const char env[] =
+            "LD_PRELOAD=libMangoHud.so\0A=1\0VK_LAYER_PATH=/first\0"
+            "LD_PRELOAD=/tmp/cheat.so\0VK_LAYER_PATH=/second\0"
+            "LD_PRELOADX=/not/this\0";
+        struct ac_environ_query q[3];
+
+        memset(q, 0, sizeof(q));
+        q[0].name = "LD_PRELOAD";
+        q[0].last_wins = 1;
+        q[1].name = "VK_LAYER_PATH";
+        q[2].name = "LD_AUDIT";
+        q[2].last_wins = 1;
+        ac_parse_environ_buf(env, sizeof(env) - 1, q, 3);
+        CHECK(q[0].found && strcmp(q[0].value, "/tmp/cheat.so") == 0,
+              "the last LD_PRELOAD= entry wins, as it does for ld.so");
+        CHECK(q[1].found && strcmp(q[1].value, "/first") == 0,
+              "the first entry still wins for a getenv()-style variable");
+        CHECK(!q[2].found, "a variable that isn't there is not found");
+        CHECK(!q[0].truncated && !q[1].truncated,
+              "values that fit are not flagged truncated");
+    }
+
+    /* --- environ: a value too long for the buffer says so --- */
+    {
+        static char env[AC_ENVIRON_VAL_LEN * 2];
+        struct ac_environ_query q;
+        size_t fits = sizeof("LD_PRELOAD=") - 1 + AC_ENVIRON_VAL_LEN - 1;
+
+        memset(env, 'x', sizeof(env) - 1);
+        memcpy(env, "LD_PRELOAD=", sizeof("LD_PRELOAD=") - 1);
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_PRELOAD";
+        ac_parse_environ_buf(env, sizeof(env) - 1, &q, 1);
+        CHECK(q.found && q.truncated &&
+              strlen(q.value) == AC_ENVIRON_VAL_LEN - 1,
+              "an over-long value is cut at the buffer and flagged");
+
+        env[fits] = '\0';
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_PRELOAD";
+        ac_parse_environ_buf(env, fits, &q, 1);
+        CHECK(q.found && !q.truncated &&
+              strlen(q.value) == AC_ENVIRON_VAL_LEN - 1,
+              "a value that exactly fills the buffer is not flagged");
+    }
+
+    /* --- environ: an exited process's empty environ is inconclusive --- */
+    {
+        pid_t pid = fork();
+
+        CHECK(pid >= 0, "fork for the empty-environ test");
+        if (pid == 0)
+            _exit(0);
+        if (pid > 0) {
+            struct ac_environ_query q;
+            siginfo_t si;
+            int rc;
+
+            /* Wait for the exit without reaping: the zombie keeps its
+             * /proc entry, with no mm left behind it. */
+            CHECK(waitid(P_PID, (id_t)pid, &si, WEXITED | WNOWAIT) == 0,
+                  "child for the empty-environ test has exited");
+            memset(&q, 0, sizeof(q));
+            q.name = "LD_PRELOAD";
+            errno = 0;
+            rc = ac_read_environ_vars((int)pid, &q, 1);
+            CHECK(rc == -1 && !q.found,
+                  "an empty environ is reported as inconclusive, not as "
+                  "nothing set");
+            waitpid(pid, NULL, 0);
         }
     }
 

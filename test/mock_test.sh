@@ -354,6 +354,13 @@ echo "== scan --check-preload / --check-vklayers / --check-implicit-layers (mock
 expect_out "scan --check-preload detects LD_PRELOAD" "LD_PRELOAD check: /tmp/evil.so" bash -c 'AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/evil.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 # shellcheck disable=SC2016
 expect_out "scan --check-preload not set" "not set" bash -c 'AC_MOCK_ENVIRON="EMPTY=1" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# ld.so acts on the last LD_PRELOAD= entry, so that is the one to show: a
+# benign entry in front must not hide it (#29). LD_AUDIT loads libraries
+# the same way and is reported alongside.
+# shellcheck disable=SC2016
+expect_out "scan --check-preload reports the last LD_PRELOAD entry" "LD_PRELOAD check: /tmp/evil.so" bash -c 'AC_MOCK_ENVIRON="LD_PRELOAD=libMangoHud.so;A=1;LD_PRELOAD=/tmp/evil.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# shellcheck disable=SC2016
+expect_out "scan --check-preload detects LD_AUDIT" "LD_AUDIT check: /tmp/audit.so" bash -c 'AC_MOCK_ENVIRON="LD_AUDIT=/tmp/audit.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 # An empty envp entry (a bare NUL in /proc/<pid>/environ) is valid and must
 # not end the scan -- a leading "" used to hide everything after it (#87).
 # shellcheck disable=SC2016
@@ -402,7 +409,7 @@ sleep 30 &
 PER_PID=$!
 ./anticheat protect --pid $PER_PID >/dev/null 2>&1
 # Create a child that has the environ we want to fake via AC_MOCK_ENVIRON? Instead we run daemon with AC_MOCK_ENVIRON set so every protected pid appears to have LD_PRELOAD
-per_out=$(timeout -k 2 --preserve-status 4 env AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/evil.so" AC_LD_PRELOAD_CHECK_INTERVAL=1 AC_VK_LAYER_CHECK_INTERVAL=1 AC_IMPLICIT_LAYER_CHECK_INTERVAL=1 AC_RENDER_HOOK_CHECK_INTERVAL=1 AC_SCAN_CHECK_INTERVAL=1 ./anticheat start --foreground 2>&1)
+per_out=$(timeout -k 2 --preserve-status 4 env AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/evil.so;LD_AUDIT=/tmp/audit.so" AC_LD_PRELOAD_CHECK_INTERVAL=1 AC_VK_LAYER_CHECK_INTERVAL=1 AC_IMPLICIT_LAYER_CHECK_INTERVAL=1 AC_RENDER_HOOK_CHECK_INTERVAL=1 AC_SCAN_CHECK_INTERVAL=1 ./anticheat start --foreground 2>&1)
 # The property under test is "warn once per pid", not "once per interval",
 # so scope the count to the pid this test actually protected — the same
 # shape the --jit check above uses. Counting every LD_PRELOAD line in the
@@ -415,6 +422,8 @@ per_out=$(timeout -k 2 --preserve-status 4 env AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/
 # suppression must produce exactly 1.
 per_ld_count=$(printf '%s' "$per_out" | grep -c "pid $PER_PID (.*LD_PRELOAD=/tmp/evil.so" || true)
 if [ "$per_ld_count" -eq 1 ]; then pass "periodic LD_PRELOAD warned exactly once for pid $PER_PID"; else fail "periodic LD_PRELOAD count $per_ld_count for pid $PER_PID, expected 1"; fi
+per_audit_count=$(printf '%s' "$per_out" | grep -c "pid $PER_PID (.*LD_AUDIT=/tmp/audit.so" || true)
+if [ "$per_audit_count" -eq 1 ]; then pass "periodic LD_AUDIT warned exactly once for pid $PER_PID"; else fail "periodic LD_AUDIT count $per_audit_count for pid $PER_PID, expected 1"; fi
 ./anticheat unprotect --pid $PER_PID >/dev/null 2>&1 || true
 kill $PER_PID 2>/dev/null; wait $PER_PID 2>/dev/null || true
 
