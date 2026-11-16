@@ -582,7 +582,7 @@ def _requires_auth(keys):
 # have to be added to deliberately, rather than becoming public by
 # forgetting a decorator. test_auth_dispatch_unit.py asserts the
 # invariant over every registered route.
-PUBLIC_HANDLERS = frozenset({"_healthz"})
+PUBLIC_HANDLERS = frozenset({"_handle_healthz"})
 
 
 class Store:
@@ -1364,8 +1364,8 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             path = urllib.parse.unquote(parsed.path)
             if not path:
                 return self._send_json(404, {"error": "not found"})
-            if path == "/healthz":
-                return self._send_json(200, {"status": "ok"})
+if path == "/healthz":
+                 return self._route_guarded(self._handle_healthz)
 
             if path.startswith("/banned/"):
                 return self._route_guarded(
