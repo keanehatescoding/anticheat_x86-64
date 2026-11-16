@@ -1364,8 +1364,8 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             path = urllib.parse.unquote(parsed.path)
             if not path:
                 return self._send_json(404, {"error": "not found"})
-if path == "/healthz":
-                 return self._route_guarded(self._handle_healthz)
+            if path == "/healthz":
+                return self._route_guarded(self._handle_healthz)
 
             if path.startswith("/banned/"):
                 return self._route_guarded(
