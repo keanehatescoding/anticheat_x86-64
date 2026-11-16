@@ -82,6 +82,25 @@ echo "== protect --comm: exe-basename precision (issue #69) =="
 # pids on disk, not just mock state.
 AC_TESTBIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_testbin.XXXXXX") || exit 1
 
+# Wait for a just-forked child to actually exec the binary it was
+# started with. Until it does, /proc/<pid>/exe still points at the
+# shell's binary and /proc/<pid>/comm is still the shell's name, so
+# neither the exe-basename nor the comm-string match can find it yet.
+# Without this wait the --comm assertions race the child's exec and
+# fail intermittently on a loaded machine (the same race the deleted-exe
+# case below already had to wait out).
+wait_for_exe() {
+    local pid="$1" exe="$2"
+    for _ in $(seq 1 50); do
+        [ "$(readlink "/proc/$pid/exe" 2>/dev/null)" = "$exe" ] && return 0
+        # the child is gone (it never exec'd, or exec failed): nothing to
+        # wait for any more
+        [ -d "/proc/$pid" ] || return 1
+        sleep 0.1
+    done
+    return 1
+}
+
 # > 15 chars, so the old comm-string-only match couldn't have found this
 # pid at all (comm would read back truncated) -- only the exe-basename
 # match can.
@@ -90,6 +109,9 @@ cp /bin/sleep "$AC_TESTBIN_DIR/$AC_LONGNAME"
 chmod +x "$AC_TESTBIN_DIR/$AC_LONGNAME"
 "$AC_TESTBIN_DIR/$AC_LONGNAME" 30 &
 AC_LONGPID=$!
+if ! wait_for_exe "$AC_LONGPID" "$AC_TESTBIN_DIR/$AC_LONGNAME"; then
+    fail "child $AC_LONGPID never exec'd $AC_LONGNAME (test setup broken)"
+fi
 expect_rc  "protect --comm matches full (>15-char) exe basename" 0 \
     ./anticheat protect --comm "$AC_LONGNAME"
 expect_out "list shows exe-basename-matched pid" "$AC_LONGPID" ./anticheat list
@@ -112,10 +134,9 @@ AC_DELPID=$!
 # in which case /proc/<pid>/exe would resolve to nothing (ENOENT) instead
 # of "... (deleted)", and the fallback-to-comm-string assertion below
 # would flake intermittently.
-for _ in $(seq 1 50); do
-    [ "$(readlink "/proc/$AC_DELPID/exe" 2>/dev/null)" = "$AC_TESTBIN_DIR/$AC_SHORTNAME" ] && break
-    sleep 0.1
-done
+if ! wait_for_exe "$AC_DELPID" "$AC_TESTBIN_DIR/$AC_SHORTNAME"; then
+    fail "child $AC_DELPID never exec'd $AC_SHORTNAME (test setup broken)"
+fi
 rm -f "$AC_TESTBIN_DIR/$AC_SHORTNAME"
 expect_rc  "protect --comm falls back to comm string (exe deleted)" 0 \
     ./anticheat protect --comm "$AC_SHORTNAME"

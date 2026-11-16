@@ -424,6 +424,19 @@ for _path in /ban /unban; do
     fi
 done
 
+# 12c. /healthz is the one deliberately public route: it answers without
+# any key (readiness probes have no credentials) and touches no state.
+# Every other route 401s above, so this is the documented exception to
+# the dispatcher's deny-by-default rule, not a hole in it.
+HEALTH_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/healthz")
+HEALTH_OUT=$(curl -s "$BASE/healthz")
+if [ "$HEALTH_CODE" = "200" ] &&
+   printf '%s' "$HEALTH_OUT" | grep -q '"status": "ok"'; then
+    pass "GET /healthz with no key -> 200 {\"status\": \"ok\"}"
+else
+    fail "GET /healthz with no key should be 200 {\"status\": \"ok\"} (got $HEALTH_CODE: $HEALTH_OUT)"
+fi
+
 # 13. reports listing shows the earlier report
 OUT=$(curl -s "$BASE/reports/$CID" -H "Authorization: Bearer $ADMIN_KEY")
 if printf '%s' "$OUT" | grep -q "syscall hook"; then
