@@ -82,13 +82,28 @@ echo "== protect --comm: exe-basename precision (issue #69) =="
 # pids on disk, not just mock state.
 AC_TESTBIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_testbin.XXXXXX") || exit 1
 
+# The binaries below are renamed copies, so they must not depend on their
+# own name: where /bin/sleep is a multicall binary (uutils coreutils), a
+# copy under another name dies with "unknown program". Build a tiny
+# standalone sleeper once and copy that instead.
+AC_SLEEPER_SRC="$AC_TESTBIN_DIR/sleeper.c"
+AC_SLEEPER_BIN="$AC_TESTBIN_DIR/sleeper.bin"
+printf '%s\n' '#include <unistd.h>' \
+    'int main(void) { sleep(30); return 0; }' > "$AC_SLEEPER_SRC"
+# CC is expanded unquoted on purpose, as the Makefile does, so a value like
+# CC='ccache gcc' (compiler plus arguments) still works.
+${CC:-cc} -o "$AC_SLEEPER_BIN" "$AC_SLEEPER_SRC" || {
+    echo "FAIL could not build the test sleeper with ${CC:-cc}"
+    exit 1
+}
+
 # > 15 chars, so the old comm-string-only match couldn't have found this
 # pid at all (comm would read back truncated) -- only the exe-basename
 # match can.
 AC_LONGNAME="ac69-exe-match-longname-$$"
-cp /bin/sleep "$AC_TESTBIN_DIR/$AC_LONGNAME"
+cp "$AC_SLEEPER_BIN" "$AC_TESTBIN_DIR/$AC_LONGNAME"
 chmod +x "$AC_TESTBIN_DIR/$AC_LONGNAME"
-"$AC_TESTBIN_DIR/$AC_LONGNAME" 30 &
+"$AC_TESTBIN_DIR/$AC_LONGNAME" &
 AC_LONGPID=$!
 expect_rc  "protect --comm matches full (>15-char) exe basename" 0 \
     ./anticheat protect --comm "$AC_LONGNAME"
@@ -103,9 +118,9 @@ wait "$AC_LONGPID" 2>/dev/null
 # back to the original /proc/<pid>/comm string match, not fail outright.
 AC_SHORTNAME="ac69delfb$$"
 AC_SHORTNAME="${AC_SHORTNAME:0:15}"
-cp /bin/sleep "$AC_TESTBIN_DIR/$AC_SHORTNAME"
+cp "$AC_SLEEPER_BIN" "$AC_TESTBIN_DIR/$AC_SHORTNAME"
 chmod +x "$AC_TESTBIN_DIR/$AC_SHORTNAME"
-"$AC_TESTBIN_DIR/$AC_SHORTNAME" 30 &
+"$AC_TESTBIN_DIR/$AC_SHORTNAME" &
 AC_DELPID=$!
 # Wait for the child to actually exec the copied binary before deleting
 # it out from under it -- deleting too early can still catch it mid-fork,
