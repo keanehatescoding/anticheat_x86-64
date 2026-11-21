@@ -2068,29 +2068,47 @@ static const char *const AC_VK_LAYER_ENV_VARS[] = {
 #define AC_VK_LAYER_ENV_VARS_COUNT \
     (sizeof(AC_VK_LAYER_ENV_VARS) / sizeof(AC_VK_LAYER_ENV_VARS[0]))
 
+/* Appended to a loader-variable match when /proc/<pid>/environ was larger
+ * than AC_ENVIRON_BUF: ld.so acts on the *last* entry, and that is exactly
+ * what the cut-off part could hold, so a match from the readable prefix may
+ * not be the one in effect. */
+#define AC_ENVIRON_INCOMPLETE_NOTE " [environ truncated: a later entry may override]"
+
 /* CLI-facing wrapper for `scan --check-preload`. */
 static int check_ld_preload(int pid)
 {
     struct ac_environ_query vars[AC_LD_INJECT_ENV_VARS_COUNT];
     unsigned int i;
-    int found_any = 0;
+    int found_any = 0, incomplete = 0;
 
     if (ac_read_ld_inject_vars(pid, vars) < 0) {
-        printf("  LD_PRELOAD check: could not read /proc/%d/environ (%s)\n",
-               pid, strerror(errno));
-        return -1;
+        /* EMSGSIZE: environ exceeded the read buffer. The matches parsed
+         * from the prefix are still in vars[] -- report them, marked
+         * incomplete, instead of discarding them with the error. Every
+         * other failure leaves vars[] meaningless. */
+        if (errno != EMSGSIZE) {
+            printf("  LD_PRELOAD check: could not read /proc/%d/environ (%s)\n",
+                   pid, strerror(errno));
+            return -1;
+        }
+        incomplete = 1;
     }
     for (i = 0; i < AC_LD_INJECT_ENV_VARS_COUNT; i++) {
         if (!vars[i].found) {
-            printf("  %s check: not set\n", vars[i].name);
+            if (incomplete)
+                printf("  %s check: not found in the readable part of environ "
+                       "(environ truncated; scan incomplete)\n", vars[i].name);
+            else
+                printf("  %s check: not set\n", vars[i].name);
             continue;
         }
-        printf("  %s check: %s%s\n", vars[i].name, vars[i].value,
-               ac_environ_trunc_note(&vars[i]));
+        printf("  %s check: %s%s%s\n", vars[i].name, vars[i].value,
+               ac_environ_trunc_note(&vars[i]),
+               incomplete ? AC_ENVIRON_INCOMPLETE_NOTE : "");
         found_any = 1;
     }
     if (!found_any)
-        return 0;
+        return incomplete ? -1 : 0;
     printf("    (informational only -- also used by legitimate overlay/compat\n"
            "     tools like MangoHud, gamemode, gamescope; not a verdict)\n");
     return 1;
@@ -3242,24 +3260,41 @@ static void check_ld_preload_periodic(void)
     preload_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_environ_query vars[AC_LD_INJECT_ENV_VARS_COUNT];
-        int found_any = 0;
+        int found_any = 0, incomplete = 0;
 
         if (preload_already_warned(pl.items[i].pid))
             continue;
-        if (ac_read_ld_inject_vars(pl.items[i].pid, vars) < 0)
-            continue;
+        if (ac_read_ld_inject_vars(pl.items[i].pid, vars) < 0) {
+            /* Only EMSGSIZE leaves usable matches behind; anything else
+             * (exited process, unreadable environ) stays inconclusive and
+             * is retried next interval. */
+            if (errno != EMSGSIZE)
+                continue;
+            incomplete = 1;
+        }
         for (j = 0; j < AC_LD_INJECT_ENV_VARS_COUNT; j++) {
             if (!vars[j].found)
                 continue;
             found_any = 1;
-            logmsg(LOG_WARNING, "pid %d (%s): %s=%s%s set at exec -- "
+            logmsg(LOG_WARNING, "pid %d (%s): %s=%s%s%s set at exec -- "
                    "common for legitimate overlay/compat tools (MangoHud, "
                    "gamemode, gamescope) as well as library-injection "
                    "hooking; informational only, not a verdict on its own",
                    pl.items[i].pid, pl.items[i].comm, vars[j].name,
-                   vars[j].value, ac_environ_trunc_note(&vars[j]));
+                   vars[j].value, ac_environ_trunc_note(&vars[j]),
+                   incomplete ? AC_ENVIRON_INCOMPLETE_NOTE : "");
         }
-        if (found_any)
+        if (incomplete && !found_any)
+            /* An oversized environ would otherwise be skipped silently,
+             * which is exactly what an entry hidden past the buffer
+             * wants. */
+            logmsg(LOG_WARNING, "pid %d (%s): environ larger than the %d "
+                   "byte read buffer -- LD_PRELOAD/LD_AUDIT scan incomplete; "
+                   "informational only, not a verdict on its own",
+                   pl.items[i].pid, pl.items[i].comm, (int)AC_ENVIRON_BUF);
+        /* The environ is fixed at exec, so one warning per pid is enough,
+         * including for the incomplete case (no per-interval log spam). */
+        if (found_any || incomplete)
             preload_mark_warned(pl.items[i].pid);
     }
 }
@@ -4580,8 +4615,12 @@ static ssize_t ac_read_status_line(int fd, char *resp, size_t respsz,
             (remaining.tv_sec == 0 && remaining.tv_usec == 0))
             break;
         if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &remaining,
-                       sizeof(remaining)) < 0)
+                       sizeof(remaining)) < 0) {
+            /* Report it as a failed read (errno from setsockopt), not as
+             * a clean close with nothing received. */
+            n = -1;
             break;
+        }
         n = read(fd, resp + total, respsz - 1 - total);
         if (n <= 0)
             break;

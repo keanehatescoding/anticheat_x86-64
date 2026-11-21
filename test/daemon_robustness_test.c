@@ -436,6 +436,83 @@ int main(void)
         }
     }
 
+    /* --- environ: an environ past the read buffer keeps its matches --- */
+    {
+        /* Each execve() string is capped at 128 KiB, so three of them put
+         * the total past AC_ENVIRON_BUF. LD_PRELOAD sits first, inside
+         * the part that is read. */
+        enum { PAD_LEN = 100 * 1024 };
+        char *pad[3] = { NULL, NULL, NULL };
+        char *envp[6];
+        char *argv_sleep[] = { "sleep", "10", NULL };
+        pid_t pid;
+        unsigned int k;
+
+        for (k = 0; k < 3; k++) {
+            pad[k] = malloc(PAD_LEN + 1);
+            CHECK(pad[k] != NULL, "allocate environ padding");
+            if (!pad[k])
+                break;
+            memset(pad[k], 'p', PAD_LEN);
+            pad[k][PAD_LEN] = '\0';
+            memcpy(pad[k], "PAD=", 4);
+        }
+        envp[0] = "LD_PRELOAD=/tmp/cheat.so";
+        envp[1] = pad[0];
+        envp[2] = pad[1];
+        envp[3] = pad[2];
+        envp[4] = "LD_AUDIT=/tmp/audit.so";   /* past the buffer: unseen */
+        envp[5] = NULL;
+        if (pad[0] && pad[1] && pad[2]) {
+            pid = fork();
+            CHECK(pid >= 0, "fork for the oversized-environ test");
+            if (pid == 0) {
+                execve("/bin/sleep", argv_sleep, envp);
+                _exit(127);
+            }
+            if (pid > 0) {
+                struct ac_environ_query vars[AC_LD_INJECT_ENV_VARS_COUNT];
+                char comm[32] = "";
+                int tries, rc, err;
+
+                /* Until the exec lands, /proc/<pid>/environ is still the
+                 * forked copy of ours; wait for the new comm. */
+                for (tries = 0; tries < 200; tries++) {
+                    char p[64];
+                    FILE *f;
+
+                    snprintf(p, sizeof(p), "/proc/%d/comm", (int)pid);
+                    f = fopen(p, "r");
+                    if (f) {
+                        if (fgets(comm, sizeof(comm), f) &&
+                            strncmp(comm, "sleep", 5) == 0) {
+                            fclose(f);
+                            break;
+                        }
+                        fclose(f);
+                    }
+                    usleep(10 * 1000);
+                }
+                CHECK(strncmp(comm, "sleep", 5) == 0,
+                      "child for the oversized-environ test has exec'd");
+                errno = 0;
+                rc = ac_read_ld_inject_vars((int)pid, vars);
+                err = errno;
+                CHECK(rc == -1 && err == EMSGSIZE,
+                      "an environ past the buffer reports EMSGSIZE");
+                CHECK(vars[0].found &&
+                      strcmp(vars[0].value, "/tmp/cheat.so") == 0,
+                      "a match in the readable part survives the EMSGSIZE");
+                CHECK(!vars[1].found,
+                      "an entry past the buffer is not claimed as found");
+                kill(pid, SIGKILL);
+                waitpid(pid, NULL, 0);
+            }
+        }
+        for (k = 0; k < 3; k++)
+            free(pad[k]);
+    }
+
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
