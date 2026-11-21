@@ -420,9 +420,15 @@ int main(void)
         size_t pos = 0;
         int k;
 
+        enum { ENTRY_LEN = sizeof("LD_AUDIT=") - 1 + AC_ENVIRON_VAL_LEN / 2 + 1 };
+
+        /* Three fixed-size entries: provably within env[], no
+         * return-value-derived sizes. */
+        _Static_assert(3 * ENTRY_LEN <= AC_ENVIRON_VAL_LEN * 4,
+                       "the three entries fit in env[]");
         for (k = 0; k < 3; k++) {
-            pos += (size_t)snprintf(env + pos, sizeof(env) - pos,
-                                    "LD_AUDIT=") ;
+            memcpy(env + pos, "LD_AUDIT=", sizeof("LD_AUDIT=") - 1);
+            pos += sizeof("LD_AUDIT=") - 1;
             memset(env + pos, 'a' + k, AC_ENVIRON_VAL_LEN / 2);
             pos += AC_ENVIRON_VAL_LEN / 2;
             env[pos++] = '\0';
