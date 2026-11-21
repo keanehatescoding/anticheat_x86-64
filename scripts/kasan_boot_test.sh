@@ -72,8 +72,42 @@ curl -fsSL -o "$WORKDIR/sha256sums.asc" \
 grep "linux-$KVER.tar.xz" "$WORKDIR/sha256sums.asc" | (cd "$WORKDIR" && sha256sum -c -)
 tar -xJf "$WORKDIR/linux-$KVER.tar.xz" -C "$WORKDIR"
 
+# Pick the compiler for the test kernel. linux-6.12.0 predates GCC 15 and does
+# not build with it: GCC 15 defaults to -std=gnu23 (the x86 EFI stub and boot
+# code rebuild their own flags without -std=gnu11, so `bool`/`false` become
+# keywords and stddef.h/types.h fail) and adds
+# -Wunterminated-string-initialization (the ACPI table signatures trip it
+# under CONFIG_WERROR). Those need per-directory flag patches in the kernel;
+# an older GCC avoids the whole class. An explicit CC=... wins; otherwise use
+# the default gcc unless it is 15+, in which case fall back to gcc-14/13/12.
+gcc_major() {
+    "$1" -dumpversion 2>/dev/null | cut -d. -f1
+}
+KCC="${CC:-}"
+if [ -z "$KCC" ]; then
+    KCC=gcc
+    if [ "$(gcc_major gcc)" -ge 15 ] 2>/dev/null; then
+        KCC=""
+        for cand in gcc-14 gcc-13 gcc-12; do
+            if command -v "$cand" >/dev/null 2>&1; then
+                KCC="$cand"
+                break
+            fi
+        done
+        if [ -z "$KCC" ]; then
+            echo "FATAL: default gcc is $(gcc -dumpversion), too new for linux-$KVER; install gcc-14 (or gcc-13/12), or set CC=" >&2
+            exit 1
+        fi
+    fi
+fi
+echo "== kernel compiler: $KCC ($("$KCC" --version | head -1)) =="
+# HOSTCC too: the kernel's own host tools break under a C23 default as well.
+kmake() {
+    make -C "$KDIR" ARCH=x86_64 CC="$KCC" HOSTCC="$KCC" "$@"
+}
+
 echo "== configuring: defconfig + KASAN/lockdep debug fragment =="
-make -C "$KDIR" ARCH=x86_64 defconfig
+kmake defconfig
 
 # Generic KASAN (not SW/HW tags -- this targets a plain x86_64 QEMU
 # guest, no MTE/tag-capable hardware involved) + full lockdep validation.
@@ -95,7 +129,7 @@ make -C "$KDIR" ARCH=x86_64 defconfig
     --enable PROVE_LOCKING \
     --enable DEBUG_ATOMIC_SLEEP \
     --set-val FRAME_WARN 0
-make -C "$KDIR" ARCH=x86_64 olddefconfig
+kmake olddefconfig
 
 # scripts/config --enable doesn't fail the build if a requested symbol
 # silently didn't stick (e.g. a missing dependency) -- verify explicitly
@@ -109,10 +143,10 @@ for sym in CONFIG_KASAN CONFIG_KASAN_GENERIC CONFIG_LOCKDEP CONFIG_PROVE_LOCKING
 done
 
 echo "== building the kernel (full build, not modules_prepare -- this is slow) =="
-make -C "$KDIR" ARCH=x86_64 -j"$(nproc)" all
+kmake -j"$(nproc)" all
 
 echo "== building anticheat.ko against this tree =="
-make -C "$REPO_ROOT" KDIR="$KDIR" module
+make -C "$REPO_ROOT" KDIR="$KDIR" CC="$KCC" module
 test -s "$REPO_ROOT/anticheat.ko"
 
 echo "== building userspace (daemon + ioctl_fuzz) =="

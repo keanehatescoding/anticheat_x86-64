@@ -24,6 +24,14 @@
  *     the retry are covered by inspection plus the existing mock
  *     LD_PRELOAD tests; this file covers the two helpers above.
  *
+ * Plus the environ parsing gaps from the same checklist:
+ *
+ *   - ac_parse_environ_buf() kept the first LD_PRELOAD= entry where ld.so
+ *     acts on the last, so a benign entry in front hid the real one; and
+ *     a value longer than the buffer was cut off without saying so.
+ *   - an empty /proc/<pid>/environ (an exited process) was reported as
+ *     "nothing set" rather than inconclusive.
+ *
  * Pulls anticheat_daemon.c in as-is (renaming its main() out of the way)
  * to test the real helpers, not duplicated copies.
  *
@@ -74,6 +82,11 @@ static int looks_like_clock(const char *s)
         isdigit((unsigned char)s[6]) && isdigit((unsigned char)s[7]);
 }
 
+/* Runs the #29 robustness checks against the daemon's own helpers (the .c
+ * is #included above): event-time formatting, the bounded resolver-child
+ * reap, and environ parsing -- repeated names, value truncation, an empty
+ * environ, and an environ past the read buffer. Exits 1 if any check
+ * failed. */
 int main(void)
 {
     char ts[32];
@@ -351,6 +364,346 @@ int main(void)
                 }
             }
         }
+    }
+
+    /* --- environ: a repeated name resolves the way its consumer does --- */
+    {
+        static const char env[] =
+            "LD_PRELOAD=libMangoHud.so\0A=1\0VK_LAYER_PATH=/first\0"
+            "LD_PRELOAD=/tmp/cheat.so\0VK_LAYER_PATH=/second\0"
+            "LD_PRELOADX=/not/this\0";
+        struct ac_environ_query q[3];
+
+        memset(q, 0, sizeof(q));
+        q[0].name = "LD_PRELOAD";
+        q[0].last_wins = 1;
+        q[1].name = "VK_LAYER_PATH";
+        q[2].name = "LD_AUDIT";
+        q[2].last_wins = 1;
+        ac_parse_environ_buf(env, sizeof(env) - 1, q, 3);
+        CHECK(q[0].found && strcmp(q[0].value, "/tmp/cheat.so") == 0,
+              "the last LD_PRELOAD= entry wins, as it does for ld.so");
+        CHECK(q[1].found && strcmp(q[1].value, "/first") == 0,
+              "the first entry still wins for a getenv()-style variable");
+        CHECK(!q[2].found, "a variable that isn't there is not found");
+        CHECK(!q[0].truncated && !q[1].truncated,
+              "values that fit are not flagged truncated");
+    }
+
+    /* --- environ: every LD_AUDIT= entry is a loader input --- */
+    {
+        static const char env[] =
+            "LD_AUDIT=/tmp/evil.so\0A=1\0LD_PRELOAD=/first.so\0"
+            "LD_AUDIT=/tmp/benign.so\0LD_PRELOAD=/second.so\0"
+            "LD_AUDIT=\0LD_AUDITX=/not/this\0";
+        struct ac_environ_query q[2];
+
+        memset(q, 0, sizeof(q));
+        q[0].name = "LD_AUDIT";
+        q[0].collect_all = 1;
+        q[1].name = "LD_PRELOAD";
+        q[1].last_wins = 1;
+        ac_parse_environ_buf(env, sizeof(env) - 1, q, 2);
+        CHECK(q[0].found && q[0].occurrences == 3 &&
+              strcmp(q[0].value, "/tmp/evil.so:/tmp/benign.so") == 0,
+              "repeated LD_AUDIT= entries are all kept, an empty one adds "
+              "nothing, and an LD_AUDITX= lookalike is ignored");
+        CHECK(!q[0].truncated, "an LD_AUDIT list that fits is not flagged");
+        CHECK(q[1].found && strcmp(q[1].value, "/second.so") == 0,
+              "LD_PRELOAD keeps last-wins selection beside a collect_all "
+              "variable");
+    }
+    {
+        /* Occurrences that don't all fit: bounded, flagged, still counted. */
+        static char env[AC_ENVIRON_VAL_LEN * 4];
+        struct ac_environ_query q;
+        size_t pos = 0;
+        int k;
+
+        enum { ENTRY_LEN = sizeof("LD_AUDIT=") - 1 + AC_ENVIRON_VAL_LEN / 2 + 1 };
+
+        /* Three fixed-size entries: provably within env[], no
+         * return-value-derived sizes. */
+        _Static_assert(3 * ENTRY_LEN <= AC_ENVIRON_VAL_LEN * 4,
+                       "the three entries fit in env[]");
+        for (k = 0; k < 3; k++) {
+            memcpy(env + pos, "LD_AUDIT=", sizeof("LD_AUDIT=") - 1);
+            pos += sizeof("LD_AUDIT=") - 1;
+            memset(env + pos, 'a' + k, AC_ENVIRON_VAL_LEN / 2);
+            pos += AC_ENVIRON_VAL_LEN / 2;
+            env[pos++] = '\0';
+        }
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_AUDIT";
+        q.collect_all = 1;
+        ac_parse_environ_buf(env, pos, &q, 1);
+        CHECK(q.found && q.truncated && q.occurrences == 3 &&
+              strlen(q.value) < AC_ENVIRON_VAL_LEN &&
+              q.value[0] == 'a',
+              "a collected LD_AUDIT list past the cap stays in bounds, is "
+              "flagged truncated, and still counts every occurrence");
+    }
+    {
+        /* Through the real reader, from a real /proc/<pid>/environ. */
+        char *envp[] = { "LD_AUDIT=/tmp/evil.so", "LD_AUDIT=/tmp/benign.so",
+                         "LD_PRELOAD=/p1.so", "LD_PRELOAD=/p2.so", NULL };
+        char *argv_sleep[] = { "sleep", "10", NULL };
+        pid_t pid = fork();
+
+        CHECK(pid >= 0, "fork for the repeated-LD_AUDIT environ test");
+        if (pid == 0) {
+            execve("/bin/sleep", argv_sleep, envp);
+            _exit(127);
+        }
+        if (pid > 0) {
+            struct ac_environ_query vars[AC_LD_INJECT_ENV_VARS_COUNT];
+            char comm[32] = "";
+            int tries, rc;
+
+            for (tries = 0; tries < 200; tries++) {
+                char p[64];
+                FILE *f;
+
+                snprintf(p, sizeof(p), "/proc/%d/comm", (int)pid);
+                f = fopen(p, "r");
+                if (f) {
+                    if (fgets(comm, sizeof(comm), f) &&
+                        strncmp(comm, "sleep", 5) == 0) {
+                        fclose(f);
+                        break;
+                    }
+                    fclose(f);
+                }
+                usleep(10 * 1000);
+            }
+            rc = ac_read_ld_inject_vars((int)pid, vars);
+            CHECK(rc == 0 && vars[1].found &&
+                  strcmp(vars[1].value,
+                         "/tmp/evil.so:/tmp/benign.so") == 0,
+                  "ac_read_ld_inject_vars() reports both repeated LD_AUDIT "
+                  "libraries, not only the last");
+            CHECK(vars[0].found && strcmp(vars[0].value, "/p2.so") == 0,
+                  "ac_read_ld_inject_vars() still reports the last "
+                  "LD_PRELOAD");
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+        }
+    }
+
+    /* --- log line: the qualifiers survive a maximum-length value --- */
+    {
+        struct ac_environ_query q;
+        char line[AC_LOG_LINE_MAX];
+
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_PRELOAD";
+        memset(q.value, 'x', sizeof(q.value) - 1);
+        q.found = 1;
+        q.truncated = 1;
+        ac_fmt_environ_warning(line, sizeof(line), 2147483647,
+                               "0123456789abcde", &q, 1, AC_LD_WARN_TAIL);
+        CHECK(strlen(line) <= sizeof(line) - 1 &&
+              strlen(line) > strlen(AC_LD_WARN_TAIL) &&
+              strcmp(line + strlen(line) - strlen(AC_LD_WARN_TAIL),
+                     AC_LD_WARN_TAIL) == 0 &&
+              strstr(line, "[value truncated]") != NULL &&
+              strstr(line, AC_ENVIRON_LOG_CUT_NOTE) != NULL &&
+              strstr(line, AC_ENVIRON_INCOMPLETE_NOTE) != NULL &&
+              strstr(line, "not a verdict on its own") != NULL,
+              "a full-length LD_* value keeps its truncation qualifiers, "
+              "marks the extra log cut, and ends with the usual tail");
+
+        memset(&q, 0, sizeof(q));
+        q.name = "VK_LAYER_PATH";
+        memset(q.value, 'y', sizeof(q.value) - 1);
+        q.found = 1;
+        q.truncated = 1;
+        ac_fmt_environ_warning(line, sizeof(line), 1, "game", &q, 0,
+                               AC_VK_WARN_TAIL);
+        CHECK(strstr(line, "[value truncated]") != NULL &&
+              strstr(line, "not a verdict on its own") != NULL,
+              "the same holds for the Vulkan-layer warning");
+
+        /* A collected LD_AUDIT list reports its entry count, and that
+         * qualifier is reserved before the value is shortened. */
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_AUDIT";
+        q.collect_all = 1;
+        memset(q.value, 'z', sizeof(q.value) - 1);
+        q.found = 1;
+        q.truncated = 1;
+        q.occurrences = 4294967295u;
+        ac_fmt_environ_warning(line, sizeof(line), 2147483647,
+                               "0123456789abcde", &q, 1, AC_LD_WARN_TAIL);
+        CHECK(strlen(line) <= sizeof(line) - 1 &&
+              strcmp(line + strlen(line) - strlen(AC_LD_WARN_TAIL),
+                     AC_LD_WARN_TAIL) == 0 &&
+              strstr(line, " [4294967295 entries]") != NULL &&
+              strstr(line, "[value truncated]") != NULL &&
+              strstr(line, AC_ENVIRON_LOG_CUT_NOTE) != NULL &&
+              strstr(line, AC_ENVIRON_INCOMPLETE_NOTE) != NULL,
+              "a truncated, incomplete LD_AUDIT list still reports its "
+              "entry count beside every other qualifier");
+
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_AUDIT";
+        q.collect_all = 1;
+        snprintf(q.value, sizeof(q.value), "/a.so:/b.so");
+        q.found = 1;
+        q.occurrences = 2;
+        ac_fmt_environ_warning(line, sizeof(line), 42, "game", &q, 0,
+                               AC_LD_WARN_TAIL);
+        CHECK(strncmp(line, "pid 42 (game): LD_AUDIT=/a.so:/b.so [2 entries]"
+                      " set at exec -- ",
+                      sizeof("pid 42 (game): LD_AUDIT=/a.so:/b.so [2 entries]"
+                             " set at exec -- ") - 1) == 0,
+              "a short LD_AUDIT list shows its entry count");
+        q.occurrences = 1;
+        snprintf(q.value, sizeof(q.value), "/a.so");
+        ac_fmt_environ_warning(line, sizeof(line), 42, "game", &q, 0,
+                               AC_LD_WARN_TAIL);
+        CHECK(strstr(line, "LD_AUDIT=/a.so [1 entry] set at exec") != NULL,
+              "a single LD_AUDIT entry is reported as 1 entry");
+
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_PRELOAD";
+        snprintf(q.value, sizeof(q.value), "/tmp/cheat.so");
+        q.found = 1;
+        ac_fmt_environ_warning(line, sizeof(line), 42, "game", &q, 0,
+                               AC_LD_WARN_TAIL);
+        CHECK(strncmp(line, "pid 42 (game): LD_PRELOAD=/tmp/cheat.so set at "
+                      "exec -- ", 55) == 0 &&
+              strstr(line, AC_ENVIRON_LOG_CUT_NOTE) == NULL &&
+              strstr(line, "[value truncated]") == NULL,
+              "a short value is logged whole with no qualifiers");
+    }
+
+    /* --- environ: a value too long for the buffer says so --- */
+    {
+        static char env[AC_ENVIRON_VAL_LEN * 2];
+        struct ac_environ_query q;
+        size_t fits = sizeof("LD_PRELOAD=") - 1 + AC_ENVIRON_VAL_LEN - 1;
+
+        memset(env, 'x', sizeof(env) - 1);
+        memcpy(env, "LD_PRELOAD=", sizeof("LD_PRELOAD=") - 1);
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_PRELOAD";
+        ac_parse_environ_buf(env, sizeof(env) - 1, &q, 1);
+        CHECK(q.found && q.truncated &&
+              strlen(q.value) == AC_ENVIRON_VAL_LEN - 1,
+              "an over-long value is cut at the buffer and flagged");
+
+        env[fits] = '\0';
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_PRELOAD";
+        ac_parse_environ_buf(env, fits, &q, 1);
+        CHECK(q.found && !q.truncated &&
+              strlen(q.value) == AC_ENVIRON_VAL_LEN - 1,
+              "a value that exactly fills the buffer is not flagged");
+    }
+
+    /* --- environ: an exited process's empty environ is inconclusive --- */
+    {
+        pid_t pid = fork();
+
+        CHECK(pid >= 0, "fork for the empty-environ test");
+        if (pid == 0)
+            _exit(0);
+        if (pid > 0) {
+            struct ac_environ_query q;
+            siginfo_t si;
+            int rc;
+
+            /* Wait for the exit without reaping: the zombie keeps its
+             * /proc entry, with no mm left behind it. */
+            CHECK(waitid(P_PID, (id_t)pid, &si, WEXITED | WNOWAIT) == 0,
+                  "child for the empty-environ test has exited");
+            memset(&q, 0, sizeof(q));
+            q.name = "LD_PRELOAD";
+            errno = 0;
+            rc = ac_read_environ_vars((int)pid, &q, 1);
+            CHECK(rc == -1 && !q.found,
+                  "an empty environ is reported as inconclusive, not as "
+                  "nothing set");
+            waitpid(pid, NULL, 0);
+        }
+    }
+
+    /* --- environ: an environ past the read buffer keeps its matches --- */
+    {
+        /* Each execve() string is capped at 128 KiB, so three of them put
+         * the total past AC_ENVIRON_BUF. LD_PRELOAD sits first, inside
+         * the part that is read. */
+        enum { PAD_LEN = 100 * 1024 };
+        char *pad[3] = { NULL, NULL, NULL };
+        char *envp[6];
+        char *argv_sleep[] = { "sleep", "10", NULL };
+        pid_t pid;
+        unsigned int k;
+
+        for (k = 0; k < 3; k++) {
+            pad[k] = malloc(PAD_LEN + 1);
+            CHECK(pad[k] != NULL, "allocate environ padding");
+            if (!pad[k])
+                break;
+            memset(pad[k], 'p', PAD_LEN);
+            pad[k][PAD_LEN] = '\0';
+            memcpy(pad[k], "PAD=", 4);
+        }
+        envp[0] = "LD_PRELOAD=/tmp/cheat.so";
+        envp[1] = pad[0];
+        envp[2] = pad[1];
+        envp[3] = pad[2];
+        envp[4] = "LD_AUDIT=/tmp/audit.so";   /* past the buffer: unseen */
+        envp[5] = NULL;
+        if (pad[0] && pad[1] && pad[2]) {
+            pid = fork();
+            CHECK(pid >= 0, "fork for the oversized-environ test");
+            if (pid == 0) {
+                execve("/bin/sleep", argv_sleep, envp);
+                _exit(127);
+            }
+            if (pid > 0) {
+                struct ac_environ_query vars[AC_LD_INJECT_ENV_VARS_COUNT];
+                char comm[32] = "";
+                int tries, rc, err;
+
+                /* Until the exec lands, /proc/<pid>/environ is still the
+                 * forked copy of ours; wait for the new comm. */
+                for (tries = 0; tries < 200; tries++) {
+                    char p[64];
+                    FILE *f;
+
+                    snprintf(p, sizeof(p), "/proc/%d/comm", (int)pid);
+                    f = fopen(p, "r");
+                    if (f) {
+                        if (fgets(comm, sizeof(comm), f) &&
+                            strncmp(comm, "sleep", 5) == 0) {
+                            fclose(f);
+                            break;
+                        }
+                        fclose(f);
+                    }
+                    usleep(10 * 1000);
+                }
+                CHECK(strncmp(comm, "sleep", 5) == 0,
+                      "child for the oversized-environ test has exec'd");
+                errno = 0;
+                rc = ac_read_ld_inject_vars((int)pid, vars);
+                err = errno;
+                CHECK(rc == -1 && err == EMSGSIZE,
+                      "an environ past the buffer reports EMSGSIZE");
+                CHECK(vars[0].found &&
+                      strcmp(vars[0].value, "/tmp/cheat.so") == 0,
+                      "a match in the readable part survives the EMSGSIZE");
+                CHECK(!vars[1].found,
+                      "an entry past the buffer is not claimed as found");
+                kill(pid, SIGKILL);
+                waitpid(pid, NULL, 0);
+            }
+        }
+        for (k = 0; k < 3; k++)
+            free(pad[k]);
     }
 
     if (failures) {
