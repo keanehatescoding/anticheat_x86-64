@@ -138,9 +138,12 @@ int main(void)
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0,
               "socketpair for the status line deadline test");
         pid = fork();
+        CHECK(pid >= 0, "fork for the status line deadline test");
         if (pid == 0) {
             close(sv[0]);
-            usleep(700 * 1000);
+            /* well inside the 1s deadline, so scheduling jitter can't push
+             * the byte past it and fail the first assertion */
+            usleep(400 * 1000);
             if (write(sv[1], "H", 1) != 1)
                 _exit(1);
             usleep(2000 * 1000);
@@ -158,8 +161,12 @@ int main(void)
               "the read after a late byte waits only for the rest of the "
               "deadline");
         close(sv[0]);
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0);
+        /* kill(-1, ...) would signal every process we can; never let a
+         * failed fork() reach it */
+        if (pid > 0) {
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+        }
     }
     {
         int sv[2];
