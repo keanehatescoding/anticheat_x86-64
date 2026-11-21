@@ -2060,6 +2060,25 @@ static const char *ac_environ_trunc_note(const struct ac_environ_query *q)
     return q->truncated ? " [value truncated]" : "";
 }
 
+/* Room for ac_environ_occ_note()'s longest output, " [4294967295 entries]"
+ * plus the NUL. */
+#define AC_ENVIRON_OCC_NOTE_LEN 24
+
+/* For a collect_all variable, says how many entries the parser matched, so a
+ * list cut at AC_ENVIRON_VAL_LEN still tells the operator how many libraries
+ * were really there. Empty for any other query. */
+static const char *ac_environ_occ_note(const struct ac_environ_query *q,
+                                        char *buf, size_t buflen)
+{
+    if (!q->collect_all || !q->found) {
+        buf[0] = '\0';
+        return buf;
+    }
+    snprintf(buf, buflen, " [%u %s]", q->occurrences,
+             q->occurrences == 1 ? "entry" : "entries");
+    return buf;
+}
+
 /* The dynamic-linker variables that load a caller-chosen library into the
  * process: LD_PRELOAD, and LD_AUDIT, whose audit libraries are loaded
  * before anything else and can rebind every symbol lookup. */
@@ -2116,6 +2135,8 @@ static void ac_fmt_environ_warning(char *out, size_t outlen, int pid,
 {
     const char *trunc_note = ac_environ_trunc_note(q);
     const char *inc_note = incomplete ? AC_ENVIRON_INCOMPLETE_NOTE : "";
+    char occ_buf[AC_ENVIRON_OCC_NOTE_LEN];
+    const char *occ_note = ac_environ_occ_note(q, occ_buf, sizeof(occ_buf));
     char head[128];
     size_t hl, reserve, vlen, cap;
     int cut;
@@ -2125,15 +2146,17 @@ static void ac_fmt_environ_warning(char *out, size_t outlen, int pid,
                           (int)AC_MAX_COMM, comm, q->name);
     if (hl >= sizeof(head))
         hl = sizeof(head) - 1;
-    reserve = hl + strlen(trunc_note) + strlen(AC_ENVIRON_LOG_CUT_NOTE) +
-              strlen(inc_note) + strlen(tail) + 1;
+    reserve = hl + strlen(occ_note) + strlen(trunc_note) +
+              strlen(AC_ENVIRON_LOG_CUT_NOTE) + strlen(inc_note) +
+              strlen(tail) + 1;
     cap = outlen > reserve ? outlen - reserve : 0;
     vlen = strlen(q->value);
     cut = vlen > cap;
     if (cut)
         vlen = cap;
-    snprintf(out, outlen, "%s%.*s%s%s%s%s", head, (int)vlen, q->value,
-             trunc_note, cut ? AC_ENVIRON_LOG_CUT_NOTE : "", inc_note, tail);
+    snprintf(out, outlen, "%s%.*s%s%s%s%s%s", head, (int)vlen, q->value,
+             occ_note, trunc_note, cut ? AC_ENVIRON_LOG_CUT_NOTE : "",
+             inc_note, tail);
 }
 
 /* CLI-facing wrapper for `scan --check-preload`. */
@@ -2164,7 +2187,10 @@ static int check_ld_preload(int pid)
                 printf("  %s check: not set\n", vars[i].name);
             continue;
         }
-        printf("  %s check: %s%s%s\n", vars[i].name, vars[i].value,
+        char occ_buf[AC_ENVIRON_OCC_NOTE_LEN];
+
+        printf("  %s check: %s%s%s%s\n", vars[i].name, vars[i].value,
+               ac_environ_occ_note(&vars[i], occ_buf, sizeof(occ_buf)),
                ac_environ_trunc_note(&vars[i]),
                incomplete ? AC_ENVIRON_INCOMPLETE_NOTE : "");
         found_any = 1;

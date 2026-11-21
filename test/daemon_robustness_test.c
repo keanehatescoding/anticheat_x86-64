@@ -524,6 +524,47 @@ int main(void)
               strstr(line, "not a verdict on its own") != NULL,
               "the same holds for the Vulkan-layer warning");
 
+        /* A collected LD_AUDIT list reports its entry count, and that
+         * qualifier is reserved before the value is shortened. */
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_AUDIT";
+        q.collect_all = 1;
+        memset(q.value, 'z', sizeof(q.value) - 1);
+        q.found = 1;
+        q.truncated = 1;
+        q.occurrences = 4294967295u;
+        ac_fmt_environ_warning(line, sizeof(line), 2147483647,
+                               "0123456789abcde", &q, 1, AC_LD_WARN_TAIL);
+        CHECK(strlen(line) <= sizeof(line) - 1 &&
+              strcmp(line + strlen(line) - strlen(AC_LD_WARN_TAIL),
+                     AC_LD_WARN_TAIL) == 0 &&
+              strstr(line, " [4294967295 entries]") != NULL &&
+              strstr(line, "[value truncated]") != NULL &&
+              strstr(line, AC_ENVIRON_LOG_CUT_NOTE) != NULL &&
+              strstr(line, AC_ENVIRON_INCOMPLETE_NOTE) != NULL,
+              "a truncated, incomplete LD_AUDIT list still reports its "
+              "entry count beside every other qualifier");
+
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_AUDIT";
+        q.collect_all = 1;
+        snprintf(q.value, sizeof(q.value), "/a.so:/b.so");
+        q.found = 1;
+        q.occurrences = 2;
+        ac_fmt_environ_warning(line, sizeof(line), 42, "game", &q, 0,
+                               AC_LD_WARN_TAIL);
+        CHECK(strncmp(line, "pid 42 (game): LD_AUDIT=/a.so:/b.so [2 entries]"
+                      " set at exec -- ",
+                      sizeof("pid 42 (game): LD_AUDIT=/a.so:/b.so [2 entries]"
+                             " set at exec -- ") - 1) == 0,
+              "a short LD_AUDIT list shows its entry count");
+        q.occurrences = 1;
+        snprintf(q.value, sizeof(q.value), "/a.so");
+        ac_fmt_environ_warning(line, sizeof(line), 42, "game", &q, 0,
+                               AC_LD_WARN_TAIL);
+        CHECK(strstr(line, "LD_AUDIT=/a.so [1 entry] set at exec") != NULL,
+              "a single LD_AUDIT entry is reported as 1 entry");
+
         memset(&q, 0, sizeof(q));
         q.name = "LD_PRELOAD";
         snprintf(q.value, sizeof(q.value), "/tmp/cheat.so");
