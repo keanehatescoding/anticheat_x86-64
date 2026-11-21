@@ -90,7 +90,9 @@ AC_SLEEPER_SRC="$AC_TESTBIN_DIR/sleeper.c"
 AC_SLEEPER_BIN="$AC_TESTBIN_DIR/sleeper.bin"
 printf '%s\n' '#include <unistd.h>' \
     'int main(void) { sleep(30); return 0; }' > "$AC_SLEEPER_SRC"
-"${CC:-cc}" -o "$AC_SLEEPER_BIN" "$AC_SLEEPER_SRC" || {
+# CC is expanded unquoted on purpose, as the Makefile does, so a value like
+# CC='ccache gcc' (compiler plus arguments) still works.
+${CC:-cc} -o "$AC_SLEEPER_BIN" "$AC_SLEEPER_SRC" || {
     echo "FAIL could not build the test sleeper with ${CC:-cc}"
     exit 1
 }
