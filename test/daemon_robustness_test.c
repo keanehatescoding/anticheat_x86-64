@@ -82,6 +82,11 @@ static int looks_like_clock(const char *s)
         isdigit((unsigned char)s[6]) && isdigit((unsigned char)s[7]);
 }
 
+/* Runs the #29 robustness checks against the daemon's own helpers (the .c
+ * is #included above): event-time formatting, the bounded resolver-child
+ * reap, and environ parsing -- repeated names, value truncation, an empty
+ * environ, and an environ past the read buffer. Exits 1 if any check
+ * failed. */
 int main(void)
 {
     char ts[32];

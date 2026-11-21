@@ -40,6 +40,11 @@ static int failures;
     } \
 } while (0)
 
+/* Exercises ac_http_status_code() and ac_read_status_line() directly: the
+ * status-code parser's accept/reject cases, a status line split across
+ * reads, the overall deadline (a late byte must not buy a further full
+ * timeout), and the buffer-bound / drain behaviour. Exits 1 if any check
+ * failed. */
 int main(void)
 {
     /* well-formed lines */

@@ -2981,6 +2981,11 @@ static void anon_baseline_forget_stale(const struct ac_prot_list *pl)
     }
 }
 
+/* Compares `count` (the pid's current anonymous executable mapping count)
+ * against the count first observed for it, and logs any growth: a WARNING
+ * for a JIT-marked process, where growth is expected, and a CRIT otherwise
+ * as possible post-start code injection. The first observation just
+ * records the baseline in a free g_anon_baseline slot. */
 static void anon_baseline_check(int pid, const char *comm, unsigned int count,
                                  int jit_allowed)
 {
@@ -3248,6 +3253,12 @@ static void preload_mark_warned(int pid)
     }
 }
 
+/* Periodic LD_PRELOAD / LD_AUDIT sweep over every protected pid. Each pid
+ * is warned about at most once, since its environ is fixed at exec: for a
+ * match, or -- when the environ was larger than AC_ENVIRON_BUF and nothing
+ * matched in the readable part -- for the incomplete scan. Any other read
+ * failure (exited process, unreadable environ) is skipped and retried on
+ * the next interval. Informational only; never a verdict on its own. */
 static void check_ld_preload_periodic(void)
 {
     struct ac_prot_list pl;
@@ -3354,6 +3365,11 @@ static void vklayer_mark_warned(int pid)
     }
 }
 
+/* Periodic sweep for Vulkan-layer activation variables (see
+ * AC_VK_LAYER_ENV_VARS) over every protected pid, warning at most once per
+ * pid. A pid whose environ can't be read in full is skipped and retried on
+ * the next interval. Informational only: these variables are also set by
+ * legitimate overlay tools such as MangoHud. */
 static void check_vk_layers_periodic(void)
 {
     struct ac_prot_list pl;
@@ -4457,6 +4473,12 @@ static size_t ac_utf8_seq_len(const unsigned char *s)
     return len;
 }
 
+/* Escapes `in` for embedding in a JSON string literal, writing a
+ * NUL-terminated result into out[outsz] and truncating at a whole token
+ * if it doesn't fit (a no-op for outsz == 0). Control characters and the
+ * JSON metacharacters are escaped; well-formed UTF-8 passes through
+ * unchanged, and any other byte >= 0x80 (a non-UTF-8 comm or path)
+ * becomes � so the report body is always valid JSON (#29). */
 static void ac_json_escape(const char *in, char *out, size_t outsz)
 {
     size_t o = 0;
@@ -4862,7 +4884,13 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
 }
 
 
-
+/* Delivers one event to the configured report server (AC_REPORT_URL, with
+ * AC_REPORT_KEY as the bearer token) as a JSON POST. Best-effort: a no-op
+ * when reporting isn't configured, and every failure -- bad URL, header
+ * injection attempt, resolve/connect error, short or non-2xx response --
+ * is logged and swallowed, never propagated to the monitor loop. The whole
+ * exchange is bounded by AC_REPORT_TIMEOUT_SEC, including the status-line
+ * read (see ac_read_status_line()). */
 static void ac_report(const char *event_type, const char *detail)
 {
     const char *url = ac_getenv("AC_REPORT_URL");
