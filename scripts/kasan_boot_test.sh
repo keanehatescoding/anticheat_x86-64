@@ -109,7 +109,15 @@ for sym in CONFIG_KASAN CONFIG_KASAN_GENERIC CONFIG_LOCKDEP CONFIG_PROVE_LOCKING
 done
 
 echo "== building the kernel (full build, not modules_prepare -- this is slow) =="
-make -C "$KDIR" ARCH=x86_64 -j"$(nproc)" all
+# GCC 15 added -Wunterminated-string-initialization, which this vanilla
+# 6.12.0 tree trips on its own ACPI table signatures (drivers/acpi/tables.c:
+# 4-char "BERT"/"APIC"/... literals into char[4]; those are intentionally
+# unterminated), and the defconfig's CONFIG_WERROR turns it into a build
+# failure. Upstream silenced it in later kernels; do the same here, for this
+# throwaway test kernel only, rather than disabling -Werror wholesale. Older
+# GCCs simply don't know the warning, so the flag is harmless there.
+make -C "$KDIR" ARCH=x86_64 -j"$(nproc)" \
+    KCFLAGS="-Wno-unterminated-string-initialization" all
 
 echo "== building anticheat.ko against this tree =="
 make -C "$REPO_ROOT" KDIR="$KDIR" module
