@@ -146,9 +146,13 @@ int main(void)
         CHECK(pid >= 0, "fork for the status line deadline test");
         if (pid == 0) {
             close(sv[0]);
-            /* well inside the 1s deadline, so scheduling jitter can't push
-             * the byte past it and fail the first assertion */
-            usleep(400 * 1000);
+            /* Timeline for the 1s deadline: this byte lands at ~0.6s, 0.4s
+             * inside it, so jitter can't push it past the deadline and
+             * fail the first assertion. A correct reader then returns at
+             * ~1.0s; one that restarts a full timeout after the byte
+             * returns at ~1.6s. The 1.3s bound below sits 0.3s from each,
+             * so it passes the first and rejects the second. */
+            usleep(600 * 1000);
             if (write(sv[1], "H", 1) != 1)
                 _exit(1);
             usleep(2000 * 1000);
@@ -162,9 +166,9 @@ int main(void)
         clock_gettime(CLOCK_MONOTONIC, &t1);
         elapsed = (double)(t1.tv_sec - t0.tv_sec) +
                   (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
-        CHECK(elapsed < 1.5,
+        CHECK(elapsed < 1.3,
               "the read after a late byte waits only for the rest of the "
-              "deadline");
+              "deadline, not a further full timeout");
         close(sv[0]);
         /* kill(-1, ...) would signal every process we can; never let a
          * failed fork() reach it */

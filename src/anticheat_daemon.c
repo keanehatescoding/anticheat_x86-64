@@ -110,10 +110,15 @@ static void die(const char *fmt, ...)
     exit(1);
 }
 
+/* logmsg()'s line buffer: anything longer is cut, so callers that print an
+ * untrusted, variable-length value must budget for it (see
+ * ac_fmt_environ_warning()). */
+#define AC_LOG_LINE_MAX 512
+
 static void logmsg(int pri, const char *fmt, ...)
 {
     va_list ap;
-    char buf[512];
+    char buf[AC_LOG_LINE_MAX];
 
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -2032,9 +2037,17 @@ struct ac_environ_query {
      * first (getenv(), i.e. what the Vulkan loader sees) or, if set, the
      * last (ld.so's own scan of envp for its LD_* variables). */
     int last_wins;
+    /* If set, every occurrence counts: ld.so appends each LD_AUDIT= value
+     * to its audit list rather than letting the last one replace the
+     * others, so all of them are loader inputs. The values are joined with
+     * ':' (the list separator, so the result reads like the one ld.so
+     * builds) and take precedence over last_wins. */
+    int collect_all;
     char value[AC_ENVIRON_VAL_LEN];       /* out */
     int found;                            /* out */
     int truncated;                        /* out: value didn't fit */
+    unsigned int occurrences;             /* out: matching entries seen,
+                                           * including any past the cap */
 };
 
 static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
@@ -2073,6 +2086,55 @@ static const char *const AC_VK_LAYER_ENV_VARS[] = {
  * what the cut-off part could hold, so a match from the readable prefix may
  * not be the one in effect. */
 #define AC_ENVIRON_INCOMPLETE_NOTE " [environ truncated: a later entry may override]"
+
+/* Appended when the value had to be shortened a second time to fit the log
+ * line, beyond any cut already made at AC_ENVIRON_VAL_LEN. */
+#define AC_ENVIRON_LOG_CUT_NOTE " [value cut for log]"
+
+#define AC_LD_WARN_TAIL \
+    " set at exec -- common for legitimate overlay/compat tools (MangoHud, " \
+    "gamemode, gamescope) as well as library-injection hooking; " \
+    "informational only, not a verdict on its own"
+#define AC_VK_WARN_TAIL \
+    " set at exec -- common for legitimate overlay tools (MangoHud) as well " \
+    "as Vulkan-layer-based hooking; informational only, not a verdict on " \
+    "its own"
+
+/* Formats "pid N (comm): NAME=<value><qualifiers><tail>" into out so that
+ * the qualifiers and the tail always survive: the value is the only
+ * variable-length part, so it alone is shortened, to whatever is left after
+ * everything else (qualifiers reserved up front) is accounted for, and
+ * AC_ENVIRON_LOG_CUT_NOTE says so when that happens. Without this, a value
+ * near AC_ENVIRON_VAL_LEN fills logmsg()'s buffer and the "[value
+ * truncated]" / incomplete-environ notes, which say how far to trust it,
+ * are the bytes lost. out must be AC_LOG_LINE_MAX bytes (or more) so
+ * logmsg() can't cut the result again. */
+static void ac_fmt_environ_warning(char *out, size_t outlen, int pid,
+                                    const char *comm,
+                                    const struct ac_environ_query *q,
+                                    int incomplete, const char *tail)
+{
+    const char *trunc_note = ac_environ_trunc_note(q);
+    const char *inc_note = incomplete ? AC_ENVIRON_INCOMPLETE_NOTE : "";
+    char head[128];
+    size_t hl, reserve, vlen, cap;
+    int cut;
+
+    /* comm is kernel-supplied: bound it rather than trust a terminator. */
+    hl = (size_t)snprintf(head, sizeof(head), "pid %d (%.*s): %s=", pid,
+                          (int)AC_MAX_COMM, comm, q->name);
+    if (hl >= sizeof(head))
+        hl = sizeof(head) - 1;
+    reserve = hl + strlen(trunc_note) + strlen(AC_ENVIRON_LOG_CUT_NOTE) +
+              strlen(inc_note) + strlen(tail) + 1;
+    cap = outlen > reserve ? outlen - reserve : 0;
+    vlen = strlen(q->value);
+    cut = vlen > cap;
+    if (cut)
+        vlen = cap;
+    snprintf(out, outlen, "%s%.*s%s%s%s%s", head, (int)vlen, q->value,
+             trunc_note, cut ? AC_ENVIRON_LOG_CUT_NOTE : "", inc_note, tail);
+}
 
 /* CLI-facing wrapper for `scan --check-preload`. */
 static int check_ld_preload(int pid)
@@ -3060,6 +3122,30 @@ static void anon_baseline_check(int pid, const char *comm, unsigned int count,
 /* The scan itself, over `total` bytes of NUL-separated entries; buf[total]
  * must be a NUL. Split out of ac_read_environ_vars() so it can be tested
  * without a /proc. */
+static void ac_environ_append_value(struct ac_environ_query *q,
+                                     const char *val)
+{
+    size_t have = strlen(q->value);
+    size_t vlen = strlen(val);
+
+    /* An empty occurrence adds nothing to the loader's list. */
+    if (vlen == 0)
+        return;
+    if (have > 0) {
+        /* Room for the separator and at least one byte after it, or the
+         * value would end in a dangling ':'. */
+        if (have + 2 >= sizeof(q->value)) {
+            q->truncated = 1;
+            return;
+        }
+        q->value[have++] = ':';
+        q->value[have] = '\0';
+    }
+    if (vlen >= sizeof(q->value) - have)
+        q->truncated = 1;
+    snprintf(q->value + have, sizeof(q->value) - have, "%s", val);
+}
+
 static void ac_parse_environ_buf(const char *buf, size_t total,
                                  struct ac_environ_query *vars,
                                  unsigned int nvars)
@@ -3083,11 +3169,20 @@ static void ac_parse_environ_buf(const char *buf, size_t total,
             size_t nlen = strlen(vars[i].name);
             const char *val = entry + nlen + 1;
 
-            /* A repeated name: keep whichever entry its consumer acts
-             * on. Taking the first LD_PRELOAD= let a benign one in front
-             * hide the one ld.so actually loads (#29). */
-            if ((vars[i].found && !vars[i].last_wins) || entry_len <= nlen ||
+            if (entry_len <= nlen ||
                 strncmp(entry, vars[i].name, nlen) != 0 || entry[nlen] != '=')
+                continue;
+            vars[i].occurrences++;
+            /* A repeated name: act on the entry (or entries) its consumer
+             * does. Taking the first LD_PRELOAD= let a benign one in front
+             * hide the one ld.so actually loads (#29); LD_AUDIT= entries
+             * all accumulate in ld.so's audit list, so none may hide
+             * another. */
+            if (vars[i].found && vars[i].collect_all) {
+                ac_environ_append_value(&vars[i], val);
+                continue;
+            }
+            if (vars[i].found && !vars[i].last_wins)
                 continue;
             snprintf(vars[i].value, sizeof(vars[i].value), "%s", val);
             vars[i].truncated = strlen(val) >= sizeof(vars[i].value);
@@ -3111,6 +3206,7 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
     for (i = 0; i < nvars; i++) {
         vars[i].found = 0;
         vars[i].truncated = 0;
+        vars[i].occurrences = 0;
     }
 
     snprintf(path, sizeof(path), "/proc/%d/environ", pid);
@@ -3169,7 +3265,9 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
 }
 
 /* Fills vars[AC_LD_INJECT_ENV_VARS_COUNT], one per AC_LD_INJECT_ENV_VARS
- * entry; same return as ac_read_environ_vars(). */
+ * entry; same return as ac_read_environ_vars(). LD_PRELOAD keeps
+ * last-wins selection; LD_AUDIT collects every occurrence (see
+ * ac_environ_query.collect_all). */
 static int ac_read_ld_inject_vars(int pid, struct ac_environ_query *vars)
 {
     unsigned int i;
@@ -3177,7 +3275,10 @@ static int ac_read_ld_inject_vars(int pid, struct ac_environ_query *vars)
     for (i = 0; i < AC_LD_INJECT_ENV_VARS_COUNT; i++) {
         memset(&vars[i], 0, sizeof(vars[i]));
         vars[i].name = AC_LD_INJECT_ENV_VARS[i];
-        vars[i].last_wins = 1;
+        if (strcmp(vars[i].name, "LD_AUDIT") == 0)
+            vars[i].collect_all = 1;
+        else
+            vars[i].last_wins = 1;
     }
     return ac_read_environ_vars(pid, vars, AC_LD_INJECT_ENV_VARS_COUNT);
 }
@@ -3271,6 +3372,7 @@ static void check_ld_preload_periodic(void)
     preload_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_environ_query vars[AC_LD_INJECT_ENV_VARS_COUNT];
+        char line[AC_LOG_LINE_MAX];
         int found_any = 0, incomplete = 0;
 
         if (preload_already_warned(pl.items[i].pid))
@@ -3287,13 +3389,10 @@ static void check_ld_preload_periodic(void)
             if (!vars[j].found)
                 continue;
             found_any = 1;
-            logmsg(LOG_WARNING, "pid %d (%s): %s=%s%s%s set at exec -- "
-                   "common for legitimate overlay/compat tools (MangoHud, "
-                   "gamemode, gamescope) as well as library-injection "
-                   "hooking; informational only, not a verdict on its own",
-                   pl.items[i].pid, pl.items[i].comm, vars[j].name,
-                   vars[j].value, ac_environ_trunc_note(&vars[j]),
-                   incomplete ? AC_ENVIRON_INCOMPLETE_NOTE : "");
+            ac_fmt_environ_warning(line, sizeof(line), pl.items[i].pid,
+                                   pl.items[i].comm, &vars[j], incomplete,
+                                   AC_LD_WARN_TAIL);
+            logmsg(LOG_WARNING, "%s", line);
         }
         if (incomplete && !found_any)
             /* An oversized environ would otherwise be skipped silently,
@@ -3382,6 +3481,7 @@ static void check_vk_layers_periodic(void)
     vklayer_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_environ_query vars[AC_VK_LAYER_ENV_VARS_COUNT];
+        char line[AC_LOG_LINE_MAX];
 
         if (vklayer_already_warned(pl.items[i].pid))
             continue;
@@ -3395,13 +3495,10 @@ static void check_vk_layers_periodic(void)
         for (j = 0; j < AC_VK_LAYER_ENV_VARS_COUNT; j++) {
             if (!vars[j].found)
                 continue;
-            logmsg(LOG_WARNING, "pid %d (%s): %s=%s%s set at exec -- "
-                   "common for legitimate overlay tools (MangoHud) as well "
-                   "as Vulkan-layer-based hooking; informational only, not "
-                   "a verdict on its own",
-                   pl.items[i].pid, pl.items[i].comm,
-                   vars[j].name, vars[j].value,
-                   ac_environ_trunc_note(&vars[j]));
+            ac_fmt_environ_warning(line, sizeof(line), pl.items[i].pid,
+                                   pl.items[i].comm, &vars[j], 0,
+                                   AC_VK_WARN_TAIL);
+            logmsg(LOG_WARNING, "%s", line);
         }
         vklayer_mark_warned(pl.items[i].pid);
     }

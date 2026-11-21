@@ -390,6 +390,147 @@ int main(void)
               "values that fit are not flagged truncated");
     }
 
+    /* --- environ: every LD_AUDIT= entry is a loader input --- */
+    {
+        static const char env[] =
+            "LD_AUDIT=/tmp/evil.so\0A=1\0LD_PRELOAD=/first.so\0"
+            "LD_AUDIT=/tmp/benign.so\0LD_PRELOAD=/second.so\0"
+            "LD_AUDIT=\0LD_AUDITX=/not/this\0";
+        struct ac_environ_query q[2];
+
+        memset(q, 0, sizeof(q));
+        q[0].name = "LD_AUDIT";
+        q[0].collect_all = 1;
+        q[1].name = "LD_PRELOAD";
+        q[1].last_wins = 1;
+        ac_parse_environ_buf(env, sizeof(env) - 1, q, 2);
+        CHECK(q[0].found && q[0].occurrences == 3 &&
+              strcmp(q[0].value, "/tmp/evil.so:/tmp/benign.so") == 0,
+              "repeated LD_AUDIT= entries are all kept, an empty one adds "
+              "nothing, and an LD_AUDITX= lookalike is ignored");
+        CHECK(!q[0].truncated, "an LD_AUDIT list that fits is not flagged");
+        CHECK(q[1].found && strcmp(q[1].value, "/second.so") == 0,
+              "LD_PRELOAD keeps last-wins selection beside a collect_all "
+              "variable");
+    }
+    {
+        /* Occurrences that don't all fit: bounded, flagged, still counted. */
+        static char env[AC_ENVIRON_VAL_LEN * 4];
+        struct ac_environ_query q;
+        size_t pos = 0;
+        int k;
+
+        for (k = 0; k < 3; k++) {
+            pos += (size_t)snprintf(env + pos, sizeof(env) - pos,
+                                    "LD_AUDIT=") ;
+            memset(env + pos, 'a' + k, AC_ENVIRON_VAL_LEN / 2);
+            pos += AC_ENVIRON_VAL_LEN / 2;
+            env[pos++] = '\0';
+        }
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_AUDIT";
+        q.collect_all = 1;
+        ac_parse_environ_buf(env, pos, &q, 1);
+        CHECK(q.found && q.truncated && q.occurrences == 3 &&
+              strlen(q.value) < AC_ENVIRON_VAL_LEN &&
+              q.value[0] == 'a',
+              "a collected LD_AUDIT list past the cap stays in bounds, is "
+              "flagged truncated, and still counts every occurrence");
+    }
+    {
+        /* Through the real reader, from a real /proc/<pid>/environ. */
+        char *envp[] = { "LD_AUDIT=/tmp/evil.so", "LD_AUDIT=/tmp/benign.so",
+                         "LD_PRELOAD=/p1.so", "LD_PRELOAD=/p2.so", NULL };
+        char *argv_sleep[] = { "sleep", "10", NULL };
+        pid_t pid = fork();
+
+        CHECK(pid >= 0, "fork for the repeated-LD_AUDIT environ test");
+        if (pid == 0) {
+            execve("/bin/sleep", argv_sleep, envp);
+            _exit(127);
+        }
+        if (pid > 0) {
+            struct ac_environ_query vars[AC_LD_INJECT_ENV_VARS_COUNT];
+            char comm[32] = "";
+            int tries, rc;
+
+            for (tries = 0; tries < 200; tries++) {
+                char p[64];
+                FILE *f;
+
+                snprintf(p, sizeof(p), "/proc/%d/comm", (int)pid);
+                f = fopen(p, "r");
+                if (f) {
+                    if (fgets(comm, sizeof(comm), f) &&
+                        strncmp(comm, "sleep", 5) == 0) {
+                        fclose(f);
+                        break;
+                    }
+                    fclose(f);
+                }
+                usleep(10 * 1000);
+            }
+            rc = ac_read_ld_inject_vars((int)pid, vars);
+            CHECK(rc == 0 && vars[1].found &&
+                  strcmp(vars[1].value,
+                         "/tmp/evil.so:/tmp/benign.so") == 0,
+                  "ac_read_ld_inject_vars() reports both repeated LD_AUDIT "
+                  "libraries, not only the last");
+            CHECK(vars[0].found && strcmp(vars[0].value, "/p2.so") == 0,
+                  "ac_read_ld_inject_vars() still reports the last "
+                  "LD_PRELOAD");
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+        }
+    }
+
+    /* --- log line: the qualifiers survive a maximum-length value --- */
+    {
+        struct ac_environ_query q;
+        char line[AC_LOG_LINE_MAX];
+
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_PRELOAD";
+        memset(q.value, 'x', sizeof(q.value) - 1);
+        q.found = 1;
+        q.truncated = 1;
+        ac_fmt_environ_warning(line, sizeof(line), 2147483647,
+                               "0123456789abcde", &q, 1, AC_LD_WARN_TAIL);
+        CHECK(strlen(line) <= sizeof(line) - 1 &&
+              strlen(line) > strlen(AC_LD_WARN_TAIL) &&
+              strcmp(line + strlen(line) - strlen(AC_LD_WARN_TAIL),
+                     AC_LD_WARN_TAIL) == 0 &&
+              strstr(line, "[value truncated]") != NULL &&
+              strstr(line, AC_ENVIRON_LOG_CUT_NOTE) != NULL &&
+              strstr(line, AC_ENVIRON_INCOMPLETE_NOTE) != NULL &&
+              strstr(line, "not a verdict on its own") != NULL,
+              "a full-length LD_* value keeps its truncation qualifiers, "
+              "marks the extra log cut, and ends with the usual tail");
+
+        memset(&q, 0, sizeof(q));
+        q.name = "VK_LAYER_PATH";
+        memset(q.value, 'y', sizeof(q.value) - 1);
+        q.found = 1;
+        q.truncated = 1;
+        ac_fmt_environ_warning(line, sizeof(line), 1, "game", &q, 0,
+                               AC_VK_WARN_TAIL);
+        CHECK(strstr(line, "[value truncated]") != NULL &&
+              strstr(line, "not a verdict on its own") != NULL,
+              "the same holds for the Vulkan-layer warning");
+
+        memset(&q, 0, sizeof(q));
+        q.name = "LD_PRELOAD";
+        snprintf(q.value, sizeof(q.value), "/tmp/cheat.so");
+        q.found = 1;
+        ac_fmt_environ_warning(line, sizeof(line), 42, "game", &q, 0,
+                               AC_LD_WARN_TAIL);
+        CHECK(strncmp(line, "pid 42 (game): LD_PRELOAD=/tmp/cheat.so set at "
+                      "exec -- ", 55) == 0 &&
+              strstr(line, AC_ENVIRON_LOG_CUT_NOTE) == NULL &&
+              strstr(line, "[value truncated]") == NULL,
+              "a short value is logged whole with no qualifiers");
+    }
+
     /* --- environ: a value too long for the buffer says so --- */
     {
         static char env[AC_ENVIRON_VAL_LEN * 2];
