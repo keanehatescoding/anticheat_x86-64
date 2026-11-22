@@ -81,8 +81,10 @@ echo "== protect --comm: exe-basename precision (issue #69) =="
 # scans the real /proc, not the mocked ioctl ABI, so it needs actual
 # pids on disk, not just mock state.
 AC_TESTBIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_testbin.XXXXXX") || exit 1
+# /proc/<pid>/exe reports the resolved path, so resolve any symlink in
+# TMPDIR once here; wait_for_exe compares against paths built from this.
+AC_TESTBIN_DIR=$(realpath "$AC_TESTBIN_DIR") || exit 1
 
-<<<<<<< HEAD
 # Wait for a just-forked child to actually exec the binary it was
 # started with. Until it does, /proc/<pid>/exe still points at the
 # shell's binary and /proc/<pid>/comm is still the shell's name, so
@@ -100,7 +102,8 @@ wait_for_exe() {
         sleep 0.1
     done
     return 1
-=======
+}
+
 # The binaries below are renamed copies, so they must not depend on their
 # own name: where /bin/sleep is a multicall binary (uutils coreutils), a
 # copy under another name dies with "unknown program". Build a tiny
@@ -114,7 +117,6 @@ printf '%s\n' '#include <unistd.h>' \
 ${CC:-cc} -o "$AC_SLEEPER_BIN" "$AC_SLEEPER_SRC" || {
     echo "FAIL could not build the test sleeper with ${CC:-cc}"
     exit 1
->>>>>>> origin/master
 }
 
 # > 15 chars, so the old comm-string-only match couldn't have found this

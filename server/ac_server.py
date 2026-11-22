@@ -1358,14 +1358,17 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             self._dispatch(self._do_GET)
 
         def _do_GET(self):
-            if self._rate_limited():
-                return
             parsed = urllib.parse.urlparse(self.path)
             path = urllib.parse.unquote(parsed.path)
-            if not path:
-                return self._send_json(404, {"error": "not found"})
+            # /healthz is dispatched before the per-IP rate limit so a
+            # readiness probe sharing a source IP with heavy traffic is
+            # never answered with a 429.
             if path == "/healthz":
                 return self._route_guarded(self._handle_healthz)
+            if self._rate_limited():
+                return
+            if not path:
+                return self._send_json(404, {"error": "not found"})
 
             if path.startswith("/banned/"):
                 return self._route_guarded(
