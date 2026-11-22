@@ -1337,7 +1337,7 @@ static void ac_mmu_release(struct mmu_notifier *subscription,
             e->removing = true;   /* pins the slot against ac_add_prot_mm()
                                     * reuse until the deferred worker's
                                     * unregister() call actually returns */
-        ac_prot_count--;
+        WRITE_ONCE(ac_prot_count, ac_prot_count - 1);
         removed = true;
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
@@ -1478,7 +1478,7 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
     ac_prots[slot].pid = pid;
     ac_prots[slot].jit_allowed = jit_allowed;
     strscpy(ac_prots[slot].comm, comm, sizeof(ac_prots[slot].comm));
-    ac_prot_count++;
+    WRITE_ONCE(ac_prot_count, ac_prot_count + 1);
     spin_unlock_irqrestore(&ac_prot_lock, flags);
     return 0;
 }
@@ -1623,6 +1623,16 @@ static bool ac_is_protected_mm(struct mm_struct *mm)
     bool prot = false;
 
     if (!mm)
+        return false;
+    /* #95: this is on every fork/thread-creation path (via ac_clone_ret())
+     * as well as ptrace/process_vm, and the overwhelmingly common case is
+     * that nothing at all is protected.  Skip the global irq-disabling
+     * lock and the AC_PROT_MAX-entry scan in that case.  ac_prot_count is
+     * changed only under ac_prot_lock, and a slot's mm is cleared before
+     * the count is decremented, so a stale zero can only describe an mm
+     * that was not protected when it was read -- a slot still being
+     * registered is not yet visible to any of these checks either. */
+    if (!READ_ONCE(ac_prot_count))
         return false;
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
