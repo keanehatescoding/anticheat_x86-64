@@ -582,7 +582,7 @@ def _requires_auth(keys):
 # have to be added to deliberately, rather than becoming public by
 # forgetting a decorator. test_auth_dispatch_unit.py asserts the
 # invariant over every registered route.
-PUBLIC_HANDLERS = frozenset()
+PUBLIC_HANDLERS = frozenset({"_handle_healthz"})
 
 
 class Store:
@@ -1358,12 +1358,18 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             self._dispatch(self._do_GET)
 
         def _do_GET(self):
-            if self._rate_limited():
-                return
             parsed = urllib.parse.urlparse(self.path)
             path = urllib.parse.unquote(parsed.path)
+            # /healthz is dispatched before the per-IP rate limit so a
+            # readiness probe sharing a source IP with heavy traffic is
+            # never answered with a 429.
+            if path == "/healthz":
+                return self._route_guarded(self._handle_healthz)
+            if self._rate_limited():
+                return
             if not path:
                 return self._send_json(404, {"error": "not found"})
+
             if path.startswith("/banned/"):
                 return self._route_guarded(
                     self._handle_banned, path[len("/banned/"):])
@@ -1437,6 +1443,9 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 return
             existed = store.unban(body["client_id"])
             self._send_json(200, {"ok": True, "was_banned": existed})
+
+        def _handle_healthz(self):
+            return self._send_json(200, {"status": "ok"})
 
         @_requires_auth(admin_keys)
         def _handle_banned(self, client_id):
