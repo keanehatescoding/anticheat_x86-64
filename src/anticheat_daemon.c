@@ -32,7 +32,7 @@
  *                           namespace that host-pid REFPID lives in
  *   scan --pid N --hash [--save|--check]   memory integrity baselines
  *   scan --pid N --check-hooks             Vulkan present-call hook check
- *   scan --pid N --check-preload           LD_PRELOAD check (heuristic)
+ *   scan --pid N --check-preload           LD_PRELOAD/LD_AUDIT check (heuristic)
  *   scan --pid N --check-vklayers          Vulkan-layer env var check (heuristic)
  *   scan --pid N --check-implicit-layers   implicit Vulkan-layer manifest check (heuristic)
  *   syscalls               verify syscall table integrity
@@ -110,10 +110,15 @@ static void die(const char *fmt, ...)
     exit(1);
 }
 
+/* logmsg()'s line buffer: anything longer is cut, so callers that print an
+ * untrusted, variable-length value must budget for it (see
+ * ac_fmt_environ_warning()). */
+#define AC_LOG_LINE_MAX 512
+
 static void logmsg(int pri, const char *fmt, ...)
 {
     va_list ap;
-    char buf[512];
+    char buf[AC_LOG_LINE_MAX];
 
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -1303,8 +1308,15 @@ static int elf_find_symbol_offset(int fd, const char *symbol,
         dynstr->sh_size == 0 || dynstr->sh_size > AC_ELF_MAX_STRTAB)
         goto out;
 
+    /* Bound sh_size itself, before narrowing: a crafted 64-bit sh_size
+     * (say 24 * (2^32 + 1)) would otherwise truncate to a small nsyms
+     * that passes the cap, and the malloc() below would be asked for the
+     * full, untruncated size (#29). */
+    if (dynsym->sh_size % sizeof(Elf64_Sym) != 0 ||
+        dynsym->sh_size / sizeof(Elf64_Sym) > AC_ELF_MAX_SYMS)
+        goto out;
     nsyms = (unsigned int)(dynsym->sh_size / sizeof(Elf64_Sym));
-    if (nsyms == 0 || nsyms > AC_ELF_MAX_SYMS)
+    if (nsyms == 0)
         goto out;
 
     syms = malloc(dynsym->sh_size);
@@ -2021,13 +2033,63 @@ static int ac_render_hook_check_interval(void)
 
 struct ac_environ_query {
     const char *name;                    /* variable name, no '=' */
+    /* Which entry counts when the name appears more than once: the
+     * first (getenv(), i.e. what the Vulkan loader sees) or, if set, the
+     * last (ld.so's own scan of envp for its LD_* variables). */
+    int last_wins;
+    /* If set, every occurrence counts: ld.so appends each LD_AUDIT= value
+     * to its audit list rather than letting the last one replace the
+     * others, so all of them are loader inputs. The values are joined with
+     * ':' (the list separator, so the result reads like the one ld.so
+     * builds) and take precedence over last_wins. */
+    int collect_all;
     char value[AC_ENVIRON_VAL_LEN];       /* out */
     int found;                            /* out */
+    int truncated;                        /* out: value didn't fit */
+    unsigned int occurrences;             /* out: matching entries seen,
+                                           * including any past the cap */
 };
 
 static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
                                  unsigned int nvars);
-static int ac_read_ld_preload(int pid, char *out, size_t outsz);
+
+/* Marks a value cut off at AC_ENVIRON_VAL_LEN, so a long list isn't
+ * mistaken for the whole of it. */
+static const char *ac_environ_trunc_note(const struct ac_environ_query *q)
+{
+    return q->truncated ? " [value truncated]" : "";
+}
+
+/* Room for ac_environ_occ_note()'s longest output, " [4294967295 entries]"
+ * plus the NUL. */
+#define AC_ENVIRON_OCC_NOTE_LEN 24
+
+/* For a collect_all variable, says how many entries the parser matched, so a
+ * list cut at AC_ENVIRON_VAL_LEN still tells the operator how many libraries
+ * were really there. Empty for any other query. */
+static const char *ac_environ_occ_note(const struct ac_environ_query *q,
+                                        char *buf, size_t buflen)
+{
+    if (!q->collect_all || !q->found) {
+        buf[0] = '\0';
+        return buf;
+    }
+    snprintf(buf, buflen, " [%u %s]", q->occurrences,
+             q->occurrences == 1 ? "entry" : "entries");
+    return buf;
+}
+
+/* The dynamic-linker variables that load a caller-chosen library into the
+ * process: LD_PRELOAD, and LD_AUDIT, whose audit libraries are loaded
+ * before anything else and can rebind every symbol lookup. */
+static const char *const AC_LD_INJECT_ENV_VARS[] = {
+    "LD_PRELOAD",
+    "LD_AUDIT",
+};
+#define AC_LD_INJECT_ENV_VARS_COUNT \
+    (sizeof(AC_LD_INJECT_ENV_VARS) / sizeof(AC_LD_INJECT_ENV_VARS[0]))
+
+static int ac_read_ld_inject_vars(int pid, struct ac_environ_query *vars);
 
 static const char *const AC_VK_LAYER_ENV_VARS[] = {
     "VK_INSTANCE_LAYERS",
@@ -2038,25 +2100,105 @@ static const char *const AC_VK_LAYER_ENV_VARS[] = {
 #define AC_VK_LAYER_ENV_VARS_COUNT \
     (sizeof(AC_VK_LAYER_ENV_VARS) / sizeof(AC_VK_LAYER_ENV_VARS[0]))
 
+/* Appended to a loader-variable match when /proc/<pid>/environ was larger
+ * than AC_ENVIRON_BUF: ld.so acts on the *last* entry, and that is exactly
+ * what the cut-off part could hold, so a match from the readable prefix may
+ * not be the one in effect. */
+#define AC_ENVIRON_INCOMPLETE_NOTE " [environ truncated: a later entry may override]"
+
+/* Appended when the value had to be shortened a second time to fit the log
+ * line, beyond any cut already made at AC_ENVIRON_VAL_LEN. */
+#define AC_ENVIRON_LOG_CUT_NOTE " [value cut for log]"
+
+#define AC_LD_WARN_TAIL \
+    " set at exec -- common for legitimate overlay/compat tools (MangoHud, " \
+    "gamemode, gamescope) as well as library-injection hooking; " \
+    "informational only, not a verdict on its own"
+#define AC_VK_WARN_TAIL \
+    " set at exec -- common for legitimate overlay tools (MangoHud) as well " \
+    "as Vulkan-layer-based hooking; informational only, not a verdict on " \
+    "its own"
+
+/* Formats "pid N (comm): NAME=<value><qualifiers><tail>" into out so that
+ * the qualifiers and the tail always survive: the value is the only
+ * variable-length part, so it alone is shortened, to whatever is left after
+ * everything else (qualifiers reserved up front) is accounted for, and
+ * AC_ENVIRON_LOG_CUT_NOTE says so when that happens. Without this, a value
+ * near AC_ENVIRON_VAL_LEN fills logmsg()'s buffer and the "[value
+ * truncated]" / incomplete-environ notes, which say how far to trust it,
+ * are the bytes lost. out must be AC_LOG_LINE_MAX bytes (or more) so
+ * logmsg() can't cut the result again. */
+static void ac_fmt_environ_warning(char *out, size_t outlen, int pid,
+                                    const char *comm,
+                                    const struct ac_environ_query *q,
+                                    int incomplete, const char *tail)
+{
+    const char *trunc_note = ac_environ_trunc_note(q);
+    const char *inc_note = incomplete ? AC_ENVIRON_INCOMPLETE_NOTE : "";
+    char occ_buf[AC_ENVIRON_OCC_NOTE_LEN];
+    const char *occ_note = ac_environ_occ_note(q, occ_buf, sizeof(occ_buf));
+    char head[128];
+    size_t hl, reserve, vlen, cap;
+    int cut;
+
+    /* comm is kernel-supplied: bound it rather than trust a terminator. */
+    hl = (size_t)snprintf(head, sizeof(head), "pid %d (%.*s): %s=", pid,
+                          (int)AC_MAX_COMM, comm, q->name);
+    if (hl >= sizeof(head))
+        hl = sizeof(head) - 1;
+    reserve = hl + strlen(occ_note) + strlen(trunc_note) +
+              strlen(AC_ENVIRON_LOG_CUT_NOTE) + strlen(inc_note) +
+              strlen(tail) + 1;
+    cap = outlen > reserve ? outlen - reserve : 0;
+    vlen = strlen(q->value);
+    cut = vlen > cap;
+    if (cut)
+        vlen = cap;
+    snprintf(out, outlen, "%s%.*s%s%s%s%s%s", head, (int)vlen, q->value,
+             occ_note, trunc_note, cut ? AC_ENVIRON_LOG_CUT_NOTE : "",
+             inc_note, tail);
+}
+
 /* CLI-facing wrapper for `scan --check-preload`. */
 static int check_ld_preload(int pid)
 {
-    char val[512];
-    int rc = ac_read_ld_preload(pid, val, sizeof(val));
+    struct ac_environ_query vars[AC_LD_INJECT_ENV_VARS_COUNT];
+    unsigned int i;
+    int found_any = 0, incomplete = 0;
 
-    if (rc < 0) {
-        printf("  LD_PRELOAD check: could not read /proc/%d/environ (%s)\n",
-               pid, strerror(errno));
-        return -1;
+    if (ac_read_ld_inject_vars(pid, vars) < 0) {
+        /* EMSGSIZE: environ exceeded the read buffer. The matches parsed
+         * from the prefix are still in vars[] -- report them, marked
+         * incomplete, instead of discarding them with the error. Every
+         * other failure leaves vars[] meaningless. */
+        if (errno != EMSGSIZE) {
+            printf("  LD_PRELOAD check: could not read /proc/%d/environ (%s)\n",
+                   pid, strerror(errno));
+            return -1;
+        }
+        incomplete = 1;
     }
-    if (rc == 0) {
-        printf("  LD_PRELOAD check: not set\n");
-        return 0;
+    for (i = 0; i < AC_LD_INJECT_ENV_VARS_COUNT; i++) {
+        if (!vars[i].found) {
+            if (incomplete)
+                printf("  %s check: not found in the readable part of environ "
+                       "(environ truncated; scan incomplete)\n", vars[i].name);
+            else
+                printf("  %s check: not set\n", vars[i].name);
+            continue;
+        }
+        char occ_buf[AC_ENVIRON_OCC_NOTE_LEN];
+
+        printf("  %s check: %s%s%s%s\n", vars[i].name, vars[i].value,
+               ac_environ_occ_note(&vars[i], occ_buf, sizeof(occ_buf)),
+               ac_environ_trunc_note(&vars[i]),
+               incomplete ? AC_ENVIRON_INCOMPLETE_NOTE : "");
+        found_any = 1;
     }
-    printf("  LD_PRELOAD check: %s\n"
-           "    (informational only -- also used by legitimate overlay/compat\n"
-           "     tools like MangoHud, gamemode, gamescope; not a verdict)\n",
-           val);
+    if (!found_any)
+        return incomplete ? -1 : 0;
+    printf("    (informational only -- also used by legitimate overlay/compat\n"
+           "     tools like MangoHud, gamemode, gamescope; not a verdict)\n");
     return 1;
 }
 
@@ -2081,7 +2223,8 @@ static int check_vk_layer_env(int pid)
     for (i = 0; i < AC_VK_LAYER_ENV_VARS_COUNT; i++) {
         if (!vars[i].found)
             continue;
-        printf("  Vulkan-layer check: %s=%s\n", vars[i].name, vars[i].value);
+        printf("  Vulkan-layer check: %s=%s%s\n", vars[i].name, vars[i].value,
+               ac_environ_trunc_note(&vars[i]));
         found_any = 1;
     }
     if (!found_any) {
@@ -2926,6 +3069,11 @@ static void anon_baseline_forget_stale(const struct ac_prot_list *pl)
     }
 }
 
+/* Compares `count` (the pid's current anonymous executable mapping count)
+ * against the count first observed for it, and logs any growth: a WARNING
+ * for a JIT-marked process, where growth is expected, and a CRIT otherwise
+ * as possible post-start code injection. The first observation just
+ * records the baseline in a free g_anon_baseline slot. */
 static void anon_baseline_check(int pid, const char *comm, unsigned int count,
                                  int jit_allowed)
 {
@@ -2990,12 +3138,86 @@ static void anon_baseline_check(int pid, const char *comm, unsigned int count,
  * the file once per variable name), filling vars[i].found/value for
  * whichever are present. Returns 0 on success (some or none may be
  * found; check vars[i].found individually), -1 if environ couldn't be
- * read at all or was too large to read in full before hitting
- * AC_ENVIRON_BUF -- in the latter case vars[i].found is only reliable
- * for names that were actually matched (a variable that would have
- * appeared past the truncation point is indistinguishable from one
+ * read at all, read back empty, or was too large to read in full before
+ * hitting AC_ENVIRON_BUF -- in the latter case vars[i].found is only
+ * reliable for names that were actually matched (a variable that would
+ * have appeared past the truncation point is indistinguishable from one
  * that was never set, so treat -1 as inconclusive, never a confident
  * "not set"). errno is set on failure. */
+
+/* The scan itself, over `total` bytes of NUL-separated entries; buf[total]
+ * must be a NUL. Split out of ac_read_environ_vars() so it can be tested
+ * without a /proc. */
+static void ac_environ_append_value(struct ac_environ_query *q,
+                                     const char *val)
+{
+    size_t have = strlen(q->value);
+    size_t vlen = strlen(val);
+
+    /* An empty occurrence adds nothing to the loader's list. */
+    if (vlen == 0)
+        return;
+    if (have > 0) {
+        /* Room for the separator and at least one byte after it, or the
+         * value would end in a dangling ':'. */
+        if (have + 2 >= sizeof(q->value)) {
+            q->truncated = 1;
+            return;
+        }
+        q->value[have++] = ':';
+        q->value[have] = '\0';
+    }
+    if (vlen >= sizeof(q->value) - have)
+        q->truncated = 1;
+    snprintf(q->value + have, sizeof(q->value) - have, "%s", val);
+}
+
+static void ac_parse_environ_buf(const char *buf, size_t total,
+                                 struct ac_environ_query *vars,
+                                 unsigned int nvars)
+{
+    size_t pos;
+    unsigned int i;
+
+    for (pos = 0; pos < total; ) {
+        const char *entry = buf + pos;
+        size_t entry_len = strlen(entry);
+
+        /* An empty entry is a valid envp element (execve() passes ""
+         * through as a bare NUL), not end-of-data -- skip it and keep
+         * scanning, or a leading "" hides every variable after it
+         * (#87). The loop bound is what ends the scan. */
+        if (entry_len == 0) {
+            pos++;
+            continue;
+        }
+        for (i = 0; i < nvars; i++) {
+            size_t nlen = strlen(vars[i].name);
+            const char *val = entry + nlen + 1;
+
+            if (entry_len <= nlen ||
+                strncmp(entry, vars[i].name, nlen) != 0 || entry[nlen] != '=')
+                continue;
+            vars[i].occurrences++;
+            /* A repeated name: act on the entry (or entries) its consumer
+             * does. Taking the first LD_PRELOAD= let a benign one in front
+             * hide the one ld.so actually loads (#29); LD_AUDIT= entries
+             * all accumulate in ld.so's audit list, so none may hide
+             * another. */
+            if (vars[i].found && vars[i].collect_all) {
+                ac_environ_append_value(&vars[i], val);
+                continue;
+            }
+            if (vars[i].found && !vars[i].last_wins)
+                continue;
+            snprintf(vars[i].value, sizeof(vars[i].value), "%s", val);
+            vars[i].truncated = strlen(val) >= sizeof(vars[i].value);
+            vars[i].found = 1;
+        }
+        pos += entry_len + 1;
+    }
+}
+
 static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
                                  unsigned int nvars)
 {
@@ -3004,12 +3226,14 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
     size_t total = 0;
     ssize_t n;
     int fd;
-    size_t pos;
     unsigned int i;
     int truncated;
 
-    for (i = 0; i < nvars; i++)
+    for (i = 0; i < nvars; i++) {
         vars[i].found = 0;
+        vars[i].truncated = 0;
+        vars[i].occurrences = 0;
+    }
 
     snprintf(path, sizeof(path), "/proc/%d/environ", pid);
     /* O_CLOEXEC: this fd must not leak into forked children (the DNS
@@ -3047,35 +3271,17 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
     }
     close(fd);
     if (total == 0) {
+        /* Nothing to read is not "nothing set": environ also reads back
+         * empty for a process that has already exited (no mm left), so
+         * this says nothing about what it was launched with (#29). */
         free(buf);
-        return 0;
+        errno = ENODATA;
+        return -1;
     }
     truncated = (total >= AC_ENVIRON_BUF - 1);
     buf[total] = '\0';
 
-    for (pos = 0; pos < total; ) {
-        const char *entry = buf + pos;
-        size_t entry_len = strlen(entry);
-
-        /* An empty entry is a valid envp element (execve() passes ""
-         * through as a bare NUL), not end-of-data -- skip it and keep
-         * scanning, or a leading "" hides every variable after it
-         * (#87). The loop bound and `truncated` are what end the scan. */
-        if (entry_len == 0) {
-            pos++;
-            continue;
-        }
-        for (i = 0; i < nvars; i++) {
-            size_t nlen = strlen(vars[i].name);
-
-            if (!vars[i].found && entry_len > nlen &&
-                strncmp(entry, vars[i].name, nlen) == 0 && entry[nlen] == '=') {
-                snprintf(vars[i].value, sizeof(vars[i].value), "%s", entry + nlen + 1);
-                vars[i].found = 1;
-            }
-        }
-        pos += entry_len + 1;
-    }
+    ac_parse_environ_buf(buf, total, vars, nvars);
     free(buf);
     if (truncated) {
         errno = EMSGSIZE;
@@ -3084,20 +3290,23 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
     return 0;
 }
 
-static int ac_read_ld_preload(int pid, char *out, size_t outsz)
+/* Fills vars[AC_LD_INJECT_ENV_VARS_COUNT], one per AC_LD_INJECT_ENV_VARS
+ * entry; same return as ac_read_environ_vars(). LD_PRELOAD keeps
+ * last-wins selection; LD_AUDIT collects every occurrence (see
+ * ac_environ_query.collect_all). */
+static int ac_read_ld_inject_vars(int pid, struct ac_environ_query *vars)
 {
-    struct ac_environ_query q;
-    int rc;
+    unsigned int i;
 
-    memset(&q, 0, sizeof(q));
-    q.name = "LD_PRELOAD";
-    rc = ac_read_environ_vars(pid, &q, 1);
-    if (rc < 0)
-        return -1;
-    if (!q.found)
-        return 0;
-    snprintf(out, outsz, "%s", q.value);
-    return 1;
+    for (i = 0; i < AC_LD_INJECT_ENV_VARS_COUNT; i++) {
+        memset(&vars[i], 0, sizeof(vars[i]));
+        vars[i].name = AC_LD_INJECT_ENV_VARS[i];
+        if (strcmp(vars[i].name, "LD_AUDIT") == 0)
+            vars[i].collect_all = 1;
+        else
+            vars[i].last_wins = 1;
+    }
+    return ac_read_environ_vars(pid, vars, AC_LD_INJECT_ENV_VARS_COUNT);
 }
 
 /* Vulkan-layer injection: the render-hook check above only catches
@@ -3171,10 +3380,16 @@ static void preload_mark_warned(int pid)
     }
 }
 
+/* Periodic LD_PRELOAD / LD_AUDIT sweep over every protected pid. Each pid
+ * is warned about at most once, since its environ is fixed at exec: for a
+ * match, or -- when the environ was larger than AC_ENVIRON_BUF and nothing
+ * matched in the readable part -- for the incomplete scan. Any other read
+ * failure (exited process, unreadable environ) is skipped and retried on
+ * the next interval. Informational only; never a verdict on its own. */
 static void check_ld_preload_periodic(void)
 {
     struct ac_prot_list pl;
-    unsigned int i;
+    unsigned int i, j;
 
     memset(&pl, 0, sizeof(pl));
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
@@ -3182,18 +3397,41 @@ static void check_ld_preload_periodic(void)
     pl.count = clamp_prot_count(pl.count);
     preload_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
-        char val[512];
+        struct ac_environ_query vars[AC_LD_INJECT_ENV_VARS_COUNT];
+        char line[AC_LOG_LINE_MAX];
+        int found_any = 0, incomplete = 0;
 
         if (preload_already_warned(pl.items[i].pid))
             continue;
-        if (ac_read_ld_preload(pl.items[i].pid, val, sizeof(val)) != 1)
-            continue;
-        logmsg(LOG_WARNING, "pid %d (%s): LD_PRELOAD=%s set at exec -- "
-               "common for legitimate overlay/compat tools (MangoHud, "
-               "gamemode, gamescope) as well as library-injection hooking; "
-               "informational only, not a verdict on its own",
-               pl.items[i].pid, pl.items[i].comm, val);
-        preload_mark_warned(pl.items[i].pid);
+        if (ac_read_ld_inject_vars(pl.items[i].pid, vars) < 0) {
+            /* Only EMSGSIZE leaves usable matches behind; anything else
+             * (exited process, unreadable environ) stays inconclusive and
+             * is retried next interval. */
+            if (errno != EMSGSIZE)
+                continue;
+            incomplete = 1;
+        }
+        for (j = 0; j < AC_LD_INJECT_ENV_VARS_COUNT; j++) {
+            if (!vars[j].found)
+                continue;
+            found_any = 1;
+            ac_fmt_environ_warning(line, sizeof(line), pl.items[i].pid,
+                                   pl.items[i].comm, &vars[j], incomplete,
+                                   AC_LD_WARN_TAIL);
+            logmsg(LOG_WARNING, "%s", line);
+        }
+        if (incomplete && !found_any)
+            /* An oversized environ would otherwise be skipped silently,
+             * which is exactly what an entry hidden past the buffer
+             * wants. */
+            logmsg(LOG_WARNING, "pid %d (%s): environ larger than the %d "
+                   "byte read buffer -- LD_PRELOAD/LD_AUDIT scan incomplete; "
+                   "informational only, not a verdict on its own",
+                   pl.items[i].pid, pl.items[i].comm, (int)AC_ENVIRON_BUF);
+        /* The environ is fixed at exec, so one warning per pid is enough,
+         * including for the incomplete case (no per-interval log spam). */
+        if (found_any || incomplete)
+            preload_mark_warned(pl.items[i].pid);
     }
 }
 
@@ -3252,6 +3490,11 @@ static void vklayer_mark_warned(int pid)
     }
 }
 
+/* Periodic sweep for Vulkan-layer activation variables (see
+ * AC_VK_LAYER_ENV_VARS) over every protected pid, warning at most once per
+ * pid. A pid whose environ can't be read in full is skipped and retried on
+ * the next interval. Informational only: these variables are also set by
+ * legitimate overlay tools such as MangoHud. */
 static void check_vk_layers_periodic(void)
 {
     struct ac_prot_list pl;
@@ -3264,6 +3507,7 @@ static void check_vk_layers_periodic(void)
     vklayer_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_environ_query vars[AC_VK_LAYER_ENV_VARS_COUNT];
+        char line[AC_LOG_LINE_MAX];
 
         if (vklayer_already_warned(pl.items[i].pid))
             continue;
@@ -3277,12 +3521,10 @@ static void check_vk_layers_periodic(void)
         for (j = 0; j < AC_VK_LAYER_ENV_VARS_COUNT; j++) {
             if (!vars[j].found)
                 continue;
-            logmsg(LOG_WARNING, "pid %d (%s): %s=%s set at exec -- "
-                   "common for legitimate overlay tools (MangoHud) as well "
-                   "as Vulkan-layer-based hooking; informational only, not "
-                   "a verdict on its own",
-                   pl.items[i].pid, pl.items[i].comm,
-                   vars[j].name, vars[j].value);
+            ac_fmt_environ_warning(line, sizeof(line), pl.items[i].pid,
+                                   pl.items[i].comm, &vars[j], 0,
+                                   AC_VK_WARN_TAIL);
+            logmsg(LOG_WARNING, "%s", line);
         }
         vklayer_mark_warned(pl.items[i].pid);
     }
@@ -4317,7 +4559,49 @@ static int ac_resolve_timeout(const char *host, const char *port,
  * contain attacker-influenced bytes (a process's comm name, a file path
  * from /proc), so this has to be correct, not just "usually fine" --
  * unescaped control characters or quotes here would let a crafted comm
- * name break the JSON body's structure. */
+ * name break the JSON body's structure. The same goes for bytes >= 0x80:
+ * a comm or path is arbitrary bytes, not necessarily UTF-8, and a body
+ * that isn't valid UTF-8 isn't valid JSON, so the server rejects the
+ * whole report. Well-formed sequences pass through; anything else becomes
+ * U+FFFD (#29). */
+
+/* Length (2-4) of the well-formed UTF-8 sequence at s, or 0 if there isn't
+ * one: a stray continuation byte, a truncated or overlong sequence, a
+ * surrogate, or a code point past U+10FFFF. Never reads past a NUL. */
+static size_t ac_utf8_seq_len(const unsigned char *s)
+{
+    size_t len, i;
+    unsigned int cp;
+
+    if (s[0] >= 0xc2 && s[0] <= 0xdf) {
+        len = 2;
+        cp = s[0] & 0x1f;
+    } else if (s[0] >= 0xe0 && s[0] <= 0xef) {
+        len = 3;
+        cp = s[0] & 0x0f;
+    } else if (s[0] >= 0xf0 && s[0] <= 0xf4) {
+        len = 4;
+        cp = s[0] & 0x07;
+    } else {
+        return 0;
+    }
+    for (i = 1; i < len; i++) {
+        if ((s[i] & 0xc0) != 0x80)
+            return 0;
+        cp = (cp << 6) | (s[i] & 0x3f);
+    }
+    if ((len == 3 && cp < 0x800) || (len == 4 && cp < 0x10000) ||
+        (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff)
+        return 0;
+    return len;
+}
+
+/* Escapes `in` for embedding in a JSON string literal, writing a
+ * NUL-terminated result into out[outsz] and truncating at a whole token
+ * if it doesn't fit (a no-op for outsz == 0). Control characters and the
+ * JSON metacharacters are escaped; well-formed UTF-8 passes through
+ * unchanged, and any other byte >= 0x80 (a non-UTF-8 comm or path)
+ * becomes � so the report body is always valid JSON (#29). */
 static void ac_json_escape(const char *in, char *out, size_t outsz)
 {
     size_t o = 0;
@@ -4327,6 +4611,19 @@ static void ac_json_escape(const char *in, char *out, size_t outsz)
     for (; *in && o + 7 < outsz; in++) {
         unsigned char c = (unsigned char)*in;
 
+        if (c >= 0x80) {
+            size_t len = ac_utf8_seq_len((const unsigned char *)in);
+
+            if (len) {
+                memcpy(out + o, in, len);
+                o += len;
+                in += len - 1;
+            } else {
+                memcpy(out + o, "\\ufffd", 6);
+                o += 6;
+            }
+            continue;
+        }
         switch (c) {
         case '"':  out[o++] = '\\'; out[o++] = '"';  break;
         case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
@@ -4426,6 +4723,58 @@ static int ac_http_status_code(const char *resp)
     if (p[3] != ' ' && p[3] != '\r' && p[3] != '\n' && p[3] != '\0')
         return -1;
     return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
+}
+
+/* Reads the start of the response into resp (NUL-terminated) until the
+ * status line is complete, resp is full, or the peer stops sending. One
+ * read() isn't enough: nothing makes the server's first segment carry the
+ * whole status line, and a line cut short parses as a failed delivery for
+ * a report that actually landed (#29). Returns the byte count, or what the
+ * last read() returned (0 or -1, errno set) if nothing arrived at all.
+ *
+ * The socket's SO_RCVTIMEO only bounds each read(), so the loop as a whole
+ * is held to timeout_sec too: a server trickling one byte per read would
+ * otherwise stall the monitor loop for a timeout per byte. Each read() is
+ * given only what is left of that deadline, so a byte arriving just before
+ * it can't buy a whole further timeout either. */
+static ssize_t ac_read_status_line(int fd, char *resp, size_t respsz,
+                                   int timeout_sec)
+{
+    struct timespec deadline, now;
+    struct timeval remaining;
+    size_t total = 0;
+    ssize_t n = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeout_sec;
+    while (total < respsz - 1) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        remaining.tv_sec = deadline.tv_sec - now.tv_sec;
+        remaining.tv_usec = (deadline.tv_nsec - now.tv_nsec) / 1000;
+        if (remaining.tv_usec < 0) {
+            remaining.tv_sec--;
+            remaining.tv_usec += 1000000;
+        }
+        /* A zero timeval would mean "block forever" to SO_RCVTIMEO. */
+        if (remaining.tv_sec < 0 ||
+            (remaining.tv_sec == 0 && remaining.tv_usec == 0))
+            break;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &remaining,
+                       sizeof(remaining)) < 0) {
+            /* Report it as a failed read (errno from setsockopt), not as
+             * a clean close with nothing received. */
+            n = -1;
+            break;
+        }
+        n = read(fd, resp + total, respsz - 1 - total);
+        if (n <= 0)
+            break;
+        total += (size_t)n;
+        if (memchr(resp, '\n', total))
+            break;
+    }
+    resp[total] = '\0';
+    return total ? (ssize_t)total : n;
 }
 
 #define AC_REPORT_UNIX_PREFIX "unix://"
@@ -4658,7 +5007,13 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
 }
 
 
-
+/* Delivers one event to the configured report server (AC_REPORT_URL, with
+ * AC_REPORT_KEY as the bearer token) as a JSON POST. Best-effort: a no-op
+ * when reporting isn't configured, and every failure -- bad URL, header
+ * injection attempt, resolve/connect error, short or non-2xx response --
+ * is logged and swallowed, never propagated to the monitor loop. The whole
+ * exchange is bounded by AC_REPORT_TIMEOUT_SEC, including the status-line
+ * read (see ac_read_status_line()). */
 static void ac_report(const char *event_type, const char *detail)
 {
     const char *url = ac_getenv("AC_REPORT_URL");
@@ -4829,7 +5184,7 @@ static void ac_report(const char *event_type, const char *detail)
             return;
         }
     }
-    n = read(fd, resp, sizeof(resp) - 1);
+    n = ac_read_status_line(fd, resp, sizeof(resp), AC_REPORT_TIMEOUT_SEC);
     {
         int code = -1;
         char body[64];
@@ -4842,7 +5197,6 @@ static void ac_report(const char *event_type, const char *detail)
          * silently falling through with no operator-visible indication
          * that the report never landed. */
         if (n > 0) {
-            resp[n] = '\0';
             /* Parse the numeric status code from the status line only
              * -- scanning the whole raw response for " 200"/" 201" as
              * substrings would also match those digits inside a header

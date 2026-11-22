@@ -82,6 +82,7 @@ echo "== protect --comm: exe-basename precision (issue #69) =="
 # pids on disk, not just mock state.
 AC_TESTBIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_testbin.XXXXXX") || exit 1
 
+<<<<<<< HEAD
 # Wait for a just-forked child to actually exec the binary it was
 # started with. Until it does, /proc/<pid>/exe still points at the
 # shell's binary and /proc/<pid>/comm is still the shell's name, so
@@ -99,15 +100,30 @@ wait_for_exe() {
         sleep 0.1
     done
     return 1
+=======
+# The binaries below are renamed copies, so they must not depend on their
+# own name: where /bin/sleep is a multicall binary (uutils coreutils), a
+# copy under another name dies with "unknown program". Build a tiny
+# standalone sleeper once and copy that instead.
+AC_SLEEPER_SRC="$AC_TESTBIN_DIR/sleeper.c"
+AC_SLEEPER_BIN="$AC_TESTBIN_DIR/sleeper.bin"
+printf '%s\n' '#include <unistd.h>' \
+    'int main(void) { sleep(30); return 0; }' > "$AC_SLEEPER_SRC"
+# CC is expanded unquoted on purpose, as the Makefile does, so a value like
+# CC='ccache gcc' (compiler plus arguments) still works.
+${CC:-cc} -o "$AC_SLEEPER_BIN" "$AC_SLEEPER_SRC" || {
+    echo "FAIL could not build the test sleeper with ${CC:-cc}"
+    exit 1
+>>>>>>> origin/master
 }
 
 # > 15 chars, so the old comm-string-only match couldn't have found this
 # pid at all (comm would read back truncated) -- only the exe-basename
 # match can.
 AC_LONGNAME="ac69-exe-match-longname-$$"
-cp /bin/sleep "$AC_TESTBIN_DIR/$AC_LONGNAME"
+cp "$AC_SLEEPER_BIN" "$AC_TESTBIN_DIR/$AC_LONGNAME"
 chmod +x "$AC_TESTBIN_DIR/$AC_LONGNAME"
-"$AC_TESTBIN_DIR/$AC_LONGNAME" 30 &
+"$AC_TESTBIN_DIR/$AC_LONGNAME" &
 AC_LONGPID=$!
 if ! wait_for_exe "$AC_LONGPID" "$AC_TESTBIN_DIR/$AC_LONGNAME"; then
     fail "child $AC_LONGPID never exec'd $AC_LONGNAME (test setup broken)"
@@ -125,9 +141,9 @@ wait "$AC_LONGPID" 2>/dev/null
 # back to the original /proc/<pid>/comm string match, not fail outright.
 AC_SHORTNAME="ac69delfb$$"
 AC_SHORTNAME="${AC_SHORTNAME:0:15}"
-cp /bin/sleep "$AC_TESTBIN_DIR/$AC_SHORTNAME"
+cp "$AC_SLEEPER_BIN" "$AC_TESTBIN_DIR/$AC_SHORTNAME"
 chmod +x "$AC_TESTBIN_DIR/$AC_SHORTNAME"
-"$AC_TESTBIN_DIR/$AC_SHORTNAME" 30 &
+"$AC_TESTBIN_DIR/$AC_SHORTNAME" &
 AC_DELPID=$!
 # Wait for the child to actually exec the copied binary before deleting
 # it out from under it -- deleting too early can still catch it mid-fork,
@@ -375,6 +391,13 @@ echo "== scan --check-preload / --check-vklayers / --check-implicit-layers (mock
 expect_out "scan --check-preload detects LD_PRELOAD" "LD_PRELOAD check: /tmp/evil.so" bash -c 'AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/evil.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 # shellcheck disable=SC2016
 expect_out "scan --check-preload not set" "not set" bash -c 'AC_MOCK_ENVIRON="EMPTY=1" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# ld.so acts on the last LD_PRELOAD= entry, so that is the one to show: a
+# benign entry in front must not hide it (#29). LD_AUDIT loads libraries
+# the same way and is reported alongside.
+# shellcheck disable=SC2016
+expect_out "scan --check-preload reports the last LD_PRELOAD entry" "LD_PRELOAD check: /tmp/evil.so" bash -c 'AC_MOCK_ENVIRON="LD_PRELOAD=libMangoHud.so;A=1;LD_PRELOAD=/tmp/evil.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
+# shellcheck disable=SC2016
+expect_out "scan --check-preload detects LD_AUDIT" "LD_AUDIT check: /tmp/audit.so" bash -c 'AC_MOCK_ENVIRON="LD_AUDIT=/tmp/audit.so" exec bash -c '\''LD_PRELOAD="$0" AC_MOCK_ROOT=1 AC_MOCK_STATE="$1" exec ./anticheat scan --pid $BASHPID --check-preload'\'' "$LD_PRELOAD" "$AC_MOCK_STATE"'
 # An empty envp entry (a bare NUL in /proc/<pid>/environ) is valid and must
 # not end the scan -- a leading "" used to hide everything after it (#87).
 # shellcheck disable=SC2016
@@ -423,7 +446,7 @@ sleep 30 &
 PER_PID=$!
 ./anticheat protect --pid $PER_PID >/dev/null 2>&1
 # Create a child that has the environ we want to fake via AC_MOCK_ENVIRON? Instead we run daemon with AC_MOCK_ENVIRON set so every protected pid appears to have LD_PRELOAD
-per_out=$(timeout -k 2 --preserve-status 4 env AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/evil.so" AC_LD_PRELOAD_CHECK_INTERVAL=1 AC_VK_LAYER_CHECK_INTERVAL=1 AC_IMPLICIT_LAYER_CHECK_INTERVAL=1 AC_RENDER_HOOK_CHECK_INTERVAL=1 AC_SCAN_CHECK_INTERVAL=1 ./anticheat start --foreground 2>&1)
+per_out=$(timeout -k 2 --preserve-status 4 env AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/evil.so;LD_AUDIT=/tmp/audit.so" AC_LD_PRELOAD_CHECK_INTERVAL=1 AC_VK_LAYER_CHECK_INTERVAL=1 AC_IMPLICIT_LAYER_CHECK_INTERVAL=1 AC_RENDER_HOOK_CHECK_INTERVAL=1 AC_SCAN_CHECK_INTERVAL=1 ./anticheat start --foreground 2>&1)
 # The property under test is "warn once per pid", not "once per interval",
 # so scope the count to the pid this test actually protected — the same
 # shape the --jit check above uses. Counting every LD_PRELOAD line in the
@@ -436,6 +459,8 @@ per_out=$(timeout -k 2 --preserve-status 4 env AC_MOCK_ENVIRON="LD_PRELOAD=/tmp/
 # suppression must produce exactly 1.
 per_ld_count=$(printf '%s' "$per_out" | grep -c "pid $PER_PID (.*LD_PRELOAD=/tmp/evil.so" || true)
 if [ "$per_ld_count" -eq 1 ]; then pass "periodic LD_PRELOAD warned exactly once for pid $PER_PID"; else fail "periodic LD_PRELOAD count $per_ld_count for pid $PER_PID, expected 1"; fi
+per_audit_count=$(printf '%s' "$per_out" | grep -c "pid $PER_PID (.*LD_AUDIT=/tmp/audit.so" || true)
+if [ "$per_audit_count" -eq 1 ]; then pass "periodic LD_AUDIT warned exactly once for pid $PER_PID"; else fail "periodic LD_AUDIT count $per_audit_count for pid $PER_PID, expected 1"; fi
 ./anticheat unprotect --pid $PER_PID >/dev/null 2>&1 || true
 kill $PER_PID 2>/dev/null; wait $PER_PID 2>/dev/null || true
 
